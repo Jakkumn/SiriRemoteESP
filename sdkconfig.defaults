@@ -1,0 +1,19 @@
+# Use NimBLE instead of Bluedroid. Smaller, better central-role support,
+# and matches the ESP-IDF blecent reference we're building from.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=n
+
+# Central + observer; we never advertise.
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=n
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=n
+
+# MTU headroom — Apple grants large MTUs; leaves room for 101-byte audio
+# reports if we ever want them.
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=247
+
+# Quality-of-life log output over UART.
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
