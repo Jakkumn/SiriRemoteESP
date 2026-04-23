@@ -1,0 +1,31 @@
+menu "Siri Bridge Configuration"
+
+    config WIFI_SSID
+        string "Wi-Fi SSID"
+        default ""
+        help
+            SSID for the ESP32 to join. Values land in sdkconfig, which is
+            gitignored — set via `idf.py menuconfig`, never commit secrets to
+            sdkconfig.defaults.
+
+    config WIFI_PASSWORD
+        string "Wi-Fi password"
+        default ""
+        help
+            WPA2 password. Leave empty for open networks.
+
+    config MQTT_BROKER_URI
+        string "MQTT broker URI"
+        default "mqtt://homeassistant.local:1883"
+        help
+            URI of the Home Assistant MQTT broker. Use mqtts:// for TLS.
+
+    config MQTT_USERNAME
+        string "MQTT username"
+        default ""
+
+    config MQTT_PASSWORD
+        string "MQTT password"
+        default ""
+
+endmenu

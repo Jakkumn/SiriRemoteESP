@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  host-tests:
+    name: Host unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install CMake
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake
+      - name: Run tests
+        run: make test
+
+  firmware-build:
+    name: Firmware (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [esp32, esp32s3]
+    container:
+      image: espressif/idf:release-v5.5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        shell: bash
+        env:
+          IDF_TARGET: ${{ matrix.target }}
+        run: |
+          . $IDF_PATH/export.sh
+          idf.py set-target "$IDF_TARGET"
+          idf.py build
