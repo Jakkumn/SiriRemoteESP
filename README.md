@@ -41,6 +41,22 @@ main/                       # firmware entry point + NimBLE bring-up
 tests/host/                 # host-side unit tests (CMake + assert())
 ```
 
+## Acknowledgments
+
+This project ports existing Siri Remote protocol work to an ESP32. The chain
+of prior art:
+
+- [Jack-R1](https://github.com/Jack-R1) — original reverse-engineering of the
+  Apple TV 4th-gen Siri Remote protocol (Opus voice decoder, macOS voice
+  control, Windows filter driver).
+- [Yanndroid/SiriRemote-Linux](https://github.com/Yanndroid/SiriRemote-Linux) —
+  Python/bluepy port for Linux that documents the GATT handle map, the
+  vendor-specific "magic write," button bitmask, and touch/clickpad report
+  format. Gen 2/3 coverage lives on the `gen-3` branch.
+
+This project translates that protocol knowledge into ESP-IDF + NimBLE C
+running on an ESP32.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
