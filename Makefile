@@ -18,7 +18,9 @@ endif
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build flash monitor fm clean fullclean erase menuconfig size set-esp32 set-esp32s3
+TEST_BUILD := tests/build
+
+.PHONY: help build flash monitor fm clean fullclean erase menuconfig size test test-clean set-esp32 set-esp32s3
 
 help: ## Show available targets
 	@echo "siri-bridge — ESP-IDF wrapper"
@@ -54,6 +56,14 @@ menuconfig: ## Interactive sdkconfig editor
 
 size: ## Show firmware size breakdown
 	$(IDF) size
+
+test: ## Build and run host-side unit tests (no ESP-IDF, no hardware)
+	@cmake -S tests/host -B $(TEST_BUILD) -DCMAKE_BUILD_TYPE=Debug > /dev/null
+	@cmake --build $(TEST_BUILD) > /dev/null
+	@ctest --test-dir $(TEST_BUILD) --output-on-failure
+
+test-clean: ## Remove host test build artefacts
+	@rm -rf $(TEST_BUILD)
 
 set-esp32: ## Target WROOM-32 / original ESP32
 	$(IDF) set-target esp32

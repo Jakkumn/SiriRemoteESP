@@ -10,7 +10,6 @@
 #include "host/ble_hs.h"
 #include "host/ble_gap.h"
 #include "host/util/util.h"
-#include "services/gap/ble_svc_gap.h"
 
 static const char *TAG = "siri-bridge";
 
@@ -118,9 +117,6 @@ void app_main(void)
 
     ble_hs_cfg.sync_cb = on_sync;
     ble_hs_cfg.reset_cb = on_reset;
-
-    ble_svc_gap_init();
-    ble_svc_gap_device_name_set("siri-bridge");
 
     nimble_port_freertos_init(nimble_host_task);
 
