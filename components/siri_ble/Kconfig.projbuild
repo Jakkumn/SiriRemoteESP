@@ -1,0 +1,18 @@
+menu "Siri BLE Bridge"
+
+    config SIRI_REMOTE_MAC
+        string "Siri Remote BLE MAC address"
+        default "e0:c3:ea:9a:7e:d0"
+        help
+            BLE MAC of the Apple Siri Remote gen-3 to pair with. Gen-3 units
+            use static random addresses — each unit has its own MAC, and there
+            is no public OUI to filter on.
+
+            To find yours: flash once, put the remote in pairing mode (hold
+            Back + Volume Up for 5 seconds), and watch the UART for an
+            advertisement at strong RSSI (> -50 dBm). The MAC on that line
+            goes here. Lives in sdkconfig (gitignored), so it never enters git.
+
+            Format: lowercase hex, colon-separated, e.g. e0:c3:ea:9a:7e:d0.
+
+endmenu

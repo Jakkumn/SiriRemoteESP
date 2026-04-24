@@ -1,0 +1,3 @@
+# Clickpad Right (directional click): press then release. Handle 0x0039.
+00 04
+00 00

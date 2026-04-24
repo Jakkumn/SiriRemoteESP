@@ -20,7 +20,7 @@ endif
 
 TEST_BUILD := tests/build
 
-.PHONY: help build flash monitor fm clean fullclean erase menuconfig size test test-clean set-esp32 set-esp32s3
+.PHONY: help build flash monitor fm clean fullclean erase menuconfig size test test-clean lint set-esp32 set-esp32s3
 
 help: ## Show available targets
 	@echo "siri-bridge — ESP-IDF wrapper"
@@ -64,6 +64,14 @@ test: ## Build and run host-side unit tests (no ESP-IDF, no hardware)
 
 test-clean: ## Remove host test build artefacts
 	@rm -rf $(TEST_BUILD)
+
+lint: ## Check C/H formatting against .clang-format
+	@command -v clang-format >/dev/null 2>&1 || { \
+	    echo "clang-format not found. Install with: brew install clang-format"; \
+	    exit 1; }
+	@find components/siri_ble components/report_decoder main tests/host \
+	    \( -name '*.c' -o -name '*.h' \) -not -name 'peer.c' -not -name 'esp_central.h' | \
+	    xargs clang-format --dry-run -Werror
 
 set-esp32: ## Target WROOM-32 / original ESP32
 	$(IDF) set-target esp32

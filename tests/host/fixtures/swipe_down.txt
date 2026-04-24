@@ -1,0 +1,24 @@
+# Touchpad swipe down. Handle 0x003d, 11 bytes per frame.
+32 5c 33 01 6a ee 0f 76 64 0a eb
+32 74 33 01 67 4e 0f 78 69 0c ec
+32 96 33 01 6f 1e 0e 7f 72 0e ec
+32 b8 33 01 68 2e 0d 89 7c 10 ec
+32 d8 33 01 67 ce 0b 8e 83 12 6c
+32 ea 33 01 65 9e 0a 90 89 12 6c
+32 0a 34 01 64 9e 08 90 89 13 ec
+32 2c 34 01 65 2e 06 8c 8a 14 6c
+32 40 34 01 67 de 03 88 8e 15 6c
+32 62 34 01 6a 0e 01 83 8f 17 6c
+32 82 34 01 6d be fc 81 95 17 6c
+32 a4 34 01 71 ae f7 80 98 18 6c
+32 b4 34 01 75 5e f4 7e 98 18 6c
+32 d6 34 01 7c 7e ed 7d 96 17 6c
+32 f8 34 01 80 0e e8 7c 88 17 ec
+32 0c 35 01 82 de e4 7d 7f 16 ec
+32 2c 35 01 88 ee dd 84 78 15 ec
+32 4e 35 01 8d 9e d8 88 71 13 ec
+32 70 35 01 91 fe d2 84 6b 0f ec
+32 80 35 01 93 9e cf 7d 60 0c ec
+32 a2 35 01 98 ee cc 6e 1c 02 ed
+32 c4 35 00 98 ee cc 00 00 00 ef
+32 d6 35 00 98 ee cc 00 00 00 e8

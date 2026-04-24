@@ -1,0 +1,3 @@
+# Power button: press then release. Handle 0x0039.
+10 00
+00 00

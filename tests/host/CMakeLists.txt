@@ -11,6 +11,12 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 add_compile_options(-Wall -Wextra -Wpedantic -Werror -UNDEBUG)
 
+# AddressSanitizer + UndefinedBehaviorSanitizer on host tests. Virtually
+# free to run on our tiny test binaries and catches memory bugs that would
+# otherwise only show up on-device.
+add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
+add_link_options(-fsanitize=address,undefined)
+
 # Build the decoder as a plain static library from its real source path.
 # No ESP-IDF headers — that's the invariant these tests defend.
 set(DECODER_DIR "${CMAKE_CURRENT_LIST_DIR}/../../components/report_decoder")

@@ -1,0 +1,3 @@
+# Mute button: press then release. Handle 0x0039.
+80 00
+00 00

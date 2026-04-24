@@ -1,0 +1,3 @@
+# Clickpad Down (directional click): press then release. Handle 0x0039.
+00 08
+00 00

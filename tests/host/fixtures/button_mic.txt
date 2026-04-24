@@ -1,0 +1,4 @@
+# Mic / Siri button: press then release. Handle 0x0039.
+# No continuous stream while held — audio flows on characteristic 0x0035 (Phase 5).
+20 00
+00 00

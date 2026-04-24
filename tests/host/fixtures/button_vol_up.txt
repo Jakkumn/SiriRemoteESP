@@ -1,0 +1,3 @@
+# Volume Up button: press then release. Handle 0x0039.
+02 00
+00 00

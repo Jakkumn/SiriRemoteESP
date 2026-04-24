@@ -1,0 +1,3 @@
+# Select (clickpad center click): press then release. Handle 0x0039.
+08 00
+00 00
