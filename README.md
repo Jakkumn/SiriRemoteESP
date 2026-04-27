@@ -67,7 +67,21 @@ The bridge auto-discovers as a single **Event entity** with these `event_type`
 values: `click`, `double_click`, `hold_start`, `hold_end`, `swipe_up`,
 `swipe_down`, `swipe_left`, `swipe_right`, `pickup`. Event payloads include
 `button` (for button events), `duration_ms` (for click/hold_end), `distance`
-(for swipes), and `idle_duration_ms` (for pickup).
+(for swipes), and `idle_duration_ms` + `wake_press_likely` (for pickup).
+
+### Wake-press loss
+
+The press that wakes the remote from sleep is not always reported as a button
+event on cold-boot reconnects. Apple's gen-3 firmware appears to gate HID
+notify delivery on its accessory-framework's secondary encryption phase, and
+on the longer first-bond-after-boot path the buffered press is dropped. After
+the bridge has bonded once and idle-disconnected, subsequent wake-presses are
+delivered normally.
+
+The `pickup` event always fires for these reconnects — react to it in HA as
+the generic "user activated remote" signal rather than relying on the first
+post-wake button event being present. `wake_press_likely: true` is included
+in the pickup payload to make the intent explicit.
 
 **Toggle a light on click:**
 ```yaml
@@ -116,6 +130,22 @@ action:
     service: scene.turn_on
     target:
       entity_id: scene.evening_lights
+```
+
+**Wake-as-power-on** (works around the cold-boot wake-press loss — react to
+pickup as if it were the wake button):
+```yaml
+- alias: "Wake remote turns on TV"
+  trigger:
+    platform: state
+    entity_id: event.siri_remote
+  condition: >
+    {{ trigger.to_state.attributes.event_type == 'pickup'
+       and trigger.to_state.attributes.wake_press_likely }}
+  action:
+    service: media_player.turn_on
+    target:
+      entity_id: media_player.living_room_tv
 ```
 
 **Magnitude-aware swipe:**

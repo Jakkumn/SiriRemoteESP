@@ -41,4 +41,46 @@ menu "Siri Bridge Configuration"
             Adds significant log spam during touchpad use (~50 lines/sec).
             Disable for normal operation.
 
+    config DEBUG_WAKE_PROBE
+        bool "Wake-press loss probe (diagnostic)"
+        default n
+        help
+            When enabled, the BLE connect path is instrumented with millisecond
+            timestamps relative to BLE_GAP_EVENT_CONNECT (logged as `t=Xms`),
+            and apply_remote_setup additionally subscribes to every
+            unexplored notify-capable HID Report CCCD on the gen-3 remote
+            (handles 0x0042 / 0x0046 / 0x004A / 0x0051 / 0x0054 / 0x0056 /
+            0x0058). Combined with the existing notify-RX hex dump, this
+            captures whether any unexplored handle carries the wake-button
+            identity that's lost on cold-boot connects.
+
+            Diagnostic only — leave disabled for normal operation.
+
+    config BATTERY_LOW_THRESHOLD_PCT
+        int "Battery low threshold (percent)"
+        default 20
+        range 0 100
+        help
+            When battery level is at or below this percentage, the published
+            battery JSON includes "low": true. Set to 0 to always report
+            "low": false (effectively disabling the alert field). HA can also
+            do this kind of thresholding template-side; this knob just lets
+            firmware-only setups have a sane low-battery flag.
+
+    config IDLE_DISCONNECT_MS
+        int "Idle BLE disconnect threshold (ms)"
+        default 60000
+        range 0 3600000
+        help
+            After this many milliseconds with no notifications from the
+            remote, the bridge proactively terminates the BLE connection so
+            the remote can enter deep sleep and conserve battery. Without
+            this, registering the standard GATT server keeps Apple's
+            accessory framework happy AND keeps the link alive indefinitely
+            — which works but drains the remote's CR2032 ~5x faster.
+
+            The remote re-advertises on the next button press; reconnect
+            takes ~1 second. Set to 0 to disable the proactive disconnect
+            (always-connected mode).
+
 endmenu

@@ -38,13 +38,18 @@ static const char *TAG = "main";
 #define TICK_PERIOD_MS 50
 
 // MQTT topic constants.
-#define TOPIC_EVENT              "siri_remote/event"
-#define TOPIC_TOUCH_RAW          "siri_remote/touch_raw"
-#define TOPIC_CONN               "siri_remote/connection"
-#define TOPIC_CMD_RAW_STREAM     "siri_remote/cmd/raw_stream"
-#define TOPIC_STATE_RAW_STREAM   "siri_remote/state/raw_stream"
-#define TOPIC_DISCOVERY_EVENT    "homeassistant/event/siri_remote/config"
-#define TOPIC_DISCOVERY_SWITCH   "homeassistant/switch/siri_remote_raw_stream/config"
+#define TOPIC_EVENT                  "siri_remote/event"
+#define TOPIC_TOUCH_RAW              "siri_remote/touch_raw"
+#define TOPIC_CONN                   "siri_remote/connection"
+#define TOPIC_REMOTE_STATUS          "siri_remote/remote_status"
+#define TOPIC_BATTERY                "siri_remote/battery"
+#define TOPIC_CHARGING               "siri_remote/charging"
+#define TOPIC_CMD_RAW_STREAM         "siri_remote/cmd/raw_stream"
+#define TOPIC_STATE_RAW_STREAM       "siri_remote/state/raw_stream"
+#define TOPIC_DISCOVERY_EVENT        "homeassistant/event/siri_remote/config"
+#define TOPIC_DISCOVERY_SWITCH       "homeassistant/switch/siri_remote_raw_stream/config"
+#define TOPIC_DISCOVERY_BATTERY      "homeassistant/sensor/siri_remote_battery/config"
+#define TOPIC_DISCOVERY_CHARGING     "homeassistant/sensor/siri_remote_charging/config"
 
 // State.
 static esp_mqtt_client_handle_t s_mqtt;
@@ -53,6 +58,9 @@ static SemaphoreHandle_t        s_es_lock;
 static volatile bool            s_mqtt_connected;
 static volatile bool            s_raw_stream_enabled;
 static esp_timer_handle_t       s_tick_timer;
+// Activity tracking for idle-disconnect. Updated on every BLE notification
+// from the remote. 0 = no remote activity yet (post-disconnect or pre-first-event).
+static volatile uint32_t        s_last_activity_ms;
 
 static uint32_t now_ms(void)
 {
@@ -124,6 +132,90 @@ static void publish_ha_discovery_event(void)
         "\"payload_not_available\":\"offline\""
         "}";
     mqtt_publish(TOPIC_DISCOVERY_EVENT, PAYLOAD, sizeof(PAYLOAD) - 1, 1, /*retain*/ true);
+}
+
+// Battery + charging are continuous-state sensors. Their availability tracks
+// BOTH the bridge's MQTT connection and the remote's BLE connection — when the
+// remote sleeps, HA marks them unavailable so a stale value isn't displayed.
+#define AVAILABILITY_BRIDGE_AND_REMOTE \
+    "\"availability\":[" \
+        "{\"topic\":\"" TOPIC_CONN "\"," \
+            "\"payload_available\":\"online\"," \
+            "\"payload_not_available\":\"offline\"}," \
+        "{\"topic\":\"" TOPIC_REMOTE_STATUS "\"," \
+            "\"payload_available\":\"connected\"," \
+            "\"payload_not_available\":\"disconnected\"}" \
+    "]," \
+    "\"availability_mode\":\"all\""
+
+static void publish_ha_discovery_battery(void)
+{
+    static const char PAYLOAD[] =
+        "{"
+        "\"name\":\"Battery\","
+        "\"unique_id\":\"siri_remote_battery\","
+        "\"state_topic\":\"" TOPIC_BATTERY "\","
+        "\"value_template\":\"{{ value_json.level }}\","
+        "\"device_class\":\"battery\","
+        "\"unit_of_measurement\":\"%\","
+        "\"device\":{\"identifiers\":[\"siri_remote_bridge\"]},"
+        AVAILABILITY_BRIDGE_AND_REMOTE
+        "}";
+    mqtt_publish(TOPIC_DISCOVERY_BATTERY, PAYLOAD, sizeof(PAYLOAD) - 1, 1, /*retain*/ true);
+}
+
+static void publish_ha_discovery_charging(void)
+{
+    static const char PAYLOAD[] =
+        "{"
+        "\"name\":\"Charging\","
+        "\"unique_id\":\"siri_remote_charging\","
+        "\"state_topic\":\"" TOPIC_CHARGING "\","
+        "\"icon\":\"mdi:battery-charging\","
+        "\"device\":{\"identifiers\":[\"siri_remote_bridge\"]},"
+        AVAILABILITY_BRIDGE_AND_REMOTE
+        "}";
+    mqtt_publish(TOPIC_DISCOVERY_CHARGING, PAYLOAD, sizeof(PAYLOAD) - 1, 1, /*retain*/ true);
+}
+
+static void publish_remote_status(bool connected)
+{
+    mqtt_publish(TOPIC_REMOTE_STATUS,
+                 connected ? "connected" : "disconnected",
+                 0, 1, /*retain*/ true);
+}
+
+static void publish_battery(uint8_t level)
+{
+    char buf[64];
+    bool low = CONFIG_BATTERY_LOW_THRESHOLD_PCT > 0 &&
+               level <= CONFIG_BATTERY_LOW_THRESHOLD_PCT;
+    int n = snprintf(buf, sizeof(buf),
+                     "{\"level\":%u,\"low\":%s}",
+                     (unsigned)level, low ? "true" : "false");
+    if (n > 0) {
+        ESP_LOGI(TAG, "battery=%u%%%s", (unsigned)level, low ? " (LOW)" : "");
+        mqtt_publish(TOPIC_BATTERY, buf, n, 1, /*retain*/ true);
+    }
+}
+
+static void publish_charging(uint8_t state_byte)
+{
+    // BLE-standard 0x2A1A "Battery Power State" is a single byte with four
+    // 2-bit fields. Bits 4..5 = charging field, 2..3 = discharging field.
+    // Value 3 in either means "yes that state is active".
+    uint8_t discharging = (state_byte >> 2) & 0x03;
+    uint8_t charging    = (state_byte >> 4) & 0x03;
+    const char *s;
+    if (charging == 3) {
+        s = "charging";
+    } else if (discharging == 3) {
+        s = "discharging";
+    } else {
+        s = "plugged_in";
+    }
+    ESP_LOGI(TAG, "charging state=0x%02x => %s", state_byte, s);
+    mqtt_publish(TOPIC_CHARGING, s, 0, 1, /*retain*/ true);
 }
 
 static void publish_ha_discovery_switch(void)
@@ -218,8 +310,13 @@ static void emit_cb(const event_state_event_t *evt, void *user)
                      event_type, evt->distance);
         break;
     case EVT_PICKUP:
+        // wake_press_likely=true means the user almost certainly pressed a
+        // button to wake the remote — but on cold-boot reconnects, Apple
+        // drops the wake-press notify, so the specific button identity may
+        // never arrive on 0x0039. HA automations should treat pickup as the
+        // generic "user activated remote" signal (see README).
         n = snprintf(buf, sizeof(buf),
-                     "{\"event_type\":\"%s\",\"idle_duration_ms\":%" PRIu32 "}",
+                     "{\"event_type\":\"%s\",\"idle_duration_ms\":%" PRIu32 ",\"wake_press_likely\":true}",
                      event_type, evt->idle_duration_ms);
         break;
     }
@@ -234,11 +331,20 @@ static void emit_cb(const event_state_event_t *evt, void *user)
 static void on_notify_cb(uint16_t attr_handle, const uint8_t *data, size_t len, void *user)
 {
     (void)user;
+    s_last_activity_ms = now_ms();
     if (attr_handle == 0x0039) {
         uint16_t btns = siri_decode_button_bytes(data, len);
         xSemaphoreTake(s_es_lock, portMAX_DELAY);
         event_state_feed_buttons(s_es, btns, now_ms());
         xSemaphoreGive(s_es_lock);
+    } else if (attr_handle == 0x002E) {
+        if (len >= 1) {
+            publish_battery(data[0]);
+        }
+    } else if (attr_handle == 0x0031) {
+        if (len >= 1) {
+            publish_charging(data[0]);
+        }
     } else if (attr_handle == 0x003D) {
         siri_touch_frame_t frame;
         if (siri_decode_touch_frame(data, len, &frame)) {
@@ -269,6 +375,8 @@ static void on_connected_cb(uint32_t idle_ms, void *user)
 {
     (void)user;
     ESP_LOGI(TAG, "remote connected (idle %" PRIu32 " ms)", idle_ms);
+    publish_remote_status(true);
+    s_last_activity_ms = now_ms();  // start the idle clock
     xSemaphoreTake(s_es_lock, portMAX_DELAY);
     event_state_feed_connect(s_es, idle_ms, now_ms());
     xSemaphoreGive(s_es_lock);
@@ -277,6 +385,8 @@ static void on_connected_cb(uint32_t idle_ms, void *user)
 static void on_disconnected_cb(void *user)
 {
     (void)user;
+    publish_remote_status(false);
+    s_last_activity_ms = 0;  // halt the idle check until next connection
     xSemaphoreTake(s_es_lock, portMAX_DELAY);
     event_state_reset(s_es, now_ms());
     xSemaphoreGive(s_es_lock);
@@ -287,9 +397,18 @@ static void on_disconnected_cb(void *user)
 static void tick_timer_cb(void *arg)
 {
     (void)arg;
+    uint32_t now = now_ms();
     xSemaphoreTake(s_es_lock, portMAX_DELAY);
-    event_state_tick(s_es, now_ms());
+    event_state_tick(s_es, now);
     xSemaphoreGive(s_es_lock);
+
+#if CONFIG_IDLE_DISCONNECT_MS > 0
+    uint32_t last = s_last_activity_ms;
+    if (last != 0 && (now - last) > CONFIG_IDLE_DISCONNECT_MS) {
+        s_last_activity_ms = 0;  // prevent repeated terminate calls
+        siri_ble_idle_disconnect();
+    }
+#endif
 }
 
 // --- Wi-Fi ---
@@ -370,19 +489,52 @@ static void mqtt_event_handler(void *args, esp_event_base_t base, int32_t id, vo
         esp_mqtt_client_publish(s_mqtt, TOPIC_CONN, "online", 0, 1, /*retain*/ 1);
         publish_ha_discovery_event();
         publish_ha_discovery_switch();
+        publish_ha_discovery_battery();
+        publish_ha_discovery_charging();
         publish_raw_stream_state();
+        // Default remote status to disconnected on MQTT (re)connect — BLE
+        // callbacks will flip it to "connected" once encryption succeeds.
+        publish_remote_status(false);
         esp_mqtt_client_subscribe(s_mqtt, TOPIC_CMD_RAW_STREAM, 1);
         break;
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "mqtt: disconnected");
         s_mqtt_connected = false;
         break;
-    case MQTT_EVENT_DATA:
-        if (evt->topic_len == (int)strlen(TOPIC_CMD_RAW_STREAM) &&
+    case MQTT_EVENT_SUBSCRIBED:
+        ESP_LOGI(TAG, "mqtt: subscribed (msg_id=%d)", evt->msg_id);
+        break;
+    case MQTT_EVENT_DATA: {
+        // Diagnostic: log every received topic + payload until 3A.2 raw-stream
+        // Switch is verified working, then drop back to a single match path.
+        char topic_buf[80];
+        int tl = (evt->topic != NULL && evt->topic_len > 0)
+                     ? (evt->topic_len < (int)sizeof(topic_buf) - 1
+                            ? evt->topic_len
+                            : (int)sizeof(topic_buf) - 1)
+                     : 0;
+        if (tl > 0) {
+            memcpy(topic_buf, evt->topic, tl);
+        }
+        topic_buf[tl] = '\0';
+        char data_buf[32];
+        int dl = evt->data_len < (int)sizeof(data_buf) - 1
+                     ? evt->data_len
+                     : (int)sizeof(data_buf) - 1;
+        if (dl > 0) {
+            memcpy(data_buf, evt->data, dl);
+        }
+        data_buf[dl] = '\0';
+        ESP_LOGI(TAG, "mqtt RX: topic='%s' (len=%d) data='%s' (len=%d)",
+                 topic_buf, evt->topic_len, data_buf, evt->data_len);
+
+        if (evt->topic != NULL &&
+            evt->topic_len == (int)strlen(TOPIC_CMD_RAW_STREAM) &&
             memcmp(evt->topic, TOPIC_CMD_RAW_STREAM, evt->topic_len) == 0) {
             handle_raw_stream_cmd(evt->data, evt->data_len);
         }
         break;
+    }
     default:
         break;
     }

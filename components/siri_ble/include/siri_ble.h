@@ -33,6 +33,11 @@ typedef struct {
 // but before spawning the host task.
 esp_err_t siri_ble_start(const siri_ble_config_t *cfg);
 
+// Proactively terminate the active BLE connection so the remote can enter
+// deep sleep. No-op if no connection is active. Reconnect happens on the
+// next button press from the remote (re-advertises automatically).
+void siri_ble_idle_disconnect(void);
+
 #ifdef __cplusplus
 }
 #endif

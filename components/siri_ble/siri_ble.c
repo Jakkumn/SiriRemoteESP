@@ -16,6 +16,8 @@
 #include "host/ble_store.h"
 #include "host/ble_uuid.h"
 #include "host/util/util.h"
+#include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
 
 #include "siri_ble.h"
 #include "esp_central.h"
@@ -27,9 +29,11 @@ static const char *TAG = "siri_ble";
 // (~3.7 seconds saved per connection) and write directly to these handles.
 // If a future unit has a different layout, set CONFIG_SIRI_BLE_VERBOSE_DISCOVERY
 // in menuconfig to re-enable a one-time peer-layout dump on first connect.
-#define BUTTON_CCCD_HANDLE  0x003A
-#define TOUCH_CCCD_HANDLE   0x003E
-#define MAGIC_HANDLE        0x004D
+#define BUTTON_CCCD_HANDLE   0x003A
+#define TOUCH_CCCD_HANDLE    0x003E
+#define BATTERY_CCCD_HANDLE  0x002F  // svc 0x180F, char 0x2A19 (battery level)
+#define CHARGING_CCCD_HANDLE 0x0032  // svc 0x180F, char 0x2A1A (battery power state)
+#define MAGIC_HANDLE         0x004D
 static const uint8_t MAGIC_VALUE[2]   = {0xF0, 0x00};
 static const uint8_t ENABLE_NOTIFY[2] = {0x01, 0x00};
 
@@ -39,6 +43,9 @@ static uint8_t s_target_mac[6];
 static uint32_t s_last_disconnect_ms;
 static bool s_has_disconnected;
 static uint16_t s_setup_done_conn = 0xFFFF;  // dedup: per-connection setup runs once
+#ifdef CONFIG_DEBUG_WAKE_PROBE
+static uint32_t s_connect_ms;  // BLE_GAP_EVENT_CONNECT timestamp; basis for t=Xms deltas
+#endif
 
 static int gap_event_cb(struct ble_gap_event *event, void *arg);
 static void start_scan(void);
@@ -47,6 +54,14 @@ static uint32_t now_ms(void)
 {
     return (uint32_t)(esp_timer_get_time() / 1000);
 }
+
+#ifdef CONFIG_DEBUG_WAKE_PROBE
+#define WAKE_PROBE_LOG(fmt, ...) \
+    ESP_LOGI(TAG, "wake_probe t=%lums " fmt, \
+             (unsigned long)(now_ms() - s_connect_ms), ##__VA_ARGS__)
+#else
+#define WAKE_PROBE_LOG(fmt, ...) ((void)0)
+#endif
 
 // Parse "aa:bb:cc:dd:ee:ff" into NimBLE's little-endian 6-byte layout (byte 0 = 0xff).
 static bool parse_mac(const char *str, uint8_t out[6])
@@ -110,55 +125,138 @@ static void connect_to(const struct ble_gap_disc_desc *disc)
     }
 }
 
-static int on_write_done(uint16_t conn_handle, const struct ble_gatt_error *error,
-                         struct ble_gatt_attr *attr, void *arg)
+// Setup steps are issued sequentially, one at a time. NimBLE's per-connection
+// GATT procedure queue (CONFIG_BT_NIMBLE_GATT_MAX_PROCS, default 4) overflows
+// when we fire all 5+ operations concurrently — by chaining via the completion
+// callback we keep at most 1 procedure in flight regardless of how many steps
+// the sequence grows to.
+//
+// Reads-after-subscribe matter for battery + charging: those characteristics
+// support read+notify (props 0x12). The remote only notifies on *change*, so
+// without an initial read the value stays empty in HA until the first state
+// transition (e.g. plugging in). The reads pull the current value immediately
+// and dispatch it through the same on_notify path.
+typedef enum {
+    SETUP_KIND_WRITE,
+    SETUP_KIND_READ,
+} setup_kind_t;
+
+typedef struct {
+    setup_kind_t   kind;
+    uint16_t       handle;
+    const uint8_t *value;  // SETUP_KIND_WRITE only
+    size_t         len;    // SETUP_KIND_WRITE only
+    const char    *label;
+} setup_step_t;
+
+static const setup_step_t SETUP_STEPS[] = {
+    {SETUP_KIND_WRITE, BUTTON_CCCD_HANDLE,   ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "button CCCD"},
+    {SETUP_KIND_WRITE, TOUCH_CCCD_HANDLE,    ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "touch CCCD"},
+    {SETUP_KIND_WRITE, BATTERY_CCCD_HANDLE,  ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "battery CCCD"},
+    {SETUP_KIND_WRITE, CHARGING_CCCD_HANDLE, ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "charging CCCD"},
+    {SETUP_KIND_WRITE, MAGIC_HANDLE,         MAGIC_VALUE,   sizeof(MAGIC_VALUE),   "magic unlock"},
+    {SETUP_KIND_READ,  0x002E,               NULL,          0,                     "battery initial read"},
+    {SETUP_KIND_READ,  0x0031,               NULL,          0,                     "charging initial read"},
+#ifdef CONFIG_DEBUG_WAKE_PROBE
+    // Unexplored HID Report CCCDs — gen-3 has 9 Report characteristics; we
+    // already use 0x0035/0x0039/0x003D/0x004D. The rest are guess-CCCDs at
+    // val_handle+1; some will fail (not actually CCCDs) and the chain will
+    // log + skip via on_setup_step_done's error path.
+    {SETUP_KIND_WRITE, 0x0042, ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "probe CCCD 0x0042"},
+    {SETUP_KIND_WRITE, 0x0046, ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "probe CCCD 0x0046"},
+    {SETUP_KIND_WRITE, 0x004A, ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "probe CCCD 0x004A"},
+    {SETUP_KIND_WRITE, 0x0051, ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "probe CCCD 0x0051"},
+    {SETUP_KIND_WRITE, 0x0054, ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "probe CCCD 0x0054"},
+    {SETUP_KIND_WRITE, 0x0056, ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "probe CCCD 0x0056"},
+    {SETUP_KIND_WRITE, 0x0058, ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "probe CCCD 0x0058"},
+#endif
+};
+#define SETUP_STEP_COUNT (sizeof(SETUP_STEPS) / sizeof(SETUP_STEPS[0]))
+
+static uint16_t s_setup_step_conn;
+static size_t   s_setup_step_idx;
+
+static int on_setup_step_done(uint16_t conn_handle, const struct ble_gatt_error *error,
+                              struct ble_gatt_attr *attr, void *arg);
+
+static void issue_setup_step(size_t idx)
 {
-    const char *label = arg;
-    if (error->status == 0) {
-        ESP_LOGI(TAG, "%s write ok (handle=0x%04x)", label, attr->handle);
-    } else {
-        ESP_LOGE(TAG, "%s write failed: status=0x%x att_handle=0x%04x",
-                 label, error->status, error->att_handle);
+    if (idx >= SETUP_STEP_COUNT) {
+        return;
     }
+    const setup_step_t *step = &SETUP_STEPS[idx];
+    int rc;
+    if (step->kind == SETUP_KIND_WRITE) {
+        rc = ble_gattc_write_flat(s_setup_step_conn, step->handle,
+                                  step->value, step->len,
+                                  on_setup_step_done, (void *)step);
+    } else {
+        rc = ble_gattc_read(s_setup_step_conn, step->handle,
+                            on_setup_step_done, (void *)step);
+    }
+    if (rc != 0) {
+        ESP_LOGE(TAG, "%s: queue failed: rc=%d", step->label, rc);
+        // Skip this step rather than stalling the chain.
+        s_setup_step_idx++;
+        issue_setup_step(s_setup_step_idx);
+    }
+}
+
+static int on_setup_step_done(uint16_t conn_handle, const struct ble_gatt_error *error,
+                              struct ble_gatt_attr *attr, void *arg)
+{
+    const setup_step_t *step = arg;
+    WAKE_PROBE_LOG("setup step '%s' done status=0x%x", step->label, error->status);
+    if (error->status != 0) {
+        ESP_LOGE(TAG, "%s failed: status=0x%x att_handle=0x%04x",
+                 step->label, error->status, error->att_handle);
+    } else if (step->kind == SETUP_KIND_READ && attr != NULL && attr->om != NULL) {
+        uint16_t len = OS_MBUF_PKTLEN(attr->om);
+        uint8_t buf[16];
+        if (len > sizeof(buf)) {
+            len = sizeof(buf);
+        }
+        uint16_t copied = 0;
+        if (ble_hs_mbuf_to_flat(attr->om, buf, len, &copied) == 0) {
+            ESP_LOGI(TAG, "%s ok (handle=0x%04x len=%u)",
+                     step->label, attr->handle, (unsigned)copied);
+            if (s_cfg.on_notify != NULL) {
+                s_cfg.on_notify(attr->handle, buf, copied, s_cfg.user);
+            }
+        }
+    } else {
+        ESP_LOGI(TAG, "%s ok (handle=0x%04x)",
+                 step->label, attr != NULL ? attr->handle : 0);
+    }
+    s_setup_step_idx++;
+    issue_setup_step(s_setup_step_idx);
     return 0;
 }
 
-static void enable_cccd(uint16_t conn_handle, uint16_t cccd_handle, const char *label)
-{
-    if (cccd_handle == 0) {
-        ESP_LOGW(TAG, "%s: CCCD not found; skipping", label);
-        return;
-    }
-    int rc = ble_gattc_write_flat(conn_handle, cccd_handle,
-                                  ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY),
-                                  on_write_done, (void *)label);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "%s: write_flat queue failed: %d", label, rc);
-    }
-}
-
-// Fast-path connection setup: subscribe to button + touch notifications and
-// fire the magic unlock. Idempotent per connection — calling twice (e.g. if
-// ENC_CHANGE fires multiple times during bonded resume) is a no-op the second
-// time. Skips GATT service discovery entirely; Phase 1 verified the gen-3
-// handle layout and it's reproducible per unit, so discovery is dead weight
-// on the live path (~3.7 seconds per reconnect).
+// Fast-path connection setup. Subscribes to button / touch / battery / charging
+// notifications and fires the magic unlock — all serialized via callback chain
+// so NimBLE's GATT procedure queue is never saturated. Idempotent per
+// connection: a second ENC_CHANGE for the same conn_handle (bonded resume edge
+// case) is a no-op.
+//
+// Wake-press loss caveat: Apple's gen-3 firmware appears to gate HID notify
+// delivery on the accessory-framework's secondary encryption phase (the second
+// ENC_CHANGE that fires ~750–1200 ms after the first). On warm reconnects the
+// press waiting in HID is delivered just after that completes; on cold-boot
+// first-bond reconnects the longer handshake path drops the buffered press
+// entirely. The pickup event still fires (driven by reconnect timing, not HID),
+// so HA automations should treat pickup as the wake-intent signal — the
+// specific button identity is not always recoverable. Use CONFIG_DEBUG_WAKE_PROBE
+// to instrument the path with t=Xms timestamps and probe unexplored handles.
 static void apply_remote_setup(uint16_t conn_handle)
 {
     if (s_setup_done_conn == conn_handle) {
         return;
     }
     s_setup_done_conn = conn_handle;
-
-    enable_cccd(conn_handle, BUTTON_CCCD_HANDLE, "button CCCD");
-    enable_cccd(conn_handle, TOUCH_CCCD_HANDLE,  "touch CCCD");
-
-    int rc = ble_gattc_write_flat(conn_handle, MAGIC_HANDLE,
-                                  MAGIC_VALUE, sizeof(MAGIC_VALUE),
-                                  on_write_done, (void *)"magic unlock");
-    if (rc != 0) {
-        ESP_LOGE(TAG, "magic unlock: write_flat queue failed: %d", rc);
-    }
+    s_setup_step_conn = conn_handle;
+    s_setup_step_idx  = 0;
+    issue_setup_step(0);
 }
 
 static int gap_event_cb(struct ble_gap_event *event, void *arg)
@@ -186,15 +284,22 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
             return 0;
         }
         ESP_LOGI(TAG, "connected, conn_handle=%d", event->connect.conn_handle);
+#ifdef CONFIG_DEBUG_WAKE_PROBE
+        s_connect_ms = now_ms();
+#endif
+        WAKE_PROBE_LOG("CONNECT");
 
         if (peer_add(event->connect.conn_handle) != 0) {
             ESP_LOGE(TAG, "peer_add failed");
         }
         (void)ble_gattc_exchange_mtu(event->connect.conn_handle, NULL, NULL);
-        if (ble_gap_security_initiate(event->connect.conn_handle) != 0) {
-            // Benign on bonded reconnect: NimBLE auto-kicks encryption and our call
-            // returns BLE_HS_EALREADY. Tracked in the Phase 3 hardening memory.
-            ESP_LOGD(TAG, "security_initiate skipped (already in progress)");
+        // On bonded reconnect, NimBLE auto-kicks encryption from its host task
+        // before our explicit call lands. The call returns BLE_HS_EALREADY (2)
+        // and the automatic path completes encryption successfully. Treat that
+        // as success — only log other failure modes.
+        int sec_rc = ble_gap_security_initiate(event->connect.conn_handle);
+        if (sec_rc != 0 && sec_rc != BLE_HS_EALREADY) {
+            ESP_LOGE(TAG, "security_initiate failed: rc=%d", sec_rc);
         }
         return 0;
 
@@ -216,12 +321,30 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_ENC_CHANGE: {
         ESP_LOGI(TAG, "encryption changed, status=%d", event->enc_change.status);
+        WAKE_PROBE_LOG("ENC_CHANGE status=%d %s",
+                       event->enc_change.status,
+                       s_setup_done_conn == event->enc_change.conn_handle ? "(post-setup)" : "(initial)");
         if (event->enc_change.status != 0) {
             return 0;
         }
-        uint32_t idle = 0;
+        // Bonded reconnect can fire ENC_CHANGE twice in quick succession —
+        // the second is Apple's accessory-framework re-encryption phase, and
+        // on cold-boot connects from a sleeping remote, the wake-press notify
+        // can be lost during this window (see CONFIG_DEBUG_WAKE_PROBE). Dedup
+        // at the conn_handle level so on_connected + setup chain run exactly
+        // once per connection.
+        if (s_setup_done_conn == event->enc_change.conn_handle) {
+            return 0;
+        }
+        uint32_t idle;
         if (s_has_disconnected) {
             idle = now_ms() - s_last_disconnect_ms;
+        } else {
+            // First connect since bridge boot. Use bridge uptime as a lower
+            // bound on idle duration — the remote was unreachable for at
+            // least this long. Lets pickup fire when the remote wakes after
+            // a long sleep, even when the bridge restarted in between.
+            idle = now_ms();
         }
         if (s_cfg.on_connected != NULL) {
             s_cfg.on_connected(idle, s_cfg.user);
@@ -241,6 +364,25 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
             ESP_LOGE(TAG, "mbuf_to_flat failed");
             return 0;
         }
+        // Diagnostic: log every non-touch notification with handle + first
+        // bytes. Touch (0x003D) is ~50/sec and would flood UART; it has its
+        // own gated dump in on_notify_cb (CONFIG_DEBUG_TOUCH_FRAMES).
+        if (event->notify_rx.attr_handle != 0x003D) {
+            char hex[3 * 16 + 1];
+            uint16_t n = copied < 16 ? copied : 16;
+            for (uint16_t i = 0; i < n; i++) {
+                snprintf(&hex[i * 3], 4, "%02x ", buf[i]);
+            }
+            hex[n * 3] = '\0';
+#ifdef CONFIG_DEBUG_WAKE_PROBE
+            ESP_LOGI(TAG, "notify t=%lums h=0x%04x len=%u %s",
+                     (unsigned long)(now_ms() - s_connect_ms),
+                     event->notify_rx.attr_handle, copied, hex);
+#else
+            ESP_LOGI(TAG, "notify h=0x%04x len=%u %s",
+                     event->notify_rx.attr_handle, copied, hex);
+#endif
+        }
         if (s_cfg.on_notify != NULL) {
             s_cfg.on_notify(event->notify_rx.attr_handle, buf, copied, s_cfg.user);
         }
@@ -257,6 +399,19 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
 
     default:
         return 0;
+    }
+}
+
+void siri_ble_idle_disconnect(void)
+{
+    uint16_t conn = s_setup_done_conn;
+    if (conn == 0xFFFF) {
+        return;
+    }
+    ESP_LOGI(TAG, "idle threshold reached, terminating connection so remote can sleep");
+    int rc = ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
+    if (rc != 0 && rc != BLE_HS_ENOTCONN) {
+        ESP_LOGW(TAG, "ble_gap_terminate failed: %d", rc);
     }
 }
 
@@ -304,6 +459,17 @@ esp_err_t siri_ble_start(const siri_ble_config_t *cfg)
 
     ble_hs_cfg.sync_cb  = on_sync;
     ble_hs_cfg.reset_cb = on_reset;
+
+    // Register the standard GAP (0x1800) and GATT (0x1801) services so Apple's
+    // accessory framework gets responses to its periodic probes. Without this,
+    // the remote terminates the connection after ~20-30 seconds of failed
+    // probe queries, even during active use. We never advertise — these are
+    // server-side responses only.
+    ble_svc_gap_init();
+    ble_svc_gatt_init();
+    if (ble_svc_gap_device_name_set("siri-bridge") != 0) {
+        ESP_LOGW(TAG, "ble_svc_gap_device_name_set failed");
+    }
 
     if (peer_init(1, 64, 64, 64) != 0) {
         ESP_LOGE(TAG, "peer_init failed");
