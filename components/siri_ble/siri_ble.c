@@ -7,6 +7,7 @@
 
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #include "host/ble_att.h"
 #include "host/ble_gap.h"
@@ -37,9 +38,16 @@ static const uint8_t ENABLE_NOTIFY[2] = {0x01, 0x00};
 static siri_ble_config_t s_cfg;
 static uint8_t s_own_addr_type;
 static uint8_t s_target_mac[6];  // parsed from CONFIG_SIRI_REMOTE_MAC at startup
+static uint32_t s_last_disconnect_ms;
+static bool s_has_disconnected;
 
 static int gap_event_cb(struct ble_gap_event *event, void *arg);
 static void start_scan(void);
+
+static uint32_t now_ms(void)
+{
+    return (uint32_t)(esp_timer_get_time() / 1000);
+}
 
 // Parse "aa:bb:cc:dd:ee:ff" into NimBLE's little-endian 6-byte layout (byte 0 = 0xff).
 static bool parse_mac(const char *str, uint8_t out[6])
@@ -249,6 +257,11 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_DISCONNECT:
         ESP_LOGI(TAG, "disconnected, reason=0x%04x", event->disconnect.reason);
         peer_delete(event->disconnect.conn.conn_handle);
+        s_last_disconnect_ms = now_ms();
+        s_has_disconnected   = true;
+        if (s_cfg.on_disconnected != NULL) {
+            s_cfg.on_disconnected(s_cfg.user);
+        }
         start_scan();
         return 0;
 
@@ -256,19 +269,28 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         ESP_LOGI(TAG, "mtu=%d", event->mtu.value);
         return 0;
 
-    case BLE_GAP_EVENT_ENC_CHANGE:
+    case BLE_GAP_EVENT_ENC_CHANGE: {
         ESP_LOGI(TAG, "encryption changed, status=%d", event->enc_change.status);
-        if (event->enc_change.status == 0) {
-            int rc = peer_disc_all(event->enc_change.conn_handle,
-                                   on_disc_complete, NULL);
-            if (rc != 0) {
-                // BLE_HS_EBUSY (7) if MTU exchange is still pending. A subsequent
-                // ENC_CHANGE fires after MTU completes and retries successfully.
-                // Tracked in the Phase 3 hardening memory.
-                ESP_LOGD(TAG, "peer_disc_all deferred: rc=%d", rc);
-            }
+        if (event->enc_change.status != 0) {
+            return 0;
+        }
+        uint32_t idle = 0;
+        if (s_has_disconnected) {
+            idle = now_ms() - s_last_disconnect_ms;
+        }
+        if (s_cfg.on_connected != NULL) {
+            s_cfg.on_connected(idle, s_cfg.user);
+        }
+        int rc = peer_disc_all(event->enc_change.conn_handle,
+                               on_disc_complete, NULL);
+        if (rc != 0) {
+            // BLE_HS_EBUSY (7) if MTU exchange is still pending. A subsequent
+            // ENC_CHANGE fires after MTU completes and retries successfully.
+            // Tracked in the Phase 3 hardening memory.
+            ESP_LOGD(TAG, "peer_disc_all deferred: rc=%d", rc);
         }
         return 0;
+    }
 
     case BLE_GAP_EVENT_NOTIFY_RX: {
         uint16_t len = OS_MBUF_PKTLEN(event->notify_rx.om);
@@ -282,7 +304,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
             return 0;
         }
         if (s_cfg.on_notify != NULL) {
-            s_cfg.on_notify(event->notify_rx.attr_handle, buf, copied);
+            s_cfg.on_notify(event->notify_rx.attr_handle, buf, copied, s_cfg.user);
         }
         return 0;
     }

@@ -21,6 +21,15 @@ CONFIG_BT_NIMBLE_MAX_BONDS=1
 CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
 CONFIG_BT_NIMBLE_NVS_PERSIST=y
 
+# Flash + partition layout — WROOM-32 ships with 4 MB flash; the default 1 MB
+# factory partition overflows once Wi-Fi + MQTT join BLE in Phase 2.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# Wi-Fi + MQTT + BLE coexistence on a single 2.4 GHz radio.
+CONFIG_SW_COEXIST_ENABLE=y
+
 # Quality-of-life log output over UART.
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y

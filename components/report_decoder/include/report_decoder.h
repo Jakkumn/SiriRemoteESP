@@ -1,7 +1,8 @@
 #pragma once
 
-#include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 
 // Button bitmap carried in a 2-byte HID report from handle 0x0039 on gen-3.
 // Empirically verified — each bit maps to one physical control. The report
@@ -24,4 +25,23 @@ typedef enum {
     SIRI_BTN_LEFT       = 0x1000,
 } siri_button_bit_t;
 
+// Parsed 11-byte touch/clickpad frame from handle 0x003D on gen-3.
+typedef struct {
+    int32_t  x;
+    int32_t  y;
+    uint8_t  pressure;
+    bool     finger_down;
+    uint32_t remote_counter;
+} siri_touch_frame_t;
+
 bool siri_button_is_pressed(uint16_t buttons, siri_button_bit_t bit);
+
+// Convert a 2-byte HID report into a 16-bit button bitmap. Returns 0 if len < 2.
+uint16_t siri_decode_button_bytes(const uint8_t *data, size_t len);
+
+// Parse an 11-byte touch frame. Returns false if len != 11 or byte 0 != 0x32.
+bool siri_decode_touch_frame(const uint8_t *data, size_t len, siri_touch_frame_t *out);
+
+// Enum → string for JSON serialization: "volume_up", "play_pause", etc.
+// Returns NULL for an unknown or zero value.
+const char *siri_button_name(siri_button_bit_t bit);

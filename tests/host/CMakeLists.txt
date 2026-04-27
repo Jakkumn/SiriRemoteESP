@@ -17,7 +17,7 @@ add_compile_options(-Wall -Wextra -Wpedantic -Werror -UNDEBUG)
 add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
 add_link_options(-fsanitize=address,undefined)
 
-# Build the decoder as a plain static library from its real source path.
+# Build each component as a plain static library from its real source path.
 # No ESP-IDF headers — that's the invariant these tests defend.
 set(DECODER_DIR "${CMAKE_CURRENT_LIST_DIR}/../../components/report_decoder")
 add_library(report_decoder STATIC
@@ -25,14 +25,24 @@ add_library(report_decoder STATIC
 )
 target_include_directories(report_decoder PUBLIC ${DECODER_DIR}/include)
 
+set(EVENT_STATE_DIR "${CMAKE_CURRENT_LIST_DIR}/../../components/event_state")
+add_library(event_state STATIC
+    ${EVENT_STATE_DIR}/event_state.c
+)
+target_include_directories(event_state PUBLIC ${EVENT_STATE_DIR}/include)
+target_link_libraries(event_state PUBLIC report_decoder)
+
 enable_testing()
 
 # One executable per test file — CTest runs each independently so a crash
 # in one doesn't mask others.
 function(add_host_test name)
     add_executable(${name} ${name}.c)
-    target_link_libraries(${name} PRIVATE report_decoder)
     add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
 add_host_test(test_report_decoder)
+target_link_libraries(test_report_decoder PRIVATE report_decoder)
+
+add_host_test(test_event_state)
+target_link_libraries(test_event_state PRIVATE event_state)

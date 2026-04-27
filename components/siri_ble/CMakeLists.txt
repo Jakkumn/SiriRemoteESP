@@ -1,7 +1,7 @@
 idf_component_register(
     SRCS "siri_ble.c" "peer.c"
     INCLUDE_DIRS "include" "."
-    REQUIRES bt nvs_flash
+    REQUIRES bt nvs_flash esp_timer
 )
 
 # Enforce strict warnings on our own code. peer.c is copied from IDF's

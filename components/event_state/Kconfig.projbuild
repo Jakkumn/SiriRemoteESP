@@ -1,0 +1,37 @@
+menu "Event state machine"
+
+    config EVENT_DOUBLE_WINDOW_MS
+        int "Double-click window (ms)"
+        default 300
+        range 0 2000
+        help
+            Window after a click during which a second press upgrades to
+            DOUBLE_CLICK. Set to 0 to disable — CLICK fires instantly with
+            no double-click support.
+
+    config EVENT_HOLD_THRESHOLD_MS
+        int "Hold threshold (ms)"
+        default 700
+        range 0 10000
+        help
+            Press duration at which HOLD_START fires. Set to 0 to disable
+            hold detection entirely.
+
+    config EVENT_SWIPE_MIN_DISTANCE
+        int "Swipe minimum distance"
+        default 40
+        range 0 500
+        help
+            Minimum finger-travel (in touchpad units) to count as a semantic
+            swipe. Below this, no swipe_* event is emitted. Does not affect
+            the raw touch stream.
+
+    config EVENT_PICKUP_IDLE_THRESHOLD_MS
+        int "Pickup event idle threshold (ms)"
+        default 30000
+        range 0 600000
+        help
+            Minimum idle time (BLE disconnected) before a reconnect counts as
+            a pickup event. Set to 0 to disable pickup events.
+
+endmenu
