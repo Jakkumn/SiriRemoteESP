@@ -1,15 +1,17 @@
 # siri-remote-ha-bridge
 
 An ESP32 BLE bridge that pairs with an Apple Siri Remote (gen 3) and forwards
-button/touch events to Home Assistant via MQTT.
+button + clickpad events to Home Assistant via MQTT, with Home Assistant
+auto-discovery so the remote shows up as a device automatically.
 
-**Status:** Phase 0 — BLE bring-up. The firmware boots, initializes NimBLE,
-and passively scans for advertisements. Siri Remote pairing is not yet wired
-up.
+**Status:** Phase 2 — Wi-Fi + MQTT + HA integration. Buttons, swipes, and
+pickup events publish to MQTT; HA auto-discovers an Event entity and a
+runtime Switch for the optional raw touch stream. Touch coordinate decoding
+and battery/charging publishing are deferred to Phase 3.
 
 ## Hardware
 
-- **MCU (development)**: ESP32-WROOM-32 DevKit
+- **MCU (development)**: ESP32-WROOM-32 DevKit (4 MB flash)
 - **MCU (eventual target)**: ESP32-S3 DevKit-C (`make set-esp32s3` to retarget)
 - **Remote**: Apple Siri Remote, 3rd generation (2022, USB-C)
 
@@ -21,24 +23,120 @@ up.
   [Espressif's setup guide](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/get-started/)
 - `export IDF_PATH=~/esp/esp-idf` in your shell (or source
   `~/esp/esp-idf/export.sh` the traditional way)
+- A running Home Assistant instance with the **MQTT integration** enabled
+  (Mosquitto add-on or any external broker)
 
 ## Quick start
 
 ```bash
 make test          # host-side unit tests, no hardware required
-make set-esp32     # target WROOM-32 (one-time per target switch)
+make menuconfig    # set Wi-Fi SSID/password + MQTT broker URI/credentials
 make build         # compile firmware
 make fm            # flash + monitor the connected device
 ```
 
 Run `make` with no arguments to see all targets.
 
+## Configuration knobs (`menuconfig`)
+
+| Menu | Key | Default | Purpose |
+|---|---|---|---|
+| Siri Bridge Configuration | `WIFI_SSID` / `WIFI_PASSWORD` | empty | Wi-Fi credentials |
+| Siri Bridge Configuration | `MQTT_BROKER_URI` | `mqtt://homeassistant.local:1883` | MQTT broker |
+| Siri Bridge Configuration | `MQTT_USERNAME` / `MQTT_PASSWORD` | empty | MQTT auth |
+| Siri BLE Bridge | `SIRI_REMOTE_MAC` | dev-paired MAC | Target remote |
+| Event state machine | `EVENT_DOUBLE_WINDOW_MS` | 300 | Double-click window |
+| Event state machine | `EVENT_HOLD_THRESHOLD_MS` | 700 | Hold detection |
+| Event state machine | `EVENT_SWIPE_MIN_DISTANCE` | 40 | Swipe threshold |
+| Event state machine | `EVENT_PICKUP_IDLE_THRESHOLD_MS` | 30000 | Pickup idle gate |
+
+`= 0` on the timing fields disables that feature (clean kill-switch).
+
+## MQTT topics published
+
+| Topic | Retained | Purpose |
+|---|---|---|
+| `siri_remote/event` | no | Discrete events (click/double_click/hold_start/hold_end/swipe_*/pickup) |
+| `siri_remote/touch_raw` | no | Raw touch frames at ~50/sec — only when the HA Switch is on |
+| `siri_remote/connection` | yes (LWT) | `online` / `offline` |
+| `siri_remote/state/raw_stream` | yes | Current Switch state, mirrored from NVS |
+
+## Home Assistant automation patterns
+
+The bridge auto-discovers as a single **Event entity** with these `event_type`
+values: `click`, `double_click`, `hold_start`, `hold_end`, `swipe_up`,
+`swipe_down`, `swipe_left`, `swipe_right`, `pickup`. Event payloads include
+`button` (for button events), `duration_ms` (for click/hold_end), `distance`
+(for swipes), and `idle_duration_ms` (for pickup).
+
+**Toggle a light on click:**
+```yaml
+trigger:
+  platform: state
+  entity_id: event.siri_remote
+condition: >
+  {{ trigger.to_state.attributes.event_type == 'click'
+     and trigger.to_state.attributes.button == 'volume_up' }}
+action:
+  service: light.toggle
+  target:
+    entity_id: light.living_room
+```
+
+**Dim while holding** (start a loop on `hold_start`, stop on `hold_end`):
+```yaml
+- alias: "Vol Down hold dims"
+  trigger:
+    platform: state
+    entity_id: event.siri_remote
+  condition: >
+    {{ trigger.to_state.attributes.event_type == 'hold_start'
+       and trigger.to_state.attributes.button == 'volume_down' }}
+  action:
+    repeat:
+      while: "{{ states('input_boolean.dimming') == 'on' }}"
+      sequence:
+        - service: light.turn_on
+          data:
+            entity_id: light.living_room
+            brightness_step_pct: -5
+        - delay: "00:00:00.1"
+```
+
+**Welcome-home on long pickup:**
+```yaml
+- alias: "Remote pickup after 1h triggers welcome scene"
+  trigger:
+    platform: state
+    entity_id: event.siri_remote
+  condition: >
+    {{ trigger.to_state.attributes.event_type == 'pickup'
+       and trigger.to_state.attributes.idle_duration_ms | int > 3600000 }}
+  action:
+    service: scene.turn_on
+    target:
+      entity_id: scene.evening_lights
+```
+
+**Magnitude-aware swipe:**
+```yaml
+condition: >
+  {{ trigger.to_state.attributes.event_type == 'swipe_up'
+     and trigger.to_state.attributes.distance | int > 100 }}
+```
+
 ## Project layout
 
 ```
-components/report_decoder/  # pure-C HID report decoder (no IDF deps)
-main/                       # firmware entry point + NimBLE bring-up
-tests/host/                 # host-side unit tests (CMake + assert())
+components/
+  siri_ble/         # BLE central — scan, pair, discover, magic unlock, notify dispatch
+  report_decoder/   # Pure-C parsers (button bitmap, touch frame, name lookup)
+  event_state/      # Pure-C state machine — derives semantic events from raw input
+main/
+  main.c            # Wi-Fi, MQTT, NVS, HA auto-discovery, glue
+  Kconfig.projbuild # Wi-Fi + MQTT credential config
+tests/host/         # Host unit tests (no hardware required) — ASan + UBSan enabled
+  fixtures/         # Captured per-button + per-swipe byte sequences from real hardware
 ```
 
 ## Acknowledgments

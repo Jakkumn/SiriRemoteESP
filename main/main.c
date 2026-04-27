@@ -46,14 +46,6 @@ static const char *TAG = "main";
 #define TOPIC_DISCOVERY_EVENT    "homeassistant/event/siri_remote/config"
 #define TOPIC_DISCOVERY_SWITCH   "homeassistant/switch/siri_remote_raw_stream/config"
 
-static const char *HA_DEVICE_JSON =
-    "\"device\":{"
-    "\"identifiers\":[\"siri_remote_bridge\"],"
-    "\"name\":\"Siri Remote Bridge\","
-    "\"manufacturer\":\"Apple\","
-    "\"model\":\"Siri Remote (3rd gen)\""
-    "}";
-
 // State.
 static esp_mqtt_client_handle_t s_mqtt;
 static event_state_t           *s_es;

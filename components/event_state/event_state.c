@@ -106,8 +106,6 @@ static void emit_pending_click(event_state_t *es, per_button_t *b,
 static void handle_press(event_state_t *es, int idx, uint32_t now_ms)
 {
     per_button_t *b = &es->buttons[idx];
-    siri_button_bit_t bit = INDEX_TO_BIT[idx];
-    (void)bit;
 
     if (b->pending_emit_at_ms != 0) {
         // Second press arrived inside the double-click window: cancel the
