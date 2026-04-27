@@ -21,10 +21,11 @@ static void reset_capture(void) { captured_count = 0; }
 static event_state_t *make_es(uint32_t double_ms, uint32_t hold_ms)
 {
     event_state_config_t cfg = {
-        .double_click_max_ms       = double_ms,
-        .hold_min_ms               = hold_ms,
-        .swipe_min_distance        = 40,
-        .pickup_idle_threshold_ms  = 30000,
+        .double_click_max_ms        = double_ms,
+        .hold_min_ms                = hold_ms,
+        .swipe_min_distance         = 40,
+        .swipe_y_priority_threshold = 30,
+        .pickup_idle_threshold_ms   = 30000,
     };
     event_state_t *es = event_state_create(&cfg, capture_cb, NULL);
     assert(es != NULL);
@@ -270,10 +271,11 @@ static void test_pickup_zero_idle(void)
 static void test_pickup_disabled(void)
 {
     event_state_config_t cfg = {
-        .double_click_max_ms      = 300,
-        .hold_min_ms              = 700,
-        .swipe_min_distance       = 40,
-        .pickup_idle_threshold_ms = 0,  // disabled
+        .double_click_max_ms        = 300,
+        .hold_min_ms                = 700,
+        .swipe_min_distance         = 40,
+        .swipe_y_priority_threshold = 30,
+        .pickup_idle_threshold_ms   = 0,  // disabled
     };
     event_state_t *es = event_state_create(&cfg, capture_cb, NULL);
     reset_capture();
@@ -328,7 +330,7 @@ static void test_swipe_left_right(void)
 {
     event_state_t *es = make_es(300, 700);
 
-    // Positive dx = LEFT (per gen-3 empirical observation).
+    // Positive dx = RIGHT (signed Cartesian: +X is right of center).
     siri_touch_frame_t f = {.x = 100, .y = 0, .pressure = 50, .finger_down = true};
     event_state_feed_touch(es, &f, 0);
     f.x = 300;
@@ -336,12 +338,12 @@ static void test_swipe_left_right(void)
     f.finger_down = false;
     event_state_feed_touch(es, &f, 150);
     assert(captured_count == 1);
-    assert(captured[0].action == EVT_SWIPE_LEFT);
+    assert(captured[0].action == EVT_SWIPE_RIGHT);
     assert(captured[0].distance == 200);
 
     reset_capture();
 
-    // Negative dx = RIGHT.
+    // Negative dx = LEFT.
     siri_touch_frame_t g = {.x = 500, .y = 0, .pressure = 50, .finger_down = true};
     event_state_feed_touch(es, &g, 200);
     g.x = 200;
@@ -349,8 +351,58 @@ static void test_swipe_left_right(void)
     g.finger_down = false;
     event_state_feed_touch(es, &g, 350);
     assert(captured_count == 1);
-    assert(captured[0].action == EVT_SWIPE_RIGHT);
+    assert(captured[0].action == EVT_SWIPE_LEFT);
     assert(captured[0].distance == 300);
+
+    event_state_destroy(es);
+}
+
+static void test_y_priority_overrides_drifty_x(void)
+{
+    // Regression: a swipe-down with significant horizontal drift (|dx| > |dy|)
+    // should still classify as DOWN as long as |dy| crosses the Y-priority
+    // threshold (default 30). Without the bias, this swipe would misclassify
+    // as swipe-left because positive dx wins by raw magnitude.
+    event_state_t *es = make_es(300, 700);
+
+    siri_touch_frame_t f = {.x = 100, .y = 50, .pressure = 50, .finger_down = true};
+    event_state_feed_touch(es, &f, 0);
+    f.x = 250; f.y = -10;  // dx=+150, dy=-60 — X dominant by raw magnitude
+    event_state_feed_touch(es, &f, 100);
+    f.finger_down = false;
+    event_state_feed_touch(es, &f, 150);
+
+    assert(captured_count == 1);
+    assert(captured[0].action == EVT_SWIPE_DOWN);
+    assert(captured[0].distance == 60);
+
+    event_state_destroy(es);
+}
+
+static void test_y_priority_disabled_falls_back(void)
+{
+    // With the priority threshold = 0, classification reverts to plain
+    // |dy| > |dx|, meaning the same gesture would now misclassify as swipe-left.
+    event_state_config_t cfg = {
+        .double_click_max_ms        = 300,
+        .hold_min_ms                = 700,
+        .swipe_min_distance         = 40,
+        .swipe_y_priority_threshold = 0,  // disabled
+        .pickup_idle_threshold_ms   = 30000,
+    };
+    event_state_t *es = event_state_create(&cfg, capture_cb, NULL);
+    reset_capture();
+
+    siri_touch_frame_t f = {.x = 100, .y = 50, .pressure = 50, .finger_down = true};
+    event_state_feed_touch(es, &f, 0);
+    f.x = 250; f.y = -10;  // dx=+150, dy=-60
+    event_state_feed_touch(es, &f, 100);
+    f.finger_down = false;
+    event_state_feed_touch(es, &f, 150);
+
+    assert(captured_count == 1);
+    assert(captured[0].action == EVT_SWIPE_RIGHT);  // unbiased: +dx = right
+    assert(captured[0].distance == 150);
 
     event_state_destroy(es);
 }
@@ -410,6 +462,8 @@ int main(void)
     test_swipe_up();
     test_swipe_down();
     test_swipe_left_right();
+    test_y_priority_overrides_drifty_x();
+    test_y_priority_disabled_falls_back();
     test_micro_touch_below_threshold();
     test_diagonal_uses_larger_axis();
     printf("test_event_state: ok\n");

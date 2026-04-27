@@ -242,6 +242,18 @@ static void on_notify_cb(uint16_t attr_handle, const uint8_t *data, size_t len, 
     } else if (attr_handle == 0x003D) {
         siri_touch_frame_t frame;
         if (siri_decode_touch_frame(data, len, &frame)) {
+#ifdef CONFIG_DEBUG_TOUCH_FRAMES
+            // Diagnostic dump: raw bytes + parsed view. Used to study how the
+            // circular touchpad encodes positions at its edges (small swipes
+            // near top/bottom misclassify direction).
+            ESP_LOGI(TAG,
+                     "touch raw=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x"
+                     " | x=%" PRId32 " y=%" PRId32 " p=%u down=%d ctr=%" PRIu32,
+                     data[0], data[1], data[2], data[3], data[4], data[5],
+                     data[6], data[7], data[8], data[9], data[10],
+                     frame.x, frame.y, (unsigned)frame.pressure,
+                     (int)frame.finger_down, frame.remote_counter);
+#endif
             xSemaphoreTake(s_es_lock, portMAX_DELAY);
             event_state_feed_touch(s_es, &frame, now_ms());
             xSemaphoreGive(s_es_lock);
@@ -423,10 +435,11 @@ void app_main(void)
     assert(s_es_lock != NULL);
 
     event_state_config_t es_cfg = {
-        .double_click_max_ms      = CONFIG_EVENT_DOUBLE_WINDOW_MS,
-        .hold_min_ms              = CONFIG_EVENT_HOLD_THRESHOLD_MS,
-        .swipe_min_distance       = CONFIG_EVENT_SWIPE_MIN_DISTANCE,
-        .pickup_idle_threshold_ms = CONFIG_EVENT_PICKUP_IDLE_THRESHOLD_MS,
+        .double_click_max_ms         = CONFIG_EVENT_DOUBLE_WINDOW_MS,
+        .hold_min_ms                 = CONFIG_EVENT_HOLD_THRESHOLD_MS,
+        .swipe_min_distance          = CONFIG_EVENT_SWIPE_MIN_DISTANCE,
+        .swipe_y_priority_threshold  = CONFIG_EVENT_SWIPE_Y_PRIORITY,
+        .pickup_idle_threshold_ms    = CONFIG_EVENT_PICKUP_IDLE_THRESHOLD_MS,
     };
     s_es = event_state_create(&es_cfg, emit_cb, NULL);
     assert(s_es != NULL);

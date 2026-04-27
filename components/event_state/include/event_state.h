@@ -23,10 +23,11 @@ typedef enum {
 } event_action_t;
 
 typedef struct {
-    uint32_t double_click_max_ms;      // 0 disables DOUBLE_CLICK; CLICK fires instantly
-    uint32_t hold_min_ms;              // 0 disables HOLD_START/HOLD_END
-    int32_t  swipe_min_distance;       // minimum axis delta to count as a swipe
-    uint32_t pickup_idle_threshold_ms; // 0 disables PICKUP
+    uint32_t double_click_max_ms;        // 0 disables DOUBLE_CLICK; CLICK fires instantly
+    uint32_t hold_min_ms;                // 0 disables HOLD_START/HOLD_END
+    int32_t  swipe_min_distance;         // minimum axis delta to count as a swipe
+    int32_t  swipe_y_priority_threshold; // |dy| >= this forces vertical classification; 0 disables
+    uint32_t pickup_idle_threshold_ms;   // 0 disables PICKUP
 } event_state_config_t;
 
 typedef struct {

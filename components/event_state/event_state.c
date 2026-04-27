@@ -223,16 +223,28 @@ void event_state_feed_touch(event_state_t *es, const siri_touch_frame_t *frame, 
         return;
     }
 
+    // The Siri Remote touchpad has asymmetric X/Y resolution — vertical
+    // swipes register significant incidental X drift. Without the Y-priority
+    // bias, a swipe-down with horizontal hand drift is misclassified as
+    // swipe-left. When |dy| crosses the threshold, force vertical.
+    bool y_dominant;
+    if (es->cfg.swipe_y_priority_threshold > 0 &&
+        abs_dy >= es->cfg.swipe_y_priority_threshold) {
+        y_dominant = true;
+    } else {
+        y_dominant = abs_dy > abs_dx;
+    }
+
     event_state_event_t evt = {
         .now_ms   = now_ms,
-        .distance = magnitude,
+        .distance = y_dominant ? abs_dy : abs_dx,
     };
-    if (abs_dy > abs_dx) {
+    if (y_dominant) {
         // Y axis: positive = up on the touchpad.
         evt.action = dy > 0 ? EVT_SWIPE_UP : EVT_SWIPE_DOWN;
     } else {
-        // X axis: positive = left on the touchpad (observed from gen-3 fixtures).
-        evt.action = dx > 0 ? EVT_SWIPE_LEFT : EVT_SWIPE_RIGHT;
+        // X axis: positive = right on the touchpad (signed 11-bit, 0 = center).
+        evt.action = dx > 0 ? EVT_SWIPE_RIGHT : EVT_SWIPE_LEFT;
     }
     emit(es, &evt);
 }

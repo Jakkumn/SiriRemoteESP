@@ -26,6 +26,18 @@ menu "Event state machine"
             swipe. Below this, no swipe_* event is emitted. Does not affect
             the raw touch stream.
 
+    config EVENT_SWIPE_Y_PRIORITY
+        int "Swipe Y-priority threshold"
+        default 30
+        range 0 200
+        help
+            When |dy| meets or exceeds this threshold, the swipe is classified
+            as vertical (UP/DOWN) regardless of |dx|. Compensates for the
+            Siri Remote touchpad's asymmetric X/Y resolution — pure vertical
+            swipes routinely register large incidental X drift, and without
+            this bias, swipe-down often misclassifies as swipe-left. Set to 0
+            to disable and use plain |dy| > |dx| classification.
+
     config EVENT_PICKUP_IDLE_THRESHOLD_MS
         int "Pickup event idle threshold (ms)"
         default 30000

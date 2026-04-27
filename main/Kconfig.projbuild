@@ -28,4 +28,17 @@ menu "Siri Bridge Configuration"
         string "MQTT password"
         default ""
 
+    config DEBUG_TOUCH_FRAMES
+        bool "Log raw touch frames to UART (diagnostic)"
+        default n
+        help
+            When enabled, every touch notification (handle 0x003D) is logged
+            to UART as hex with parsed x/y/pressure/finger fields. Intended
+            for protocol diagnosis — for example, understanding how the
+            circular touchpad encodes coordinates near its physical edges,
+            where small swipes are misclassified.
+
+            Adds significant log spam during touchpad use (~50 lines/sec).
+            Disable for normal operation.
+
 endmenu

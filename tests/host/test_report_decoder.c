@@ -78,15 +78,15 @@ static void test_decode_touch_frame_valid(void)
         0x32, 0xf2, 0x76, 0x01, 0x51, 0xde, 0xc0, 0x51, 0x1e, 0x06, 0xeb};
     siri_touch_frame_t t;
     assert(siri_decode_touch_frame(frame, 11, &t));
-    // X = 0x51 | (0xde & 0x07) << 8 = 81 | 1536 = 1617... actually (0xde & 0x07)=6
-    // 0x51 | (6 << 8) = 81 | 1536 = 1617
-    assert(t.x == (int32_t)(0x51 | ((0xde & 0x07) << 8)));
+    // X is signed 11-bit. Raw = 0x51 | ((0xde & 0x07) << 8) = 81 | (6<<8) = 1617.
+    // Since 1617 >= 1024, sign-extend: 1617 - 2048 = -431 (left of center).
+    assert(t.x == -431);
     // Y = (int8_t)0xc0 = -64
     assert(t.y == -64);
     // Bytes 7,8 = 0x51, 0x1e (non-zero) → finger down
     assert(t.finger_down);
     assert(t.pressure == 0x06);
-    // Counter: f2 76 01 (LE) = 1 << 16 | 0x76 << 8 | 0xf2 = 96498
+    // Counter: f2 76 01 (LE)
     assert(t.remote_counter == (uint32_t)(0xf2 | (0x76 << 8) | (0x01 << 16)));
 }
 

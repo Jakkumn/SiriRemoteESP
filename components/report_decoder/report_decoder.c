@@ -18,9 +18,17 @@ bool siri_decode_touch_frame(const uint8_t *data, size_t len, siri_touch_frame_t
     if (data == NULL || out == NULL || len != 11 || data[0] != 0x32) {
         return false;
     }
-    // X encoding (gen-1-derived; verified against gen-3 fixtures during Phase 2).
-    // The low 3 bits of byte 5 extend byte 4 to form a ~11-bit value.
-    out->x = (int32_t)(data[4] | ((uint32_t)(data[5] & 0x07) << 8));
+    // X is a SIGNED 11-bit value: byte 4 = low 8 bits, low 3 bits of byte 5 =
+    // upper 3 bits, with bit 10 as the sign bit. Range: -1024 to +1023, with
+    // 0 in the middle of the touchpad. Positive = right side, negative = left.
+    // Verified empirically Phase 2 by capturing controlled swipes at center,
+    // top, and bottom of the circular pad — the unsigned interpretation
+    // produced bogus wraparound across the X=0 axis.
+    int32_t x = (int32_t)(data[4] | ((uint32_t)(data[5] & 0x07) << 8));
+    if (x >= 1024) {
+        x -= 2048;
+    }
+    out->x = x;
     // Y is a signed 8-bit value. Positive = upward on the touchpad.
     out->y = (int32_t)(int8_t)data[6];
     // Bytes 7-8 go to zero when the finger lifts.
