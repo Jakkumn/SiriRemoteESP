@@ -22,24 +22,23 @@
 
 static const char *TAG = "siri_ble";
 
-// Expected gen-3 characteristic value handles (empirically verified).
-// We look up CCCDs by walking the discovered peer for a char with this val_handle;
-// if gen-3 firmware shifts handles, we log a mismatch warning and proceed with what we found.
-#define EXPECTED_BUTTON_VAL_HANDLE 0x0039
-#define EXPECTED_TOUCH_VAL_HANDLE  0x003D
-#define EXPECTED_BUTTON_CCCD       0x003A
-#define EXPECTED_TOUCH_CCCD        0x003E
-
-// Vendor-specific unlock — no standard UUID, handle is hardcoded per Yanndroid gen-3 source.
-#define MAGIC_HANDLE 0x004D
+// Gen-3 GATT handles, empirically verified in Phase 1 and reproducible across
+// reconnects on the same unit. We skip GATT service discovery on the live path
+// (~3.7 seconds saved per connection) and write directly to these handles.
+// If a future unit has a different layout, set CONFIG_SIRI_BLE_VERBOSE_DISCOVERY
+// in menuconfig to re-enable a one-time peer-layout dump on first connect.
+#define BUTTON_CCCD_HANDLE  0x003A
+#define TOUCH_CCCD_HANDLE   0x003E
+#define MAGIC_HANDLE        0x004D
 static const uint8_t MAGIC_VALUE[2]   = {0xF0, 0x00};
 static const uint8_t ENABLE_NOTIFY[2] = {0x01, 0x00};
 
 static siri_ble_config_t s_cfg;
 static uint8_t s_own_addr_type;
-static uint8_t s_target_mac[6];  // parsed from CONFIG_SIRI_REMOTE_MAC at startup
+static uint8_t s_target_mac[6];
 static uint32_t s_last_disconnect_ms;
 static bool s_has_disconnected;
+static uint16_t s_setup_done_conn = 0xFFFF;  // dedup: per-connection setup runs once
 
 static int gap_event_cb(struct ble_gap_event *event, void *arg);
 static void start_scan(void);
@@ -67,26 +66,6 @@ static void log_addr(const char *prefix, const uint8_t val[6])
 {
     ESP_LOGI(TAG, "%s %02x:%02x:%02x:%02x:%02x:%02x",
              prefix, val[5], val[4], val[3], val[2], val[1], val[0]);
-}
-
-static uint16_t find_cccd_for_val_handle(const struct peer *peer, uint16_t val_handle)
-{
-    struct peer_svc *svc;
-    SLIST_FOREACH(svc, &peer->svcs, next) {
-        struct peer_chr *chr;
-        SLIST_FOREACH(chr, &svc->chrs, next) {
-            if (chr->chr.val_handle != val_handle) {
-                continue;
-            }
-            struct peer_dsc *dsc;
-            SLIST_FOREACH(dsc, &chr->dscs, next) {
-                if (ble_uuid_u16(&dsc->dsc.uuid.u) == BLE_GATT_DSC_CLT_CFG_UUID16) {
-                    return dsc->dsc.handle;
-                }
-            }
-        }
-    }
-    return 0;
 }
 
 static void start_scan(void)
@@ -158,58 +137,23 @@ static void enable_cccd(uint16_t conn_handle, uint16_t cccd_handle, const char *
     }
 }
 
-static void log_peer_layout(const struct peer *peer)
+// Fast-path connection setup: subscribe to button + touch notifications and
+// fire the magic unlock. Idempotent per connection — calling twice (e.g. if
+// ENC_CHANGE fires multiple times during bonded resume) is a no-op the second
+// time. Skips GATT service discovery entirely; Phase 1 verified the gen-3
+// handle layout and it's reproducible per unit, so discovery is dead weight
+// on the live path (~3.7 seconds per reconnect).
+static void apply_remote_setup(uint16_t conn_handle)
 {
-    ESP_LOGI(TAG, "peer layout:");
-    struct peer_svc *svc;
-    SLIST_FOREACH(svc, &peer->svcs, next) {
-        char uuid_buf[BLE_UUID_STR_LEN];
-        ble_uuid_to_str(&svc->svc.uuid.u, uuid_buf);
-        ESP_LOGI(TAG, "  svc %s  [0x%04x..0x%04x]",
-                 uuid_buf, svc->svc.start_handle, svc->svc.end_handle);
-        struct peer_chr *chr;
-        SLIST_FOREACH(chr, &svc->chrs, next) {
-            ble_uuid_to_str(&chr->chr.uuid.u, uuid_buf);
-            ESP_LOGI(TAG, "    chr %s  def=0x%04x val=0x%04x props=0x%02x",
-                     uuid_buf, chr->chr.def_handle, chr->chr.val_handle,
-                     chr->chr.properties);
-            struct peer_dsc *dsc;
-            SLIST_FOREACH(dsc, &chr->dscs, next) {
-                ble_uuid_to_str(&dsc->dsc.uuid.u, uuid_buf);
-                ESP_LOGI(TAG, "      dsc %s  handle=0x%04x",
-                         uuid_buf, dsc->dsc.handle);
-            }
-        }
-    }
-}
-
-static void on_disc_complete(const struct peer *peer, int status, void *arg)
-{
-    if (status != 0) {
-        ESP_LOGE(TAG, "service discovery failed: status=%d", status);
-        (void)ble_gap_terminate(peer->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    if (s_setup_done_conn == conn_handle) {
         return;
     }
+    s_setup_done_conn = conn_handle;
 
-    log_peer_layout(peer);
+    enable_cccd(conn_handle, BUTTON_CCCD_HANDLE, "button CCCD");
+    enable_cccd(conn_handle, TOUCH_CCCD_HANDLE,  "touch CCCD");
 
-    uint16_t cccd_btn   = find_cccd_for_val_handle(peer, EXPECTED_BUTTON_VAL_HANDLE);
-    uint16_t cccd_touch = find_cccd_for_val_handle(peer, EXPECTED_TOUCH_VAL_HANDLE);
-
-    if (cccd_btn != 0 && cccd_btn != EXPECTED_BUTTON_CCCD) {
-        ESP_LOGW(TAG, "button CCCD is 0x%04x (expected 0x%04x)",
-                 cccd_btn, EXPECTED_BUTTON_CCCD);
-    }
-    if (cccd_touch != 0 && cccd_touch != EXPECTED_TOUCH_CCCD) {
-        ESP_LOGW(TAG, "touch CCCD is 0x%04x (expected 0x%04x)",
-                 cccd_touch, EXPECTED_TOUCH_CCCD);
-    }
-
-    enable_cccd(peer->conn_handle, cccd_btn,   "button CCCD");
-    enable_cccd(peer->conn_handle, cccd_touch, "touch CCCD");
-
-    // Magic unlock has no discoverable UUID — hardcoded handle from gen-3 source.
-    int rc = ble_gattc_write_flat(peer->conn_handle, MAGIC_HANDLE,
+    int rc = ble_gattc_write_flat(conn_handle, MAGIC_HANDLE,
                                   MAGIC_VALUE, sizeof(MAGIC_VALUE),
                                   on_write_done, (void *)"magic unlock");
     if (rc != 0) {
@@ -259,6 +203,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         peer_delete(event->disconnect.conn.conn_handle);
         s_last_disconnect_ms = now_ms();
         s_has_disconnected   = true;
+        s_setup_done_conn    = 0xFFFF;
         if (s_cfg.on_disconnected != NULL) {
             s_cfg.on_disconnected(s_cfg.user);
         }
@@ -281,14 +226,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         if (s_cfg.on_connected != NULL) {
             s_cfg.on_connected(idle, s_cfg.user);
         }
-        int rc = peer_disc_all(event->enc_change.conn_handle,
-                               on_disc_complete, NULL);
-        if (rc != 0) {
-            // BLE_HS_EBUSY (7) if MTU exchange is still pending. A subsequent
-            // ENC_CHANGE fires after MTU completes and retries successfully.
-            // Tracked in the Phase 3 hardening memory.
-            ESP_LOGD(TAG, "peer_disc_all deferred: rc=%d", rc);
-        }
+        apply_remote_setup(event->enc_change.conn_handle);
         return 0;
     }
 
