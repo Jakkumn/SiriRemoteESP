@@ -249,22 +249,6 @@ void event_state_feed_touch(event_state_t *es, const siri_touch_frame_t *frame, 
     emit(es, &evt);
 }
 
-void event_state_feed_connect(event_state_t *es, uint32_t idle_ms, uint32_t now_ms)
-{
-    if (es == NULL || es->cfg.pickup_idle_threshold_ms == 0) {
-        return;
-    }
-    if (idle_ms < es->cfg.pickup_idle_threshold_ms) {
-        return;
-    }
-    event_state_event_t evt = {
-        .action           = EVT_PICKUP,
-        .now_ms           = now_ms,
-        .idle_duration_ms = idle_ms,
-    };
-    emit(es, &evt);
-}
-
 void event_state_tick(event_state_t *es, uint32_t now_ms)
 {
     if (es == NULL) {
@@ -326,4 +310,24 @@ void event_state_reset(event_state_t *es, uint32_t now_ms)
     }
     memset(&es->touch, 0, sizeof(es->touch));
     es->prev_buttons = 0;
+}
+
+void event_state_set_swipe_y_priority(event_state_t *es, int32_t value)
+{
+    if (es != NULL) es->cfg.swipe_y_priority_threshold = value;
+}
+
+void event_state_set_swipe_min_distance(event_state_t *es, int32_t value)
+{
+    if (es != NULL) es->cfg.swipe_min_distance = value;
+}
+
+void event_state_set_double_click_max_ms(event_state_t *es, uint32_t value)
+{
+    if (es != NULL) es->cfg.double_click_max_ms = value;
+}
+
+void event_state_set_hold_min_ms(event_state_t *es, uint32_t value)
+{
+    if (es != NULL) es->cfg.hold_min_ms = value;
 }

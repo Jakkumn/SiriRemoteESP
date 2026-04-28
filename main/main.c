@@ -58,9 +58,20 @@ static esp_mqtt_client_handle_t s_mqtt;
 static event_state_t           *s_es;
 static SemaphoreHandle_t        s_es_lock;
 static volatile bool            s_mqtt_connected;
+static volatile bool            s_remote_connected;  // tracks BLE-side state
+                                                     // for the MQTT-reconnect
+                                                     // republish of remote_status
 static esp_timer_handle_t       s_tick_timer;
 static mqtt_entity_t           *s_raw_stream_entity;
 static mqtt_entity_t           *s_repair_entity;
+// Phase 3B.8 runtime tunables. NVS-persisted via the helper; on_change
+// callbacks push live updates into event_state / siri_ble.
+static mqtt_entity_t           *s_swipe_y_pri_entity;
+static mqtt_entity_t           *s_swipe_dist_entity;
+static mqtt_entity_t           *s_dbl_ms_entity;
+static mqtt_entity_t           *s_hold_ms_entity;
+static mqtt_entity_t           *s_battery_low_entity;
+static mqtt_entity_t           *s_ble_lat_entity;
 // On first-bond, Apple's HID flushes the press/release notifies that were
 // buffered during the bond window (the TV+VolUp pairing-combo the user
 // just held) right after the button CCCD subscribe lands. Without
@@ -99,8 +110,7 @@ static void publish_ha_discovery_event(void)
         "\"state_topic\":\"" TOPIC_EVENT "\","
         "\"event_types\":["
         "\"click\",\"double_click\",\"hold_start\",\"hold_end\","
-        "\"swipe_up\",\"swipe_down\",\"swipe_left\",\"swipe_right\","
-        "\"pickup\"],"
+        "\"swipe_up\",\"swipe_down\",\"swipe_left\",\"swipe_right\"],"
         "\"device\":{"
         "\"identifiers\":[\"siri_remote_bridge\"],"
         "\"name\":\"Siri Remote Bridge\","
@@ -165,11 +175,22 @@ static void publish_remote_status(bool connected)
                  0, 1, /*retain*/ true);
 }
 
+// Latest battery + charging bytes cached so we can re-publish them on MQTT
+// (re)connect. Necessary because on cold boot the BLE bonded reconnect
+// often completes (and runs the battery/charging initial read) before
+// Wi-Fi + MQTT finish associating — the publish goes nowhere, and the
+// remote only emits *change* notifications afterwards, so HA is stuck
+// without a value until the level happens to shift.
+// 0xFF = unknown / not yet observed.
+static uint8_t s_last_battery_level = 0xFF;
+static uint8_t s_last_charging_byte = 0xFF;
+
 static void publish_battery(uint8_t level)
 {
+    s_last_battery_level = level;
     char buf[64];
-    bool low = CONFIG_BATTERY_LOW_THRESHOLD_PCT > 0 &&
-               level <= CONFIG_BATTERY_LOW_THRESHOLD_PCT;
+    int32_t threshold = mqtt_entity_get_value(s_battery_low_entity);
+    bool low = threshold > 0 && level <= threshold;
     int n = snprintf(buf, sizeof(buf),
                      "{\"level\":%u,\"low\":%s}",
                      (unsigned)level, low ? "true" : "false");
@@ -181,6 +202,7 @@ static void publish_battery(uint8_t level)
 
 static void publish_charging(uint8_t state_byte)
 {
+    s_last_charging_byte = state_byte;
     // BLE-standard 0x2A1A "Battery Power State" is a single byte with four
     // 2-bit fields. Bits 4..5 = charging field, 2..3 = discharging field.
     // Value 3 in either means "yes that state is active".
@@ -227,7 +249,6 @@ static const char *action_to_event_type(event_action_t a)
     case EVT_SWIPE_DOWN:   return "swipe_down";
     case EVT_SWIPE_LEFT:   return "swipe_left";
     case EVT_SWIPE_RIGHT:  return "swipe_right";
-    case EVT_PICKUP:       return "pickup";
     }
     return NULL;
 }
@@ -266,11 +287,6 @@ static void emit_cb(const event_state_event_t *evt, void *user)
         n = snprintf(buf, sizeof(buf),
                      "{\"event_type\":\"%s\",\"distance\":%" PRId32 "}",
                      event_type, evt->distance);
-        break;
-    case EVT_PICKUP:
-        n = snprintf(buf, sizeof(buf),
-                     "{\"event_type\":\"%s\",\"idle_duration_ms\":%" PRIu32 "}",
-                     event_type, evt->idle_duration_ms);
         break;
     }
     if (n > 0) {
@@ -332,6 +348,7 @@ static void on_connected_cb(uint32_t idle_ms, void *user)
 {
     (void)user;
     ESP_LOGI(TAG, "remote connected (idle %" PRIu32 " ms)", idle_ms);
+    s_remote_connected = true;
     publish_remote_status(true);
     s_last_activity_ms = now_ms();  // start the idle clock
     if (idle_ms == 0) {
@@ -339,14 +356,12 @@ static void on_connected_cb(uint32_t idle_ms, void *user)
         // Suppress buffered HID flushes for the next 1.5 s.
         s_suppress_buttons_until_ms = now_ms() + PAIRING_FLUSH_SUPPRESS_MS;
     }
-    xSemaphoreTake(s_es_lock, portMAX_DELAY);
-    event_state_feed_connect(s_es, idle_ms, now_ms());
-    xSemaphoreGive(s_es_lock);
 }
 
 static void on_disconnected_cb(void *user)
 {
     (void)user;
+    s_remote_connected = false;
     publish_remote_status(false);
     s_last_activity_ms = 0;  // halt the idle check until next connection
     xSemaphoreTake(s_es_lock, portMAX_DELAY);
@@ -360,6 +375,55 @@ static void repair_button_pressed(int32_t value, void *user)
     (void)user;
     ESP_LOGI(TAG, "HA repair button pressed");
     siri_ble_repair();
+}
+
+// --- Phase 3B.8 Number-entity on_change callbacks ---
+//
+// event_state setters are called under s_es_lock for ordering with the
+// feed/tick functions. siri_ble_set_slave_latency handles its own state
+// internally. battery_low has no setter — publish_battery reads the entity
+// value directly when it next publishes.
+
+static void on_swipe_y_pri_changed(int32_t value, void *user)
+{
+    (void)user;
+    xSemaphoreTake(s_es_lock, portMAX_DELAY);
+    event_state_set_swipe_y_priority(s_es, value);
+    xSemaphoreGive(s_es_lock);
+    ESP_LOGI(TAG, "swipe_y_priority -> %" PRId32, value);
+}
+
+static void on_swipe_dist_changed(int32_t value, void *user)
+{
+    (void)user;
+    xSemaphoreTake(s_es_lock, portMAX_DELAY);
+    event_state_set_swipe_min_distance(s_es, value);
+    xSemaphoreGive(s_es_lock);
+    ESP_LOGI(TAG, "swipe_min_distance -> %" PRId32, value);
+}
+
+static void on_dbl_ms_changed(int32_t value, void *user)
+{
+    (void)user;
+    xSemaphoreTake(s_es_lock, portMAX_DELAY);
+    event_state_set_double_click_max_ms(s_es, (uint32_t)value);
+    xSemaphoreGive(s_es_lock);
+    ESP_LOGI(TAG, "double_click_max_ms -> %" PRId32, value);
+}
+
+static void on_hold_ms_changed(int32_t value, void *user)
+{
+    (void)user;
+    xSemaphoreTake(s_es_lock, portMAX_DELAY);
+    event_state_set_hold_min_ms(s_es, (uint32_t)value);
+    xSemaphoreGive(s_es_lock);
+    ESP_LOGI(TAG, "hold_min_ms -> %" PRId32, value);
+}
+
+static void on_ble_lat_changed(int32_t value, void *user)
+{
+    (void)user;
+    siri_ble_set_slave_latency((uint16_t)value);
 }
 
 // --- FreeRTOS tick for event_state ---
@@ -440,12 +504,28 @@ static void mqtt_event_handler(void *args, esp_event_base_t base, int32_t id, vo
         publish_ha_discovery_event();
         publish_ha_discovery_battery();
         publish_ha_discovery_charging();
-        // Default remote status to disconnected on MQTT (re)connect — BLE
-        // callbacks will flip it to "connected" once encryption succeeds.
-        publish_remote_status(false);
+        // Republish remote_status reflecting the *current* BLE state. If
+        // BLE is already connected (cold-boot bonded reconnect that beat
+        // MQTT to the punch, or MQTT-only reconnect mid-session), we
+        // must NOT clobber it with "disconnected" — the battery and
+        // charging entities use availability_mode=all and treat
+        // remote_status=disconnected as "make me unavailable", which
+        // silently drops every state publish until BLE itself bounces.
+        publish_remote_status(s_remote_connected);
         // Helper-managed entities (raw-stream Switch, future Buttons/Numbers)
         // (re)publish their discovery + state and (re)subscribe to commands.
         mqtt_entity_on_mqtt_connected(s_mqtt);
+        // If BLE already delivered battery / charging values before MQTT
+        // came up (cold-boot bonded reconnect path), republish the cached
+        // values now that the broker is listening. Without this HA waits
+        // for the next change notification, which on a stable battery may
+        // never come.
+        if (s_last_battery_level != 0xFF) {
+            publish_battery(s_last_battery_level);
+        }
+        if (s_last_charging_byte != 0xFF) {
+            publish_charging(s_last_charging_byte);
+        }
         break;
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "mqtt: disconnected");
@@ -529,18 +609,112 @@ void app_main(void)
     });
     assert(s_repair_entity != NULL);
 
+    // Phase 3B.8 runtime-tunable Number entities. Created BEFORE event_state
+    // so we can build the initial config from each entity's loaded value
+    // (which is the NVS value if persisted, else the Kconfig default
+    // supplied as default_value).
+    s_swipe_y_pri_entity = mqtt_entity_create(&(mqtt_entity_config_t){
+        .kind               = MQTT_ENTITY_NUMBER,
+        .unique_id          = "siri_remote_swipe_y_priority",
+        .display_name       = "Swipe Y Priority",
+        .icon               = "mdi:gesture-swipe-vertical",
+        .device_id          = HA_DEVICE_ID,
+        .availability_topic = TOPIC_CONN,
+        .min_value          = 0, .max_value = 200, .step_value = 5,
+        .nvs_key            = "swipe_y_pri",
+        .default_value      = CONFIG_EVENT_SWIPE_Y_PRIORITY,
+        .on_change          = on_swipe_y_pri_changed,
+    });
+    assert(s_swipe_y_pri_entity != NULL);
+
+    s_swipe_dist_entity = mqtt_entity_create(&(mqtt_entity_config_t){
+        .kind               = MQTT_ENTITY_NUMBER,
+        .unique_id          = "siri_remote_swipe_min_distance",
+        .display_name       = "Swipe Min Distance",
+        .icon               = "mdi:gesture-swipe",
+        .device_id          = HA_DEVICE_ID,
+        .availability_topic = TOPIC_CONN,
+        .min_value          = 0, .max_value = 500, .step_value = 10,
+        .nvs_key            = "swipe_dist",
+        .default_value      = CONFIG_EVENT_SWIPE_MIN_DISTANCE,
+        .on_change          = on_swipe_dist_changed,
+    });
+    assert(s_swipe_dist_entity != NULL);
+
+    s_dbl_ms_entity = mqtt_entity_create(&(mqtt_entity_config_t){
+        .kind               = MQTT_ENTITY_NUMBER,
+        .unique_id          = "siri_remote_double_window_ms",
+        .display_name       = "Double-Click Window",
+        .icon               = "mdi:cursor-default-click",
+        .device_id          = HA_DEVICE_ID,
+        .availability_topic = TOPIC_CONN,
+        .min_value          = 0, .max_value = 2000, .step_value = 50,
+        .unit_of_measurement = "ms",
+        .nvs_key            = "dbl_ms",
+        .default_value      = CONFIG_EVENT_DOUBLE_WINDOW_MS,
+        .on_change          = on_dbl_ms_changed,
+    });
+    assert(s_dbl_ms_entity != NULL);
+
+    s_hold_ms_entity = mqtt_entity_create(&(mqtt_entity_config_t){
+        .kind               = MQTT_ENTITY_NUMBER,
+        .unique_id          = "siri_remote_hold_threshold_ms",
+        .display_name       = "Hold Threshold",
+        .icon               = "mdi:gesture-tap-hold",
+        .device_id          = HA_DEVICE_ID,
+        .availability_topic = TOPIC_CONN,
+        .min_value          = 0, .max_value = 10000, .step_value = 100,
+        .unit_of_measurement = "ms",
+        .nvs_key            = "hold_ms",
+        .default_value      = CONFIG_EVENT_HOLD_THRESHOLD_MS,
+        .on_change          = on_hold_ms_changed,
+    });
+    assert(s_hold_ms_entity != NULL);
+
+    s_battery_low_entity = mqtt_entity_create(&(mqtt_entity_config_t){
+        .kind               = MQTT_ENTITY_NUMBER,
+        .unique_id          = "siri_remote_battery_low_pct",
+        .display_name       = "Battery Low Threshold",
+        .icon               = "mdi:battery-alert",
+        .device_id          = HA_DEVICE_ID,
+        .availability_topic = TOPIC_CONN,
+        .min_value          = 0, .max_value = 100, .step_value = 5,
+        .unit_of_measurement = "%",
+        .nvs_key            = "bat_low",
+        .default_value      = CONFIG_BATTERY_LOW_THRESHOLD_PCT,
+        .on_change          = NULL,  // publish_battery reads via mqtt_entity_get_value
+    });
+    assert(s_battery_low_entity != NULL);
+
+    s_ble_lat_entity = mqtt_entity_create(&(mqtt_entity_config_t){
+        .kind               = MQTT_ENTITY_NUMBER,
+        .unique_id          = "siri_remote_ble_slave_latency",
+        .display_name       = "BLE Slave Latency",
+        .icon               = "mdi:bluetooth-settings",
+        .device_id          = HA_DEVICE_ID,
+        .availability_topic = TOPIC_CONN,
+        .min_value          = 0, .max_value = 500, .step_value = 20,
+        .nvs_key            = "ble_lat",
+        .default_value      = 400,
+        .on_change          = on_ble_lat_changed,
+    });
+    assert(s_ble_lat_entity != NULL);
+
     s_es_lock = xSemaphoreCreateMutex();
     assert(s_es_lock != NULL);
 
     event_state_config_t es_cfg = {
-        .double_click_max_ms         = CONFIG_EVENT_DOUBLE_WINDOW_MS,
-        .hold_min_ms                 = CONFIG_EVENT_HOLD_THRESHOLD_MS,
-        .swipe_min_distance          = CONFIG_EVENT_SWIPE_MIN_DISTANCE,
-        .swipe_y_priority_threshold  = CONFIG_EVENT_SWIPE_Y_PRIORITY,
-        .pickup_idle_threshold_ms    = CONFIG_EVENT_PICKUP_IDLE_THRESHOLD_MS,
+        .double_click_max_ms         = (uint32_t)mqtt_entity_get_value(s_dbl_ms_entity),
+        .hold_min_ms                 = (uint32_t)mqtt_entity_get_value(s_hold_ms_entity),
+        .swipe_min_distance          = mqtt_entity_get_value(s_swipe_dist_entity),
+        .swipe_y_priority_threshold  = mqtt_entity_get_value(s_swipe_y_pri_entity),
     };
     s_es = event_state_create(&es_cfg, emit_cb, NULL);
     assert(s_es != NULL);
+
+    // Push the persisted BLE slave-latency into siri_ble *before* siri_ble_start
+    // so the first conn-param update (post-setup) uses the right value.
+    siri_ble_set_slave_latency((uint16_t)mqtt_entity_get_value(s_ble_lat_entity));
 
     esp_timer_create_args_t ta = {
         .callback = tick_timer_cb,

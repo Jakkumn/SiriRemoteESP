@@ -25,7 +25,6 @@ static event_state_t *make_es(uint32_t double_ms, uint32_t hold_ms)
         .hold_min_ms                = hold_ms,
         .swipe_min_distance         = 40,
         .swipe_y_priority_threshold = 30,
-        .pickup_idle_threshold_ms   = 30000,
     };
     event_state_t *es = event_state_create(&cfg, capture_cb, NULL);
     assert(es != NULL);
@@ -235,57 +234,6 @@ static void test_reset_flushes_pending_click(void)
     event_state_destroy(es);
 }
 
-static void test_pickup_below_threshold(void)
-{
-    event_state_t *es = make_es(300, 700);
-
-    event_state_feed_connect(es, 10000, 0);  // 10s idle, below default 30s
-    assert(captured_count == 0);
-
-    event_state_destroy(es);
-}
-
-static void test_pickup_above_threshold(void)
-{
-    event_state_t *es = make_es(300, 700);
-
-    event_state_feed_connect(es, 60000, 0);
-    assert(captured_count == 1);
-    assert(captured[0].action == EVT_PICKUP);
-    assert(captured[0].idle_duration_ms == 60000);
-
-    event_state_destroy(es);
-}
-
-static void test_pickup_zero_idle(void)
-{
-    // First boot: idle_ms=0 → no pickup (threshold is 30s).
-    event_state_t *es = make_es(300, 700);
-
-    event_state_feed_connect(es, 0, 0);
-    assert(captured_count == 0);
-
-    event_state_destroy(es);
-}
-
-static void test_pickup_disabled(void)
-{
-    event_state_config_t cfg = {
-        .double_click_max_ms        = 300,
-        .hold_min_ms                = 700,
-        .swipe_min_distance         = 40,
-        .swipe_y_priority_threshold = 30,
-        .pickup_idle_threshold_ms   = 0,  // disabled
-    };
-    event_state_t *es = event_state_create(&cfg, capture_cb, NULL);
-    reset_capture();
-
-    event_state_feed_connect(es, 1000000, 0);
-    assert(captured_count == 0);
-
-    event_state_destroy(es);
-}
-
 static void test_swipe_up(void)
 {
     event_state_t *es = make_es(300, 700);
@@ -388,7 +336,6 @@ static void test_y_priority_disabled_falls_back(void)
         .hold_min_ms                = 700,
         .swipe_min_distance         = 40,
         .swipe_y_priority_threshold = 0,  // disabled
-        .pickup_idle_threshold_ms   = 30000,
     };
     event_state_t *es = event_state_create(&cfg, capture_cb, NULL);
     reset_capture();
@@ -443,6 +390,97 @@ static void test_diagonal_uses_larger_axis(void)
     event_state_destroy(es);
 }
 
+// --- Phase 3B.8 setter tests --------------------------------------------
+//
+// Setters mutate the cached cfg directly. Asserting via behavior change
+// (post-setter input produces a different outcome than pre-setter input)
+// is more robust than reaching into the private struct.
+
+static void test_set_swipe_min_distance(void)
+{
+    event_state_t *es = make_es(300, 700);
+    // Default min_distance from make_es is 40. A swipe of 50 should fire.
+    siri_touch_frame_t f = {.x = 0, .y = 0, .pressure = 50, .finger_down = true};
+    event_state_feed_touch(es, &f, 0);
+    f.x = 50;
+    event_state_feed_touch(es, &f, 50);
+    f.finger_down = false;
+    event_state_feed_touch(es, &f, 60);
+    assert(captured_count == 1);
+    assert(captured[0].action == EVT_SWIPE_RIGHT);
+
+    // Raise threshold above the same swipe — second swipe must not fire.
+    reset_capture();
+    event_state_set_swipe_min_distance(es, 200);
+    f = (siri_touch_frame_t){.x = 0, .y = 0, .pressure = 50, .finger_down = true};
+    event_state_feed_touch(es, &f, 1000);
+    f.x = 50;
+    event_state_feed_touch(es, &f, 1050);
+    f.finger_down = false;
+    event_state_feed_touch(es, &f, 1060);
+    assert(captured_count == 0);
+    event_state_destroy(es);
+}
+
+static void test_set_double_click_max_ms(void)
+{
+    event_state_t *es = make_es(300, 700);
+    // Disable double-click via setter — second click should fire as a CLICK
+    // immediately rather than waiting for the double-window.
+    event_state_set_double_click_max_ms(es, 0);
+
+    event_state_feed_buttons(es, 0x0001, 0);    // press TV
+    event_state_feed_buttons(es, 0x0000, 50);   // release
+    assert(captured_count == 1);
+    assert(captured[0].action == EVT_CLICK);
+    event_state_destroy(es);
+}
+
+static void test_set_hold_min_ms(void)
+{
+    event_state_t *es = make_es(300, 700);
+    // Lower hold threshold via setter — a 200 ms press should now register
+    // as HOLD_START → HOLD_END (with default 700 it wouldn't).
+    event_state_set_hold_min_ms(es, 100);
+
+    event_state_feed_buttons(es, 0x0001, 0);    // press
+    event_state_tick(es, 150);                  // hold_min_ms=100 elapsed → HOLD_START
+    event_state_feed_buttons(es, 0x0000, 200);  // release → HOLD_END
+    // Expect: HOLD_START (at tick), HOLD_END (at release).
+    assert(captured_count == 2);
+    assert(captured[0].action == EVT_HOLD_START);
+    assert(captured[1].action == EVT_HOLD_END);
+    event_state_destroy(es);
+}
+
+static void test_set_swipe_y_priority(void)
+{
+    event_state_t *es = make_es(300, 700);
+    // make_es starts with swipe_y_priority_threshold=30. With dy=35, dx=50,
+    // priority is engaged so we'd classify vertical. Disable priority via
+    // setter — same input now classifies horizontal (dx > dy).
+    event_state_set_swipe_y_priority(es, 0);
+
+    siri_touch_frame_t f = {.x = 0, .y = 0, .pressure = 50, .finger_down = true};
+    event_state_feed_touch(es, &f, 0);
+    f.x = 50; f.y = 35;
+    event_state_feed_touch(es, &f, 100);
+    f.finger_down = false;
+    event_state_feed_touch(es, &f, 150);
+    assert(captured_count == 1);
+    assert(captured[0].action == EVT_SWIPE_RIGHT);
+    event_state_destroy(es);
+}
+
+static void test_setters_null_safe(void)
+{
+    event_state_set_swipe_y_priority(NULL, 50);
+    event_state_set_swipe_min_distance(NULL, 50);
+    event_state_set_double_click_max_ms(NULL, 50);
+    event_state_set_hold_min_ms(NULL, 50);
+    // No assertion — just verify no crash. Setters must short-circuit on NULL.
+}
+
 int main(void)
 {
     test_single_click();
@@ -455,10 +493,6 @@ int main(void)
     test_click_then_hold();
     test_reset_mid_hold();
     test_reset_flushes_pending_click();
-    test_pickup_below_threshold();
-    test_pickup_above_threshold();
-    test_pickup_zero_idle();
-    test_pickup_disabled();
     test_swipe_up();
     test_swipe_down();
     test_swipe_left_right();
@@ -466,6 +500,11 @@ int main(void)
     test_y_priority_disabled_falls_back();
     test_micro_touch_below_threshold();
     test_diagonal_uses_larger_axis();
+    test_set_swipe_min_distance();
+    test_set_double_click_max_ms();
+    test_set_hold_min_ms();
+    test_set_swipe_y_priority();
+    test_setters_null_safe();
     printf("test_event_state: ok\n");
     return 0;
 }

@@ -44,8 +44,18 @@ void siri_ble_idle_disconnect(void);
 // store, terminates the active connection (if any), clears the in-RAM
 // candidate blacklist, and starts a fresh active scan filtered on the HID
 // service UUID. The user is expected to put the remote into Apple-pairing
-// mode (TV + Vol Up held ~5 s) during the window.
+// mode (Back + Vol Up held ~5 s) during the window.
 void siri_ble_repair(void);
+
+// Update slave-latency on the post-setup low-power conn params. Supervision
+// timeout is auto-recomputed from latency to satisfy the BLE spec rule
+// (timeout > 2 * itvl_max * (1 + latency)) with ~25 % margin, capped at
+// 1500 (15 s). If a connection is currently active and post-setup, applies
+// via ble_gap_update_params immediately; otherwise the new value takes
+// effect on the next bonded reconnect. Apple may reject the requested
+// params (CONN_UPDATE status != 0); the cached value is kept either way
+// and the controller falls back to whatever was previously negotiated.
+void siri_ble_set_slave_latency(uint16_t latency);
 
 #ifdef __cplusplus
 }

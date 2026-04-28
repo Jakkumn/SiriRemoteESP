@@ -4,7 +4,7 @@ An ESP32 BLE bridge that pairs with an Apple Siri Remote (gen 3) and forwards
 button + clickpad events to Home Assistant via MQTT, with Home Assistant
 auto-discovery so the remote shows up as a device automatically.
 
-**Status:** Phase 3B in progress — buttons, swipes, pickup, battery, and
+**Status:** Phase 3B in progress — buttons, swipes, battery, and
 charging all publish to MQTT with HA auto-discovery (Event entity, Switch
 for raw touch stream, Sensors for battery + charging, Button to re-pair).
 The bridge auto-discovers the remote on first boot — no hardcoded MAC, no
@@ -103,7 +103,6 @@ warning and goes idle until the next repair-button press.
 | Event state machine | `EVENT_DOUBLE_WINDOW_MS` | 300 | Double-click window |
 | Event state machine | `EVENT_HOLD_THRESHOLD_MS` | 700 | Hold detection |
 | Event state machine | `EVENT_SWIPE_MIN_DISTANCE` | 40 | Swipe threshold |
-| Event state machine | `EVENT_PICKUP_IDLE_THRESHOLD_MS` | 30000 | Pickup idle gate |
 | Siri Bridge Configuration | `IDLE_DISCONNECT_MS` | **0** (always-connected) | See "Always-connected mode" below |
 
 `= 0` on the timing fields disables that feature (clean kill-switch).
@@ -116,13 +115,13 @@ The reason we stay connected: Apple's BLE accessory firmware has an undocumented
 
 **Battery cost:** ~5–10 µA average draw on the remote in connected-low-power mode at latency 400, vs. ~1 µA disconnected. CR2032 (≈ 225 mAh) lifetime drops from ~18–24 months to ~14–18 months. Roughly 1.2× drain for 100 % wake-press reliability — a Phase 3B Number entity will let you tune slave latency live to trade battery vs. disconnect-detection latency without reflashing.
 
-**Opting out:** set `CONFIG_IDLE_DISCONNECT_MS` to a non-zero value (e.g. 60000) via `idf.py menuconfig`. The bridge will proactively terminate the link after that many milliseconds of inactivity, the remote enters its deepest sleep, and battery improves — but any button press after >30 s of disconnect arrives without the button identity. The synthesized `pickup` event still fires as a generic "user activated remote" signal in HA. Choose this if battery matters more than knowing which specific button was pressed to wake.
+**Opting out:** set `CONFIG_IDLE_DISCONNECT_MS` to a non-zero value (e.g. 60000) via `idf.py menuconfig`. The bridge will proactively terminate the link after that many milliseconds of inactivity, the remote enters its deepest sleep, and battery improves — but any button press after >30 s of disconnect arrives without the button identity. Choose this if battery matters more than knowing which specific button was pressed to wake.
 
 ## MQTT topics published
 
 | Topic | Retained | Purpose |
 |---|---|---|
-| `siri_remote/event` | no | Discrete events (click/double_click/hold_start/hold_end/swipe_*/pickup) |
+| `siri_remote/event` | no | Discrete events (click/double_click/hold_start/hold_end/swipe_*) |
 | `siri_remote/touch_raw` | no | Raw touch frames at ~50/sec — only when the HA Switch is on |
 | `siri_remote/connection` | yes (LWT) | `online` / `offline` |
 | `siri_remote/state/raw_stream` | yes | Current Switch state, mirrored from NVS |
@@ -131,9 +130,15 @@ The reason we stay connected: Apple's BLE accessory firmware has an undocumented
 
 The bridge auto-discovers as a single **Event entity** with these `event_type`
 values: `click`, `double_click`, `hold_start`, `hold_end`, `swipe_up`,
-`swipe_down`, `swipe_left`, `swipe_right`, `pickup`. Event payloads include
-`button` (for button events), `duration_ms` (for click/hold_end), `distance`
-(for swipes), and `idle_duration_ms` (for pickup).
+`swipe_down`, `swipe_left`, `swipe_right`. Event payloads include
+`button` (for button events), `duration_ms` (for click/hold_end), and
+`distance` (for swipes).
+
+For "bridge came back online" automations (Wi-Fi outage recovery, bridge
+reboot, etc.), bind to the bridge LWT availability topic
+`siri_remote/connection` and watch for an `offline → online` transition —
+the previously-emitted `pickup` event was a duplicate of this signal with
+worse semantics in always-connected mode and was removed in Phase 3.N.
 
 **Toggle a light on click:**
 ```yaml
@@ -169,20 +174,11 @@ action:
         - delay: "00:00:00.1"
 ```
 
-**Welcome-home on long pickup:**
-```yaml
-- alias: "Remote pickup after 1h triggers welcome scene"
-  trigger:
-    platform: state
-    entity_id: event.siri_remote
-  condition: >
-    {{ trigger.to_state.attributes.event_type == 'pickup'
-       and trigger.to_state.attributes.idle_duration_ms | int > 3600000 }}
-  action:
-    service: scene.turn_on
-    target:
-      entity_id: scene.evening_lights
-```
+**Welcome-home on bridge recovery:** subscribe to MQTT topic
+`siri_remote/connection` and trigger on the `offline → online` transition.
+The bridge LWT publishes `online` when it boots and the broker pushes
+`offline` after the keepalive expires; HA's `mqtt.state` trigger handles
+this directly without needing a synthetic event.
 
 **Magnitude-aware swipe:**
 ```yaml

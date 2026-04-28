@@ -19,7 +19,6 @@ typedef enum {
     EVT_SWIPE_DOWN,
     EVT_SWIPE_LEFT,
     EVT_SWIPE_RIGHT,
-    EVT_PICKUP,
 } event_action_t;
 
 typedef struct {
@@ -27,7 +26,6 @@ typedef struct {
     uint32_t hold_min_ms;                // 0 disables HOLD_START/HOLD_END
     int32_t  swipe_min_distance;         // minimum axis delta to count as a swipe
     int32_t  swipe_y_priority_threshold; // |dy| >= this forces vertical classification; 0 disables
-    uint32_t pickup_idle_threshold_ms;   // 0 disables PICKUP
 } event_state_config_t;
 
 typedef struct {
@@ -38,8 +36,6 @@ typedef struct {
     uint32_t duration_ms;
     // Swipe events (SWIPE_*):
     int32_t distance;
-    // Pickup event:
-    uint32_t idle_duration_ms;
 } event_state_event_t;
 
 typedef void (*event_state_emit_fn)(const event_state_event_t *evt, void *user);
@@ -53,9 +49,18 @@ void event_state_destroy(event_state_t *es);
 
 void event_state_feed_buttons(event_state_t *es, uint16_t buttons, uint32_t now_ms);
 void event_state_feed_touch(event_state_t *es, const siri_touch_frame_t *frame, uint32_t now_ms);
-void event_state_feed_connect(event_state_t *es, uint32_t idle_ms, uint32_t now_ms);
 void event_state_tick(event_state_t *es, uint32_t now_ms);
 void event_state_reset(event_state_t *es, uint32_t now_ms);
+
+// Runtime-tunable thresholds. Each writes one cfg field; the new value
+// takes effect on the next event_state_feed_* call. Caller must hold the
+// same mutex it uses around the feed/tick functions — there is no
+// internal lock. Field assignment is atomic on Xtensa, so the lock is
+// for ordering with concurrent reads, not tearing.
+void event_state_set_swipe_y_priority(event_state_t *es, int32_t value);
+void event_state_set_swipe_min_distance(event_state_t *es, int32_t value);
+void event_state_set_double_click_max_ms(event_state_t *es, uint32_t value);
+void event_state_set_hold_min_ms(event_state_t *es, uint32_t value);
 
 #ifdef __cplusplus
 }

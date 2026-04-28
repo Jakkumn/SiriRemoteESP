@@ -150,10 +150,11 @@ static esp_timer_handle_t s_setup_fallback_timer;
 // (15 s) gives ~25 % margin, the cost being that a runaway remote takes
 // ~15 s to register as gone.
 //
-// Phase 3B.8 exposes itvl_max / latency / supervision_timeout as runtime
-// MQTT Number entities so users can trade battery-life vs. responsiveness
-// vs. disconnect-detection latency without reflashing.
-static const struct ble_gap_upd_params LOW_POWER_CONN_PARAMS = {
+// Phase 3B.8 exposes slave_latency as a runtime MQTT Number entity so users
+// can trade battery-life vs. disconnect-detection latency without reflashing.
+// `siri_ble_set_slave_latency` mutates this struct + auto-recomputes
+// supervision_timeout to satisfy the BLE spec rule with ~25 % margin.
+static struct ble_gap_upd_params s_low_power_conn_params = {
     .itvl_min            = 6,     // 6 * 1.25ms = 7.5ms
     .itvl_max            = 12,    // 12 * 1.25ms = 15ms
     .latency             = 400,
@@ -427,7 +428,7 @@ static void issue_setup_step(size_t idx)
         // conn params so it can deep-sleep between events. Lets us keep the
         // link alive forever (which avoids the wake-press loss) without
         // burning the CR2032 to charge it every couple of weeks.
-        int rc = ble_gap_update_params(s_setup_step_conn, &LOW_POWER_CONN_PARAMS);
+        int rc = ble_gap_update_params(s_setup_step_conn, &s_low_power_conn_params);
         if (rc != 0 && rc != BLE_HS_ENOTCONN) {
             ESP_LOGW(TAG, "post-setup conn-param update rc=%d", rc);
         }
@@ -1031,6 +1032,36 @@ void siri_ble_repair(void)
     // discovery already), then restart the window from scratch.
     (void)ble_gap_disc_cancel();
     start_discovery();
+}
+
+void siri_ble_set_slave_latency(uint16_t latency)
+{
+    // Spec rule: supervision_timeout > 2 * itvl_max * (1 + latency).
+    // Compute with ~25% margin: ceil(2.5 * (1 + latency) * itvl_max),
+    // expressed in 10 ms units (the supervision_timeout field unit).
+    // itvl_max field is in 1.25 ms units; multiply by 125 then divide by
+    // 100 to get ms. Combined: timeout_units_10ms = ceil(2.5 * (1+lat) * itvl_max * 1.25 / 10)
+    //                                              = ceil((1+lat) * itvl_max * 25 / 80)
+    // ...which we round up via integer math, then clamp to the 16-bit
+    // field's safe upper bound (1500 = 15 s; longer means runaway-detection
+    // delay > 15 s which is already the high end of acceptable).
+    uint32_t numerator = (uint32_t)(1 + latency) * s_low_power_conn_params.itvl_max * 25;
+    uint32_t timeout   = (numerator + 79) / 80;  // ceil(numerator / 80)
+    if (timeout < 100) timeout = 100;            // 1 s floor
+    if (timeout > 1500) timeout = 1500;          // 15 s ceiling
+
+    s_low_power_conn_params.latency             = latency;
+    s_low_power_conn_params.supervision_timeout = (uint16_t)timeout;
+
+    ESP_LOGI(TAG, "slave_latency=%u sup_timeout=%lu (= %lu ms)",
+             latency, (unsigned long)timeout, (unsigned long)timeout * 10);
+
+    if (s_setup_done_conn != 0xFFFF) {
+        int rc = ble_gap_update_params(s_setup_done_conn, &s_low_power_conn_params);
+        if (rc != 0 && rc != BLE_HS_ENOTCONN) {
+            ESP_LOGW(TAG, "live conn-param update rc=%d (cached value kept)", rc);
+        }
+    }
 }
 
 static void on_reset(int reason)
