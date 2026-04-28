@@ -9,14 +9,37 @@
 extern "C" {
 #endif
 
+// Gen-3 Siri Remote GATT *value* handles. Empirically verified in Phase 1
+// and reproducible across reconnects on the same unit; main.c uses these
+// to dispatch on `attr_handle` from notify / read callbacks. CCCD handles
+// for these characteristics are siri_ble's internal concern (the bridge
+// subscribes during the setup chain) and stay private to the component.
+#define SIRI_HANDLE_BUTTON   0x0039  // 16-bit button bitmap (notify)
+#define SIRI_HANDLE_TOUCH    0x003D  // 11-byte touch frames (notify, ~50/sec)
+#define SIRI_HANDLE_AUDIO    0x0035  // Opus audio (Phase 5)
+#define SIRI_HANDLE_BATTERY  0x002E  // single-byte percentage (read + notify)
+#define SIRI_HANDLE_CHARGING 0x0031  // BLE-standard 0x2A1A power-state byte (read + notify)
+
 // Raw notification from the remote. `attr_handle` lets the caller
-// distinguish button (0x0039) / touch (0x003D) / audio (0x0035) etc.
+// distinguish button / touch / audio / battery / charging etc — see the
+// SIRI_HANDLE_* constants above.
 // `data` is owned by NimBLE and valid only for the duration of the call.
 typedef void (*siri_ble_notify_cb_t)(uint16_t attr_handle, const uint8_t *data,
                                      size_t len, void *user);
 
-// Fired on successful encrypted connection. `idle_ms_since_disconnect` is the
-// time since the last disconnect in ms, or 0 on first-boot connect.
+// Fired on successful encrypted connection (after the post-secondary
+// ENC_CHANGE fingerprint pass on first-pair, or after a bonded reconnect's
+// setup chain in always-connected mode).
+//
+// `idle_ms_since_disconnect` is overloaded:
+//   - **0** — fresh first-bond from the DISCOVERING flow. Caller may use
+//     this as a discriminator to suppress buffered HID notifies (the
+//     pairing-combo flush) for ~1.5 s.
+//   - **>0** — warm reconnect after the link dropped (Wi-Fi outage,
+//     remote out of range, bridge reboot). Value reflects elapsed wall
+//     time since the previous disconnect. Mostly diagnostic — in
+//     always-connected mode (`CONFIG_IDLE_DISCONNECT_MS=0`, default) the
+//     link doesn't deliberately drop, so this path is exceptional.
 typedef void (*siri_ble_connected_cb_t)(uint32_t idle_ms_since_disconnect, void *user);
 
 // Fired immediately on BLE disconnect event.

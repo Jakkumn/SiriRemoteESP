@@ -54,7 +54,9 @@ static const char *TAG = "main";
 #define HA_DEVICE_ID "siri_remote_bridge"
 
 // State.
-static esp_mqtt_client_handle_t s_mqtt;
+// Set once in mqtt_start() before any concurrent reader exists; the volatile
+// keeps the compiler honest about the cross-task visibility nonetheless.
+static esp_mqtt_client_handle_t volatile s_mqtt;
 static event_state_t           *s_es;
 static SemaphoreHandle_t        s_es_lock;
 static volatile bool            s_mqtt_connected;
@@ -81,9 +83,16 @@ static mqtt_entity_t           *s_ble_lat_entity;
 // CONNECTED transition (bonded reconnects always pass a non-zero idle).
 #define PAIRING_FLUSH_SUPPRESS_MS 1500
 static uint32_t                 s_suppress_buttons_until_ms;
-// Activity tracking for idle-disconnect. Updated on every BLE notification
-// from the remote. 0 = no remote activity yet (post-disconnect or pre-first-event).
+// Activity tracking for the optional idle-disconnect path. Compiled out
+// entirely in the default always-connected mode (CONFIG_IDLE_DISCONNECT_MS=0).
+#if CONFIG_IDLE_DISCONNECT_MS > 0
 static volatile uint32_t        s_last_activity_ms;
+#define MARK_ACTIVITY()         do { s_last_activity_ms = now_ms(); } while (0)
+#define MARK_INACTIVE()         do { s_last_activity_ms = 0;        } while (0)
+#else
+#define MARK_ACTIVITY()         ((void)0)
+#define MARK_INACTIVE()         ((void)0)
+#endif
 
 static uint32_t now_ms(void)
 {
@@ -300,8 +309,8 @@ static void emit_cb(const event_state_event_t *evt, void *user)
 static void on_notify_cb(uint16_t attr_handle, const uint8_t *data, size_t len, void *user)
 {
     (void)user;
-    s_last_activity_ms = now_ms();
-    if (attr_handle == 0x0039) {
+    MARK_ACTIVITY();
+    if (attr_handle == SIRI_HANDLE_BUTTON) {
         if (now_ms() < s_suppress_buttons_until_ms) {
             ESP_LOGI(TAG, "suppressing buffered pairing-combo button notify");
             return;
@@ -310,15 +319,15 @@ static void on_notify_cb(uint16_t attr_handle, const uint8_t *data, size_t len, 
         xSemaphoreTake(s_es_lock, portMAX_DELAY);
         event_state_feed_buttons(s_es, btns, now_ms());
         xSemaphoreGive(s_es_lock);
-    } else if (attr_handle == 0x002E) {
+    } else if (attr_handle == SIRI_HANDLE_BATTERY) {
         if (len >= 1) {
             publish_battery(data[0]);
         }
-    } else if (attr_handle == 0x0031) {
+    } else if (attr_handle == SIRI_HANDLE_CHARGING) {
         if (len >= 1) {
             publish_charging(data[0]);
         }
-    } else if (attr_handle == 0x003D) {
+    } else if (attr_handle == SIRI_HANDLE_TOUCH) {
         siri_touch_frame_t frame;
         if (siri_decode_touch_frame(data, len, &frame)) {
 #ifdef CONFIG_DEBUG_TOUCH_FRAMES
@@ -350,7 +359,7 @@ static void on_connected_cb(uint32_t idle_ms, void *user)
     ESP_LOGI(TAG, "remote connected (idle %" PRIu32 " ms)", idle_ms);
     s_remote_connected = true;
     publish_remote_status(true);
-    s_last_activity_ms = now_ms();  // start the idle clock
+    MARK_ACTIVITY();  // start the idle clock (no-op unless CONFIG_IDLE_DISCONNECT_MS>0)
     if (idle_ms == 0) {
         // Fresh bond from siri_ble's DISCOVERING→CONNECTED transition.
         // Suppress buffered HID flushes for the next 1.5 s.
@@ -363,7 +372,7 @@ static void on_disconnected_cb(void *user)
     (void)user;
     s_remote_connected = false;
     publish_remote_status(false);
-    s_last_activity_ms = 0;  // halt the idle check until next connection
+    MARK_INACTIVE();  // halt the idle check until next connection
     xSemaphoreTake(s_es_lock, portMAX_DELAY);
     event_state_reset(s_es, now_ms());
     xSemaphoreGive(s_es_lock);

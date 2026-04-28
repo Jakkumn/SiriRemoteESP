@@ -9,6 +9,9 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/portmacro.h"
+
 #include "host/ble_att.h"
 #include "host/ble_gap.h"
 #include "host/ble_gatt.h"
@@ -95,7 +98,12 @@ typedef struct {
                                                 // Short TTL so the user pressing
                                                 // Back+VolUp recovers quickly.
 static blacklist_entry_t s_blacklist[BLACKLIST_SIZE];
-static size_t            s_blacklist_next;  // ring index for replacement on overflow
+static size_t            s_blacklist_next;       // ring index for replacement on overflow
+static portMUX_TYPE      s_blacklist_mux = portMUX_INITIALIZER_UNLOCKED;
+                                                 // protects s_blacklist + s_blacklist_next:
+                                                 // writes/reads from BLE host task (DISC
+                                                 // event, fingerprint reject), clears from
+                                                 // MQTT task (siri_ble_repair).
 
 // Discovery window — keeps the bridge from sitting in active scan forever
 // after a failed/abandoned pairing attempt. Cancelled on fingerprint pass
@@ -194,6 +202,8 @@ static void log_addr(const char *prefix, const uint8_t val[6])
 
 static bool blacklist_contains(const uint8_t addr[6])
 {
+    bool found = false;
+    portENTER_CRITICAL(&s_blacklist_mux);
     uint32_t now = now_ms();
     for (size_t i = 0; i < BLACKLIST_SIZE; i++) {
         if (s_blacklist[i].expire_ms == 0) continue;
@@ -201,22 +211,30 @@ static bool blacklist_contains(const uint8_t addr[6])
             s_blacklist[i].expire_ms = 0;  // expired, evict lazily
             continue;
         }
-        if (memcmp(s_blacklist[i].addr, addr, 6) == 0) return true;
+        if (memcmp(s_blacklist[i].addr, addr, 6) == 0) {
+            found = true;
+            break;
+        }
     }
-    return false;
+    portEXIT_CRITICAL(&s_blacklist_mux);
+    return found;
 }
 
 static void blacklist_add(const uint8_t addr[6], uint32_t ttl_ms)
 {
+    portENTER_CRITICAL(&s_blacklist_mux);
     s_blacklist[s_blacklist_next].expire_ms = now_ms() + ttl_ms;
     memcpy(s_blacklist[s_blacklist_next].addr, addr, 6);
     s_blacklist_next = (s_blacklist_next + 1) % BLACKLIST_SIZE;
+    portEXIT_CRITICAL(&s_blacklist_mux);
 }
 
 static void blacklist_clear(void)
 {
+    portENTER_CRITICAL(&s_blacklist_mux);
     memset(s_blacklist, 0, sizeof(s_blacklist));
     s_blacklist_next = 0;
+    portEXIT_CRITICAL(&s_blacklist_mux);
 }
 
 // --- Adv parsing helper ----------------------------------------------------
@@ -604,8 +622,10 @@ static void on_fingerprint_disc_complete(const struct peer *peer, int status, vo
         (void)esp_timer_stop(s_discovery_window_timer);
     }
     // Use idle=0 here: this is a brand-new bond, there's no meaningful
-    // time-since-disconnect to publish. complete_setup_chain → on_connected
-    // → main.c's pickup-event logic suppresses pickup for idle=0.
+    // time-since-disconnect to publish. main.c keys on idle_ms == 0 in its
+    // on_connected_cb to enable the buffered-button suppression window
+    // (Apple flushes the pairing combo as buttery-press notifies once the
+    // button CCCD subscribes).
     complete_setup_chain(conn, 0);
     return;
 
@@ -910,9 +930,10 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
                 idle = now_ms() - s_last_disconnect_ms;
             } else {
                 // First connect since bridge boot. Use bridge uptime as a
-                // lower bound on idle duration so pickup fires for cold-boot
-                // wakes after long sleeps where the bridge restarted in
-                // between.
+                // lower bound on idle duration. The value is mostly
+                // diagnostic now — main.c only branches on idle_ms == 0
+                // (fresh fingerprint pass) vs > 0 (warm reconnect) to
+                // gate the buffered-button suppression window.
                 idle = now_ms();
             }
             s_pending_setup_conn    = conn;
