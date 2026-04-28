@@ -60,6 +60,16 @@ static SemaphoreHandle_t        s_es_lock;
 static volatile bool            s_mqtt_connected;
 static esp_timer_handle_t       s_tick_timer;
 static mqtt_entity_t           *s_raw_stream_entity;
+static mqtt_entity_t           *s_repair_entity;
+// On first-bond, Apple's HID flushes the press/release notifies that were
+// buffered during the bond window (the TV+VolUp pairing-combo the user
+// just held) right after the button CCCD subscribe lands. Without
+// suppression they surface as phantom click events in HA. We squash button
+// notifies for a short window after a fresh-bond on_connected; the window
+// is keyed on idle_ms==0, which is unique to siri_ble's DISCOVERING→
+// CONNECTED transition (bonded reconnects always pass a non-zero idle).
+#define PAIRING_FLUSH_SUPPRESS_MS 1500
+static uint32_t                 s_suppress_buttons_until_ms;
 // Activity tracking for idle-disconnect. Updated on every BLE notification
 // from the remote. 0 = no remote activity yet (post-disconnect or pre-first-event).
 static volatile uint32_t        s_last_activity_ms;
@@ -276,6 +286,10 @@ static void on_notify_cb(uint16_t attr_handle, const uint8_t *data, size_t len, 
     (void)user;
     s_last_activity_ms = now_ms();
     if (attr_handle == 0x0039) {
+        if (now_ms() < s_suppress_buttons_until_ms) {
+            ESP_LOGI(TAG, "suppressing buffered pairing-combo button notify");
+            return;
+        }
         uint16_t btns = siri_decode_button_bytes(data, len);
         xSemaphoreTake(s_es_lock, portMAX_DELAY);
         event_state_feed_buttons(s_es, btns, now_ms());
@@ -320,6 +334,11 @@ static void on_connected_cb(uint32_t idle_ms, void *user)
     ESP_LOGI(TAG, "remote connected (idle %" PRIu32 " ms)", idle_ms);
     publish_remote_status(true);
     s_last_activity_ms = now_ms();  // start the idle clock
+    if (idle_ms == 0) {
+        // Fresh bond from siri_ble's DISCOVERING→CONNECTED transition.
+        // Suppress buffered HID flushes for the next 1.5 s.
+        s_suppress_buttons_until_ms = now_ms() + PAIRING_FLUSH_SUPPRESS_MS;
+    }
     xSemaphoreTake(s_es_lock, portMAX_DELAY);
     event_state_feed_connect(s_es, idle_ms, now_ms());
     xSemaphoreGive(s_es_lock);
@@ -333,6 +352,14 @@ static void on_disconnected_cb(void *user)
     xSemaphoreTake(s_es_lock, portMAX_DELAY);
     event_state_reset(s_es, now_ms());
     xSemaphoreGive(s_es_lock);
+}
+
+static void repair_button_pressed(int32_t value, void *user)
+{
+    (void)value;
+    (void)user;
+    ESP_LOGI(TAG, "HA repair button pressed");
+    siri_ble_repair();
 }
 
 // --- FreeRTOS tick for event_state ---
@@ -490,6 +517,17 @@ void app_main(void)
     assert(s_raw_stream_entity != NULL);
     ESP_LOGI(TAG, "raw_stream initial state: %s",
              mqtt_entity_get_value(s_raw_stream_entity) ? "ON" : "OFF");
+
+    s_repair_entity = mqtt_entity_create(&(mqtt_entity_config_t){
+        .kind               = MQTT_ENTITY_BUTTON,
+        .unique_id          = "siri_remote_repair",
+        .display_name       = "Re-pair Remote",
+        .icon               = "mdi:bluetooth-refresh",
+        .device_id          = HA_DEVICE_ID,
+        .availability_topic = TOPIC_CONN,
+        .on_change          = repair_button_pressed,
+    });
+    assert(s_repair_entity != NULL);
 
     s_es_lock = xSemaphoreCreateMutex();
     assert(s_es_lock != NULL);

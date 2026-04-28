@@ -1,6 +1,6 @@
-# Custom partition table — WROOM-32 has 4 MB flash; default 1 MB factory
-# overflowed once Wi-Fi + MQTT were added in Phase 2.
+# Custom partition table — XIAO ESP32-S3 (8 MB flash). 3 MB factory leaves
+# ~5 MB unallocated for Phase 5 (voice/Opus + audio buffers + future OTA).
 # Name,     Type, SubType, Offset,   Size,    Flags
 nvs,        data, nvs,     0x9000,   0x6000,
 phy_init,   data, phy,     0xf000,   0x1000,
-factory,    app,  factory, 0x10000,  0x1F0000,
+factory,    app,  factory, 0x10000,  0x300000,

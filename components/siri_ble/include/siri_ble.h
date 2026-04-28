@@ -38,6 +38,15 @@ esp_err_t siri_ble_start(const siri_ble_config_t *cfg);
 // next button press from the remote (re-advertises automatically).
 void siri_ble_idle_disconnect(void);
 
+// Forget the current bond and re-enter the 5-minute discovery window.
+// Called when the user presses `button.siri_remote_repair` in HA, or when
+// they want to switch to a different physical remote. Wipes the NimBLE bond
+// store, terminates the active connection (if any), clears the in-RAM
+// candidate blacklist, and starts a fresh active scan filtered on the HID
+// service UUID. The user is expected to put the remote into Apple-pairing
+// mode (TV + Vol Up held ~5 s) during the window.
+void siri_ble_repair(void);
+
 #ifdef __cplusplus
 }
 #endif

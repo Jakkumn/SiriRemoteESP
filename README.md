@@ -4,16 +4,20 @@ An ESP32 BLE bridge that pairs with an Apple Siri Remote (gen 3) and forwards
 button + clickpad events to Home Assistant via MQTT, with Home Assistant
 auto-discovery so the remote shows up as a device automatically.
 
-**Status:** Phase 3A complete — buttons, swipes, pickup, battery, and
+**Status:** Phase 3B in progress — buttons, swipes, pickup, battery, and
 charging all publish to MQTT with HA auto-discovery (Event entity, Switch
-for raw touch stream, Sensors for battery + charging). Connected-low-power
-mode is the default to ensure 100 % wake-press reliability — see
-[Always-connected mode](#always-connected-mode-default) below.
+for raw touch stream, Sensors for battery + charging, Button to re-pair).
+The bridge auto-discovers the remote on first boot — no hardcoded MAC, no
+menuconfig step. Connected-low-power mode is the default to ensure 100 %
+wake-press reliability — see [Always-connected mode](#always-connected-mode-default)
+below.
 
 ## Hardware
 
-- **MCU (development)**: ESP32-WROOM-32 DevKit (4 MB flash)
-- **MCU (eventual target)**: ESP32-S3 DevKit-C (`make set-esp32s3` to retarget)
+- **MCU**: XIAO ESP32-S3 (Seeed Studio 3-pack — 8 MB flash, 8 MB octal PSRAM,
+  native USB-C, BLE 5.0). Project migrated to this board in Phase 3.M; the
+  ESP32-WROOM-32 path was the development target through Phase 3B but is no
+  longer the primary build.
 - **Remote**: Apple Siri Remote, 3rd generation (2022, USB-C)
 
 ## Prerequisites
@@ -38,6 +42,57 @@ make fm            # flash + monitor the connected device
 
 Run `make` with no arguments to see all targets.
 
+## Pairing your remote
+
+The bridge has no hardcoded MAC. On first boot (empty NVS) it enters a 5-minute
+**discovery window**: an active BLE scan filtered on the HID service UUID
+(`0x1812`), with a proximity gate (RSSI ≥ −55 dBm) and a post-connect
+fingerprint check (HID + ≥3 Report chars + Apple custom service + button
+value handle `0x0039`).
+
+### First-time pair (or pair to a new bridge)
+
+The remote treats every distinct BLE peer identity as a separate "host" and
+will not admit a connect request from an unknown peer at the LL layer until
+it's been put into pairing mode. This is verified empirically: with a fresh
+ESP32-S3 (different factory MAC than the previously-bonded ESP32), button
+presses alone produce undirected advs but connect attempts fail with HCI
+reason `0x3E` ("connection failed to be established") in a tight retry loop.
+The fix is to put the remote into pairing mode:
+
+1. Power the bridge on within ~1 metre of the remote.
+2. Hold **Back + Volume Up** on the remote for ~5 seconds. The remote enters
+   Apple's native pairing-mode advertising and admits unknown peers.
+3. The bridge connects, runs the fingerprint check, bonds, and starts
+   forwarding events. The whole dance takes <10 seconds. The bond is
+   persisted in NVS — subsequent reboots reconnect directly without scanning.
+
+If the bridge logs `candidate failed pre-fingerprint — blacklisting 5 s,
+hold Back+VolUp …`, that's the signal: the remote is advertising but
+rejecting your bridge's identity. Press the combo and the next retry will
+succeed.
+
+If the wrong device is in range (an iPhone, Apple Watch, Magic Keyboard…)
+the bridge will either reject it via the HID-UUID filter (most Apple devices
+don't advertise HID) or via the post-connect fingerprint (Magic Keyboard
+passes the UUID gate but fails the Apple-custom-service check). Fingerprint
+failures are blacklisted for 60 s; LL connect failures for 5 s (so a
+correctly-pressed pairing combo recovers quickly).
+
+### Re-pair on the same bridge (already bonded once)
+
+The remote remembers bonded peers on its side too. If the bond is still
+present on the remote and you press the HA repair button on the bridge:
+
+- In Home Assistant, press **`button.siri_remote_repair`** (icon
+  `mdi:bluetooth-refresh`). The bridge wipes the bond, terminates the active
+  connection, and re-enters the 5-minute discovery window.
+- Press **any button** on the remote (no combo needed — the remote still has
+  the bridge in its bond list and will admit the connection for re-keying).
+
+If the discovery window expires without finding a remote, the bridge logs a
+warning and goes idle until the next repair-button press.
+
 ## Configuration knobs (`menuconfig`)
 
 | Menu | Key | Default | Purpose |
@@ -45,7 +100,6 @@ Run `make` with no arguments to see all targets.
 | Siri Bridge Configuration | `WIFI_SSID` / `WIFI_PASSWORD` | empty | Wi-Fi credentials |
 | Siri Bridge Configuration | `MQTT_BROKER_URI` | `mqtt://homeassistant.local:1883` | MQTT broker |
 | Siri Bridge Configuration | `MQTT_USERNAME` / `MQTT_PASSWORD` | empty | MQTT auth |
-| Siri BLE Bridge | `SIRI_REMOTE_MAC` | dev-paired MAC | Target remote |
 | Event state machine | `EVENT_DOUBLE_WINDOW_MS` | 300 | Double-click window |
 | Event state machine | `EVENT_HOLD_THRESHOLD_MS` | 700 | Hold detection |
 | Event state machine | `EVENT_SWIPE_MIN_DISTANCE` | 40 | Swipe threshold |

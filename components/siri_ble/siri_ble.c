@@ -13,6 +13,7 @@
 #include "host/ble_gap.h"
 #include "host/ble_gatt.h"
 #include "host/ble_hs.h"
+#include "host/ble_hs_adv.h"
 #include "host/ble_store.h"
 #include "host/ble_uuid.h"
 #include "host/util/util.h"
@@ -27,8 +28,10 @@ static const char *TAG = "siri_ble";
 // Gen-3 GATT handles, empirically verified in Phase 1 and reproducible across
 // reconnects on the same unit. We skip GATT service discovery on the live path
 // (~3.7 seconds saved per connection) and write directly to these handles.
-// If a future unit has a different layout, set CONFIG_SIRI_BLE_VERBOSE_DISCOVERY
-// in menuconfig to re-enable a one-time peer-layout dump on first connect.
+// First-bond connects in DISCOVERING mode still run peer_disc_all once for
+// the fingerprint check, but bonded reconnects use these constants directly.
+// Phase 3B.7 plans a runtime "discovery mode" Switch for cross-gen units
+// where the layout differs.
 #define BUTTON_CCCD_HANDLE   0x003A
 #define TOUCH_CCCD_HANDLE    0x003E
 #define BATTERY_CCCD_HANDLE  0x002F  // svc 0x180F, char 0x2A19 (battery level)
@@ -39,13 +42,80 @@ static const uint8_t ENABLE_NOTIFY[2] = {0x01, 0x00};
 
 static siri_ble_config_t s_cfg;
 static uint8_t s_own_addr_type;
-static uint8_t s_target_mac[6];
 static uint32_t s_last_disconnect_ms;
 static bool s_has_disconnected;
 static uint16_t s_setup_done_conn = 0xFFFF;  // dedup: per-connection setup runs once
+static uint16_t s_active_conn = 0xFFFF;      // for siri_ble_idle_disconnect / siri_ble_repair
 #ifdef CONFIG_DEBUG_WAKE_PROBE
 static uint32_t s_connect_ms;  // BLE_GAP_EVENT_CONNECT timestamp; basis for t=Xms deltas
 #endif
+
+// Discovery / bonded-reconnect state machine. Phase 3B.6 retired the hard-
+// coded MAC: at boot we either reconnect to a stored bond or run a 5-minute
+// active-scan window looking for an HID-advertising candidate that survives
+// a post-connect fingerprint check.
+typedef enum {
+    MODE_DISCOVERING,       // active scan, HID-UUID + RSSI gate, fingerprint after connect
+    MODE_BONDED_RECONNECT,  // ble_gap_connect direct to s_bonded_peer, IRK resumes encryption
+    MODE_CONNECTED,         // happy path: link up, setup complete
+    MODE_IDLE,              // no bond, discovery window expired, awaiting repair button
+} siri_ble_mode_t;
+static siri_ble_mode_t s_mode = MODE_IDLE;
+
+// Bonded peer identity address, populated at boot from the NimBLE bond store
+// or right after a fresh fingerprint pass. Used as the target of the direct
+// `ble_gap_connect` in BONDED_RECONNECT mode (no scan necessary; NimBLE's
+// resolving list translates outbound connect commands when the peer's
+// random-resolvable address matches a bonded IRK).
+static ble_addr_t s_bonded_peer;
+static bool       s_have_bonded_peer;
+
+// Address of the candidate we're currently connecting to / fingerprinting.
+// Stashed at BLE_GAP_EVENT_DISC time so we can blacklist + delete-bond on
+// fingerprint failure even though the NimBLE GAP event for the failure is
+// the disconnect (which doesn't carry the peer addr).
+static ble_addr_t s_pending_candidate;
+static bool       s_pending_candidate_set;
+
+// In-RAM candidate blacklist. Discovery walks every nearby HID adv; once
+// we've rejected one (fingerprint mismatch, or LL connect-establish failure
+// from a remote that's advertising but won't admit an unknown peer until
+// the user enters pairing mode) we drop it briefly so we don't re-attempt
+// every adv interval. Lost on reboot — fine, since reboot also clears any
+// stuck NimBLE state.
+typedef struct {
+    uint8_t  addr[6];
+    uint32_t expire_ms;
+} blacklist_entry_t;
+#define BLACKLIST_SIZE                   8
+#define BLACKLIST_TTL_FINGERPRINT_MS     60000  // wrong device entirely
+#define BLACKLIST_TTL_FAILED_CONNECT_MS  5000   // LL handshake didn't complete —
+                                                // most often the remote isn't in
+                                                // pairing mode for our identity yet.
+                                                // Short TTL so the user pressing
+                                                // Back+VolUp recovers quickly.
+static blacklist_entry_t s_blacklist[BLACKLIST_SIZE];
+static size_t            s_blacklist_next;  // ring index for replacement on overflow
+
+// Discovery window — keeps the bridge from sitting in active scan forever
+// after a failed/abandoned pairing attempt. Cancelled on fingerprint pass
+// or repair-button press (both restart it from scratch).
+#define DISCOVERY_WINDOW_MS  (5 * 60 * 1000)
+#define DISCOVERY_RSSI_MIN   -55
+static esp_timer_handle_t s_discovery_window_timer;
+
+// HID service + Report char UUIDs (16-bit) for adv filter + fingerprint walk.
+#define HID_SVC_UUID16              0x1812
+#define HID_REPORT_UUID16           0x2A4D
+#define HID_REPORT_BUTTON_VAL       0x0039  // gen-3 button bitmap value handle
+#define APPLE_FINGERPRINT_MIN_REPORTS 3     // gen-3 has 9; require ≥3 for fingerprint pass
+
+// Apple custom service UUID `8341f2b4-c013-4f04-8197-c4cdb42e26dc` (LE byte
+// order). Required member of the gen-3 fingerprint; also used by the optional
+// CONFIG_DEBUG_WAKE_PROBE path below for post-setup notify subscription.
+static const ble_uuid128_t APPLE_CUSTOM_SVC_UUID =
+    BLE_UUID128_INIT(0xdc, 0x26, 0x2e, 0xb4, 0xcd, 0xc4, 0x97, 0x81,
+                     0x04, 0x4f, 0x13, 0xc0, 0xb4, 0xf2, 0x41, 0x83);
 
 // Deferred-setup state. apply_remote_setup is held back until the *second*
 // ENC_CHANGE for a connection — Apple's accessory framework re-encrypts the
@@ -62,19 +132,6 @@ static esp_timer_handle_t s_setup_fallback_timer;
 // anyway. Across captured gen-3 connects the gap is reliably 750-1200 ms;
 // 2500 ms gives generous headroom while still bounding worst-case latency.
 #define ENC_CHANGE_FALLBACK_MS 2500
-
-// Apple custom service UUID `8341f2b4-c013-4f04-8197-c4cdb42e26dc` (LE byte
-// order — NimBLE stores UUID128s LSB-first). Phase 1 dump found this service
-// on the gen-3 remote but didn't enumerate its characteristics. CONFIG_DEBUG_WAKE_PROBE
-// runs peer_disc_all post-setup and dumps the full layout so we can identify
-// any wake-reason / accessory-state characteristics that might explain why
-// the cold-boot first-bond wake-press is dropped on the HID path.
-#ifdef CONFIG_DEBUG_WAKE_PROBE
-static const ble_uuid128_t APPLE_CUSTOM_SVC_UUID =
-    BLE_UUID128_INIT(0xdc, 0x26, 0x2e, 0xb4, 0xcd, 0xc4, 0x97, 0x81,
-                     0x04, 0x4f, 0x13, 0xc0, 0xb4, 0xf2, 0x41, 0x83);
-
-#endif
 
 // Connection parameters requested AFTER setup completes. itvl_min/itvl_max
 // match the remote's PPCP (read at handle 0x0007: 06 00 0c 00 50 00 58 02).
@@ -106,7 +163,8 @@ static const struct ble_gap_upd_params LOW_POWER_CONN_PARAMS = {
 };
 
 static int gap_event_cb(struct ble_gap_event *event, void *arg);
-static void start_scan(void);
+static void start_discovery(void);
+static void start_bonded_reconnect(void);
 static void complete_setup_chain(uint16_t conn_handle, uint32_t idle_ms);
 #ifdef CONFIG_DEBUG_WAKE_PROBE
 static void kick_probe_discovery(uint16_t conn_handle);
@@ -125,35 +183,72 @@ static uint32_t now_ms(void)
 #define WAKE_PROBE_LOG(fmt, ...) ((void)0)
 #endif
 
-// Parse "aa:bb:cc:dd:ee:ff" into NimBLE's little-endian 6-byte layout (byte 0 = 0xff).
-static bool parse_mac(const char *str, uint8_t out[6])
-{
-    unsigned int a[6];
-    if (sscanf(str, "%2x:%2x:%2x:%2x:%2x:%2x",
-               &a[5], &a[4], &a[3], &a[2], &a[1], &a[0]) != 6) {
-        return false;
-    }
-    for (int i = 0; i < 6; i++) {
-        out[i] = (uint8_t)a[i];
-    }
-    return true;
-}
-
 static void log_addr(const char *prefix, const uint8_t val[6])
 {
     ESP_LOGI(TAG, "%s %02x:%02x:%02x:%02x:%02x:%02x",
              prefix, val[5], val[4], val[3], val[2], val[1], val[0]);
 }
 
-static void start_scan(void)
+// --- Candidate blacklist (RAM only, ~60 s TTL) -----------------------------
+
+static bool blacklist_contains(const uint8_t addr[6])
 {
+    uint32_t now = now_ms();
+    for (size_t i = 0; i < BLACKLIST_SIZE; i++) {
+        if (s_blacklist[i].expire_ms == 0) continue;
+        if (s_blacklist[i].expire_ms <= now) {
+            s_blacklist[i].expire_ms = 0;  // expired, evict lazily
+            continue;
+        }
+        if (memcmp(s_blacklist[i].addr, addr, 6) == 0) return true;
+    }
+    return false;
+}
+
+static void blacklist_add(const uint8_t addr[6], uint32_t ttl_ms)
+{
+    s_blacklist[s_blacklist_next].expire_ms = now_ms() + ttl_ms;
+    memcpy(s_blacklist[s_blacklist_next].addr, addr, 6);
+    s_blacklist_next = (s_blacklist_next + 1) % BLACKLIST_SIZE;
+}
+
+static void blacklist_clear(void)
+{
+    memset(s_blacklist, 0, sizeof(s_blacklist));
+    s_blacklist_next = 0;
+}
+
+// --- Adv parsing helper ----------------------------------------------------
+
+// Returns true if the parsed adv fields advertise the HID service (UUID16
+// 0x1812). Looks at both incomplete and complete UUID16 lists (NimBLE
+// merges them into the same `uuids16` array).
+static bool adv_advertises_hid(const struct ble_hs_adv_fields *f)
+{
+    for (uint8_t i = 0; i < f->num_uuids16; i++) {
+        if (ble_uuid_u16(&f->uuids16[i].u) == HID_SVC_UUID16) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// --- Scan / connect entry points -------------------------------------------
+
+static void start_discovery(void)
+{
+    s_mode = MODE_DISCOVERING;
+    s_pending_candidate_set = false;
+
     struct ble_gap_disc_params params = {
         .itvl = 0,
         .window = 0,
         .filter_policy = 0,
         .limited = 0,
-        .passive = 0,  // active scan so we receive scan responses (carries the full name)
-        .filter_duplicates = 1,
+        .passive = 0,            // active scan to capture scan responses
+        .filter_duplicates = 0,  // OFF — we want every adv from a candidate
+                                 // until we connect, since blacklist eviction
+                                 // depends on retrying after the TTL expires
     };
 
     int rc = ble_gap_disc(s_own_addr_type, BLE_HS_FOREVER, &params, gap_event_cb, NULL);
@@ -161,30 +256,86 @@ static void start_scan(void)
         ESP_LOGE(TAG, "ble_gap_disc failed: %d", rc);
         return;
     }
-    ESP_LOGI(TAG, "scanning for %02x:%02x:%02x:%02x:%02x:%02x",
-             s_target_mac[5], s_target_mac[4], s_target_mac[3],
-             s_target_mac[2], s_target_mac[1], s_target_mac[0]);
-}
 
-static bool should_connect(const struct ble_gap_disc_desc *disc)
-{
-    if (disc->event_type != BLE_HCI_ADV_RPT_EVTYPE_ADV_IND &&
-        disc->event_type != BLE_HCI_ADV_RPT_EVTYPE_DIR_IND) {
-        return false;
+    if (s_discovery_window_timer != NULL) {
+        (void)esp_timer_stop(s_discovery_window_timer);
+        (void)esp_timer_start_once(s_discovery_window_timer,
+                                   (uint64_t)DISCOVERY_WINDOW_MS * 1000);
     }
-    return memcmp(disc->addr.val, s_target_mac, 6) == 0;
+    ESP_LOGI(TAG, "DISCOVERING — for a NEW bridge, hold Back+VolUp on the remote ~5s to "
+                  "enter pairing mode; for a previously-paired remote, any button press "
+                  "should suffice (window=%d min, filter=HID UUID 0x1812, RSSI ≥ %d dBm)",
+             DISCOVERY_WINDOW_MS / 60000, DISCOVERY_RSSI_MIN);
 }
 
-static void connect_to(const struct ble_gap_disc_desc *disc)
+static void start_bonded_reconnect(void)
 {
-    (void)ble_gap_disc_cancel();
+    if (!s_have_bonded_peer) {
+        ESP_LOGW(TAG, "start_bonded_reconnect called with no stored peer; falling back to discovery");
+        start_discovery();
+        return;
+    }
+    s_mode = MODE_BONDED_RECONNECT;
+    s_pending_candidate_set = false;
 
+    log_addr("BONDED_RECONNECT to", s_bonded_peer.val);
+    int rc = ble_gap_connect(s_own_addr_type, &s_bonded_peer, BLE_HS_FOREVER,
+                             NULL, gap_event_cb, NULL);
+    if (rc != 0 && rc != BLE_HS_EALREADY && rc != BLE_HS_EBUSY) {
+        ESP_LOGE(TAG, "ble_gap_connect (bonded) failed rc=%d; entering discovery", rc);
+        s_have_bonded_peer = false;
+        start_discovery();
+    }
+}
+
+// Inspect an incoming adv. If it advertises HID and clears the RSSI / blacklist
+// gates, cancel scan and connect. Stashes the candidate addr in
+// s_pending_candidate so fingerprint failure can blacklist + delete bond.
+static void try_connect_candidate(const struct ble_gap_disc_desc *disc,
+                                   const struct ble_hs_adv_fields *fields)
+{
+    if (s_pending_candidate_set) {
+        // Already mid-connect to a candidate; ignore concurrent advs.
+        return;
+    }
+    if (disc->rssi < DISCOVERY_RSSI_MIN) {
+        ESP_LOGD(TAG, "rejecting candidate: rssi=%d < %d", disc->rssi, DISCOVERY_RSSI_MIN);
+        return;
+    }
+    if (blacklist_contains(disc->addr.val)) {
+        return;  // already-rejected device, silently ignore
+    }
+    if (!adv_advertises_hid(fields)) {
+        return;  // not an HID advertiser, silently ignore
+    }
+
+    log_addr("HID candidate", disc->addr.val);
+    ESP_LOGI(TAG, "  rssi=%d, attempting connect+fingerprint", disc->rssi);
+
+    s_pending_candidate     = disc->addr;
+    s_pending_candidate_set = true;
+
+    (void)ble_gap_disc_cancel();
     int rc = ble_gap_connect(s_own_addr_type, &disc->addr, 30000, NULL,
                              gap_event_cb, NULL);
     if (rc != 0) {
-        ESP_LOGE(TAG, "ble_gap_connect failed: %d", rc);
-        start_scan();
+        ESP_LOGE(TAG, "ble_gap_connect failed: rc=%d", rc);
+        s_pending_candidate_set = false;
+        start_discovery();
     }
+}
+
+static void discovery_window_expired_cb(void *arg)
+{
+    (void)arg;
+    if (s_mode != MODE_DISCOVERING) {
+        return;
+    }
+    ESP_LOGW(TAG, "discovery window (%d min) expired without finding a remote — "
+                  "press the HA Repair button to retry",
+             DISCOVERY_WINDOW_MS / 60000);
+    (void)ble_gap_disc_cancel();
+    s_mode = MODE_IDLE;
 }
 
 // Setup steps are issued sequentially, one at a time. NimBLE's per-connection
@@ -373,10 +524,99 @@ static void apply_remote_setup(uint16_t conn_handle)
 
 static void complete_setup_chain(uint16_t conn_handle, uint32_t idle_ms)
 {
+    s_mode = MODE_CONNECTED;
     if (s_cfg.on_connected != NULL) {
         s_cfg.on_connected(idle_ms, s_cfg.user);
     }
     apply_remote_setup(conn_handle);
+}
+
+// --- Discovery-mode fingerprint --------------------------------------------
+//
+// Run only on the *first* connect to a candidate (DISCOVERING mode).
+// Walks the discovered GATT tree and confirms the candidate looks like a
+// gen-3 Siri Remote: HID service present, ≥3 Report chars with notify, the
+// button value handle 0x0039 specifically present, and the Apple custom
+// service present. Bonded reconnects skip this — we trust prior bonds.
+
+// Returns NULL on pass; otherwise a static string describing the failed check.
+static const char *fingerprint_check(const struct peer *peer)
+{
+    const ble_uuid16_t hid_svc_uuid    = BLE_UUID16_INIT(HID_SVC_UUID16);
+    const ble_uuid16_t hid_report_uuid = BLE_UUID16_INIT(HID_REPORT_UUID16);
+
+    const struct peer_svc *hid = peer_svc_find_uuid(peer, &hid_svc_uuid.u);
+    if (hid == NULL) {
+        return "HID service 0x1812 missing";
+    }
+
+    int report_notify_count = 0;
+    bool button_handle_present = false;
+    const struct peer_chr *chr;
+    SLIST_FOREACH(chr, &hid->chrs, next) {
+        if (ble_uuid_cmp(&chr->chr.uuid.u, &hid_report_uuid.u) != 0) {
+            continue;
+        }
+        if (chr->chr.properties & BLE_GATT_CHR_PROP_NOTIFY) {
+            report_notify_count++;
+        }
+        if (chr->chr.val_handle == HID_REPORT_BUTTON_VAL) {
+            button_handle_present = true;
+        }
+    }
+    if (report_notify_count < APPLE_FINGERPRINT_MIN_REPORTS) {
+        return "fewer than 3 notify-capable HID Report chars";
+    }
+    if (!button_handle_present) {
+        return "HID button value handle 0x0039 missing";
+    }
+    if (peer_svc_find_uuid(peer, &APPLE_CUSTOM_SVC_UUID.u) == NULL) {
+        return "Apple custom service 8341f2b4-... missing";
+    }
+    return NULL;
+}
+
+static void on_fingerprint_disc_complete(const struct peer *peer, int status, void *arg)
+{
+    (void)arg;
+    uint16_t conn = peer->conn_handle;
+
+    if (status != 0) {
+        ESP_LOGW(TAG, "fingerprint: peer_disc_all failed status=%d — rejecting candidate",
+                 status);
+        goto reject;
+    }
+
+    const char *reason = fingerprint_check(peer);
+    if (reason != NULL) {
+        ESP_LOGI(TAG, "fingerprint FAIL: %s — rejecting candidate", reason);
+        goto reject;
+    }
+
+    ESP_LOGI(TAG, "fingerprint PASS — gen-3 Siri Remote confirmed, proceeding with setup");
+    if (s_pending_candidate_set) {
+        s_bonded_peer       = s_pending_candidate;
+        s_have_bonded_peer  = true;
+        s_pending_candidate_set = false;
+    }
+    if (s_discovery_window_timer != NULL) {
+        (void)esp_timer_stop(s_discovery_window_timer);
+    }
+    // Use idle=0 here: this is a brand-new bond, there's no meaningful
+    // time-since-disconnect to publish. complete_setup_chain → on_connected
+    // → main.c's pickup-event logic suppresses pickup for idle=0.
+    complete_setup_chain(conn, 0);
+    return;
+
+reject:
+    if (s_pending_candidate_set) {
+        blacklist_add(s_pending_candidate.val, BLACKLIST_TTL_FINGERPRINT_MS);
+        (void)ble_store_util_delete_peer(&s_pending_candidate);
+        s_pending_candidate_set = false;
+    }
+    (void)ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
+    // Disconnect handler will resume scanning while still inside the
+    // discovery window.
 }
 
 // Fired from esp_timer task if the second ENC_CHANGE never arrives. Runs
@@ -395,7 +635,17 @@ static void setup_fallback_cb(void *arg)
     uint16_t conn = s_pending_setup_conn;
     uint32_t idle = s_pending_setup_idle_ms;
     s_pending_setup_conn = 0xFFFF;
-    complete_setup_chain(conn, idle);
+    if (s_mode == MODE_DISCOVERING) {
+        // Fallback during discovery: kick fingerprint manually, since the
+        // secondary ENC_CHANGE that would have triggered it never arrived.
+        int rc = peer_disc_all(conn, on_fingerprint_disc_complete, NULL);
+        if (rc != 0) {
+            ESP_LOGW(TAG, "fingerprint: peer_disc_all kickoff failed rc=%d", rc);
+            (void)ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
+        }
+    } else {
+        complete_setup_chain(conn, idle);
+    }
 }
 
 #ifdef CONFIG_DEBUG_WAKE_PROBE
@@ -480,26 +730,49 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
 {
     switch (event->type) {
     case BLE_GAP_EVENT_DISC: {
-        // Every non-matching adv is logged at DEBUG — bump esp_log_level_set("siri_ble", ESP_LOG_DEBUG)
-        // if you need to see the full scan stream (e.g. hunting for a different remote's MAC).
-        const uint8_t *a = event->disc.addr.val;
-        if (!should_connect(&event->disc)) {
-            ESP_LOGD(TAG, "adv %02x:%02x:%02x:%02x:%02x:%02x rssi=%d",
-                     a[5], a[4], a[3], a[2], a[1], a[0], event->disc.rssi);
+        if (s_mode != MODE_DISCOVERING) {
+            return 0;  // not actively scanning (e.g. idle / connected); ignore
+        }
+        if (event->disc.event_type != BLE_HCI_ADV_RPT_EVTYPE_ADV_IND) {
+            // Only act on undirected connectable advs (ADV_IND). Skip:
+            //   ADV_DIRECT_IND (0x01) — addressed to a specific peer, almost
+            //     always the remote's prior bonded host. Connecting to one
+            //     where we're not the addressed peer fails at LL with
+            //     reason 0x023e ("connection failed to be established") and
+            //     loops because the remote keeps sending the same DIR_IND.
+            //     Wait for the ADV_IND fallback (Apple typically sends DIR_IND
+            //     for ~1.28 s before falling back to ADV_IND for unbonded
+            //     pairing — and explicit pairing-mode (TV+VolUp 5 s) goes
+            //     straight to ADV_IND).
+            //   ADV_SCAN_IND / ADV_NONCONN_IND / scan responses — skip.
             return 0;
         }
-        log_addr("matching adv", a);
-        ESP_LOGI(TAG, "  rssi=%d", event->disc.rssi);
-        connect_to(&event->disc);
+        struct ble_hs_adv_fields fields;
+        if (ble_hs_adv_parse_fields(&fields, event->disc.data,
+                                    event->disc.length_data) != 0) {
+            return 0;  // malformed adv
+        }
+        try_connect_candidate(&event->disc, &fields);
         return 0;
     }
 
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status != 0) {
             ESP_LOGE(TAG, "connect failed: status=%d", event->connect.status);
-            start_scan();
+            if (s_mode == MODE_DISCOVERING && s_pending_candidate_set) {
+                blacklist_add(s_pending_candidate.val,
+                              BLACKLIST_TTL_FAILED_CONNECT_MS);
+            }
+            s_pending_candidate_set = false;
+            if (s_mode == MODE_BONDED_RECONNECT) {
+                // Re-issue direct connect — peer will eventually advertise.
+                start_bonded_reconnect();
+            } else if (s_mode == MODE_DISCOVERING) {
+                start_discovery();
+            }
             return 0;
         }
+        s_active_conn = event->connect.conn_handle;
         ESP_LOGI(TAG, "connected, conn_handle=%d", event->connect.conn_handle);
 #ifdef CONFIG_DEBUG_WAKE_PROBE
         s_connect_ms = now_ms();
@@ -539,21 +812,58 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         return 0;
     }
 
-    case BLE_GAP_EVENT_DISCONNECT:
+    case BLE_GAP_EVENT_DISCONNECT: {
+        bool failed_pre_fingerprint =
+            (s_mode == MODE_DISCOVERING && s_pending_candidate_set &&
+             s_setup_done_conn == 0xFFFF);
         ESP_LOGI(TAG, "disconnected, reason=0x%04x", event->disconnect.reason);
         peer_delete(event->disconnect.conn.conn_handle);
         s_last_disconnect_ms = now_ms();
         s_has_disconnected   = true;
         s_setup_done_conn    = 0xFFFF;
+        s_active_conn        = 0xFFFF;
         if (s_pending_setup_conn != 0xFFFF) {
             (void)esp_timer_stop(s_setup_fallback_timer);
             s_pending_setup_conn = 0xFFFF;
         }
+        if (failed_pre_fingerprint) {
+            // Connect was attempted but the link never reached fingerprint —
+            // most often the peer is advertising but won't admit us at LL
+            // until the user puts the remote in pairing mode (Back+VolUp).
+            // Short blacklist breaks the retry loop while still recovering
+            // quickly when the user does press the combo.
+            ESP_LOGI(TAG, "candidate failed pre-fingerprint — blacklisting %d s, "
+                          "hold Back+VolUp ~5s on the remote to pair",
+                     BLACKLIST_TTL_FAILED_CONNECT_MS / 1000);
+            blacklist_add(s_pending_candidate.val,
+                          BLACKLIST_TTL_FAILED_CONNECT_MS);
+        }
         if (s_cfg.on_disconnected != NULL) {
             s_cfg.on_disconnected(s_cfg.user);
         }
-        start_scan();
+        // Mode dispatch on disconnect:
+        //   - DISCOVERING (fingerprint just rejected, or bonded peer
+        //     advertising during discovery dropped us): keep scanning.
+        //   - BONDED_RECONNECT (link dropped, we want it back): re-issue
+        //     direct connect.
+        //   - CONNECTED (idle disconnect or remote went away): if we have a
+        //     bond, transition to BONDED_RECONNECT; otherwise this means the
+        //     bond was wiped mid-session (siri_ble_repair after terminate),
+        //     so enter discovery.
+        //   - IDLE: shouldn't happen (no active conn), but just stay idle.
+        if (s_mode == MODE_DISCOVERING) {
+            start_discovery();
+        } else if (s_mode == MODE_BONDED_RECONNECT) {
+            start_bonded_reconnect();
+        } else if (s_mode == MODE_CONNECTED) {
+            if (s_have_bonded_peer) {
+                start_bonded_reconnect();
+            } else {
+                start_discovery();
+            }
+        }
         return 0;
+    }
 
     case BLE_GAP_EVENT_MTU:
         ESP_LOGI(TAG, "mtu=%d", event->mtu.value);
@@ -611,12 +921,28 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
             return 0;
         }
         // Secondary ENC_CHANGE — Apple's accessory-framework handshake has
-        // settled. Cancel fallback, run setup. Apple flushes the buffered
-        // wake-press to us shortly after the button CCCD subscribe lands.
+        // settled. Cancel fallback. If we're discovering (no prior bond),
+        // run a fingerprint check before committing to the bond — peer_disc_all
+        // walks the GATT tree, then on_fingerprint_disc_complete either runs
+        // setup or rejects+blacklists. If we already trust the bond, skip
+        // straight to setup; Apple flushes the buffered wake-press to us
+        // shortly after the button CCCD subscribe lands.
         (void)esp_timer_stop(s_setup_fallback_timer);
         uint32_t idle = s_pending_setup_idle_ms;
         s_pending_setup_conn = 0xFFFF;
-        complete_setup_chain(conn, idle);
+        if (s_mode == MODE_DISCOVERING) {
+            int rc = peer_disc_all(conn, on_fingerprint_disc_complete, NULL);
+            if (rc != 0) {
+                ESP_LOGE(TAG, "fingerprint: peer_disc_all kickoff failed rc=%d", rc);
+                if (s_pending_candidate_set) {
+                    blacklist_add(s_pending_candidate.val, BLACKLIST_TTL_FINGERPRINT_MS);
+                    s_pending_candidate_set = false;
+                }
+                (void)ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
+            }
+        } else {
+            complete_setup_chain(conn, idle);
+        }
         return 0;
     }
 
@@ -679,6 +1005,34 @@ void siri_ble_idle_disconnect(void)
     }
 }
 
+void siri_ble_repair(void)
+{
+    ESP_LOGI(TAG, "repair: clearing bond store and re-entering discovery");
+    int rc = ble_store_clear();
+    if (rc != 0) {
+        ESP_LOGW(TAG, "ble_store_clear rc=%d", rc);
+    }
+    s_have_bonded_peer      = false;
+    s_pending_candidate_set = false;
+    blacklist_clear();
+
+    if (s_active_conn != 0xFFFF) {
+        // Disconnect handler will see s_have_bonded_peer=false and route
+        // into discovery on its way out. Setting mode here would race the
+        // disconnect; let it dispatch.
+        s_mode = MODE_DISCOVERING;
+        int trc = ble_gap_terminate(s_active_conn, BLE_ERR_REM_USER_CONN_TERM);
+        if (trc != 0 && trc != BLE_HS_ENOTCONN) {
+            ESP_LOGW(TAG, "ble_gap_terminate (repair) rc=%d", trc);
+        }
+        return;
+    }
+    // No active connection — make sure scan is stopped (in case we're mid-
+    // discovery already), then restart the window from scratch.
+    (void)ble_gap_disc_cancel();
+    start_discovery();
+}
+
 static void on_reset(int reason)
 {
     ESP_LOGW(TAG, "host reset, reason=%d", reason);
@@ -697,23 +1051,36 @@ static void on_sync(void)
     if (ble_att_set_preferred_mtu(247) != 0) {
         ESP_LOGW(TAG, "set_preferred_mtu(247) failed");
     }
-    // Log persisted bond-store record counts at boot. Doesn't change BLE
-    // behavior (NimBLE loads keys lazily anyway and Phase 3A.7 confirmed
-    // pre-loading makes no difference) but the counts are useful at-a-
-    // glance diagnostic for confirming a bond is actually persisted.
-    int bonded_count = 0;
-    if (ble_store_util_count(BLE_STORE_OBJ_TYPE_PEER_SEC, &bonded_count) == 0) {
-        ESP_LOGI(TAG, "bond store: %d persisted peer-sec record(s)", bonded_count);
+    // Inspect the bond store. If a peer is persisted from a previous boot,
+    // skip discovery and go straight to a direct connect — NimBLE's resolving
+    // list translates the bonded identity address into the peer's current
+    // resolvable random adv automatically. If the store is empty (first boot
+    // or post-repair), enter the 5-minute discovery window.
+    ble_addr_t peer_id_addrs[CONFIG_BT_NIMBLE_MAX_BONDS];
+    int        num_bonded = 0;
+    int rc = ble_store_util_bonded_peers(peer_id_addrs, &num_bonded,
+                                          CONFIG_BT_NIMBLE_MAX_BONDS);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "ble_store_util_bonded_peers rc=%d; entering discovery", rc);
+        num_bonded = 0;
     }
     int our_count = 0;
-    if (ble_store_util_count(BLE_STORE_OBJ_TYPE_OUR_SEC, &our_count) == 0) {
-        ESP_LOGI(TAG, "bond store: %d persisted our-sec record(s)", our_count);
-    }
+    (void)ble_store_util_count(BLE_STORE_OBJ_TYPE_OUR_SEC, &our_count);
     int cccd_count = 0;
-    if (ble_store_util_count(BLE_STORE_OBJ_TYPE_CCCD, &cccd_count) == 0) {
-        ESP_LOGI(TAG, "bond store: %d persisted CCCD record(s)", cccd_count);
+    (void)ble_store_util_count(BLE_STORE_OBJ_TYPE_CCCD, &cccd_count);
+    ESP_LOGI(TAG, "bond store: %d peer-sec / %d our-sec / %d CCCD record(s)",
+             num_bonded, our_count, cccd_count);
+
+    if (num_bonded > 0) {
+        // Use the first bonded peer. We never expect more than one — the
+        // bridge bonds to exactly one remote — but tolerate the array form.
+        s_bonded_peer      = peer_id_addrs[0];
+        s_have_bonded_peer = true;
+        start_bonded_reconnect();
+    } else {
+        s_have_bonded_peer = false;
+        start_discovery();
     }
-    start_scan();
 }
 
 esp_err_t siri_ble_start(const siri_ble_config_t *cfg)
@@ -722,12 +1089,6 @@ esp_err_t siri_ble_start(const siri_ble_config_t *cfg)
         return ESP_ERR_INVALID_ARG;
     }
     s_cfg = *cfg;
-
-    if (!parse_mac(CONFIG_SIRI_REMOTE_MAC, s_target_mac)) {
-        ESP_LOGE(TAG, "SIRI_REMOTE_MAC \"%s\" is malformed; expected aa:bb:cc:dd:ee:ff",
-                 CONFIG_SIRI_REMOTE_MAC);
-        return ESP_ERR_INVALID_ARG;
-    }
 
     ble_hs_cfg.sm_io_cap         = BLE_HS_IO_NO_INPUT_OUTPUT;
     ble_hs_cfg.sm_bonding        = 1;
@@ -756,12 +1117,20 @@ esp_err_t siri_ble_start(const siri_ble_config_t *cfg)
         return ESP_FAIL;
     }
 
-    const esp_timer_create_args_t timer_args = {
+    const esp_timer_create_args_t setup_timer_args = {
         .callback = setup_fallback_cb,
         .name     = "siri_setup_fallback",
     };
-    if (esp_timer_create(&timer_args, &s_setup_fallback_timer) != ESP_OK) {
-        ESP_LOGE(TAG, "esp_timer_create failed");
+    if (esp_timer_create(&setup_timer_args, &s_setup_fallback_timer) != ESP_OK) {
+        ESP_LOGE(TAG, "esp_timer_create (setup_fallback) failed");
+        return ESP_FAIL;
+    }
+    const esp_timer_create_args_t window_timer_args = {
+        .callback = discovery_window_expired_cb,
+        .name     = "siri_disc_window",
+    };
+    if (esp_timer_create(&window_timer_args, &s_discovery_window_timer) != ESP_OK) {
+        ESP_LOGE(TAG, "esp_timer_create (discovery_window) failed");
         return ESP_FAIL;
     }
     return ESP_OK;
