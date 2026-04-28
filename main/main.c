@@ -310,13 +310,8 @@ static void emit_cb(const event_state_event_t *evt, void *user)
                      event_type, evt->distance);
         break;
     case EVT_PICKUP:
-        // wake_press_likely=true means the user almost certainly pressed a
-        // button to wake the remote — but on cold-boot reconnects, Apple
-        // drops the wake-press notify, so the specific button identity may
-        // never arrive on 0x0039. HA automations should treat pickup as the
-        // generic "user activated remote" signal (see README).
         n = snprintf(buf, sizeof(buf),
-                     "{\"event_type\":\"%s\",\"idle_duration_ms\":%" PRIu32 ",\"wake_press_likely\":true}",
+                     "{\"event_type\":\"%s\",\"idle_duration_ms\":%" PRIu32 "}",
                      event_type, evt->idle_duration_ms);
         break;
     }

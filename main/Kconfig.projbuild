@@ -69,18 +69,32 @@ menu "Siri Bridge Configuration"
 
     config IDLE_DISCONNECT_MS
         int "Idle BLE disconnect threshold (ms)"
-        default 60000
+        default 0
         range 0 3600000
         help
             After this many milliseconds with no notifications from the
-            remote, the bridge proactively terminates the BLE connection so
-            the remote can enter deep sleep and conserve battery. Without
-            this, registering the standard GATT server keeps Apple's
-            accessory framework happy AND keeps the link alive indefinitely
-            — which works but drains the remote's CR2032 ~5x faster.
+            remote, the bridge proactively terminates the BLE connection.
+            **Default is 0 (always-connected mode), which is the
+            recommended setting** — see below.
 
-            The remote re-advertises on the next button press; reconnect
-            takes ~1 second. Set to 0 to disable the proactive disconnect
-            (always-connected mode).
+            Wake-press loss caveat: Apple's BLE accessory firmware drops
+            the press that wakes the remote if the bridge has been
+            disconnected for longer than ~30s. Investigation in Phase 3A.7
+            confirmed this is server-side and unrecoverable from the
+            central regardless of GATT-level interventions tried.
+
+            With 0 (the default), the bridge stays connected forever and
+            relies on the remote's preferred slave-latency = 80 (configured
+            after setup completes) to let the remote deep-sleep between
+            conn events. Effective duty cycle is ~0.1%; CR2032 lifetime
+            stays at ~10-15 months instead of ~18-24 months disconnected.
+            Trade ~1.5x battery for 100% wake-press reliability.
+
+            With a non-zero value (e.g. 60000), the bridge auto-disconnects
+            after the idle window so the remote enters deep sleep. Battery
+            is better, but any wake-press after >30s of disconnect drops
+            the button identity (the synthesized `pickup` event still
+            fires as a generic wake signal). Use this if battery matters
+            more than knowing which button was pressed to wake the remote.
 
 endmenu
