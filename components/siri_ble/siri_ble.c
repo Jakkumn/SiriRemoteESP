@@ -685,12 +685,10 @@ static void on_sync(void)
     if (ble_att_set_preferred_mtu(247) != 0) {
         ESP_LOGW(TAG, "set_preferred_mtu(247) failed");
     }
-    // Warm the NimBLE bond store: walk every persisted security record at
-    // boot so the keys are paged into RAM before the first connection.
-    // Hypothesis: cold-boot first-bond reconnect fails to recover Apple's
-    // buffered wake-press because LTK lookup runs lazily during the handshake
-    // and adds enough latency that Apple drops the press. Pre-loading should
-    // make the cold-boot path feel like a warm reconnect to NimBLE.
+    // Log persisted bond-store record counts at boot. Doesn't change BLE
+    // behavior (NimBLE loads keys lazily anyway and Phase 3A.7 confirmed
+    // pre-loading makes no difference) but the counts are useful at-a-
+    // glance diagnostic for confirming a bond is actually persisted.
     int bonded_count = 0;
     if (ble_store_util_count(BLE_STORE_OBJ_TYPE_PEER_SEC, &bonded_count) == 0) {
         ESP_LOGI(TAG, "bond store: %d persisted peer-sec record(s)", bonded_count);

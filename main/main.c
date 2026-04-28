@@ -499,37 +499,13 @@ static void mqtt_event_handler(void *args, esp_event_base_t base, int32_t id, vo
     case MQTT_EVENT_SUBSCRIBED:
         ESP_LOGI(TAG, "mqtt: subscribed (msg_id=%d)", evt->msg_id);
         break;
-    case MQTT_EVENT_DATA: {
-        // Diagnostic: log every received topic + payload until 3A.2 raw-stream
-        // Switch is verified working, then drop back to a single match path.
-        char topic_buf[80];
-        int tl = (evt->topic != NULL && evt->topic_len > 0)
-                     ? (evt->topic_len < (int)sizeof(topic_buf) - 1
-                            ? evt->topic_len
-                            : (int)sizeof(topic_buf) - 1)
-                     : 0;
-        if (tl > 0) {
-            memcpy(topic_buf, evt->topic, tl);
-        }
-        topic_buf[tl] = '\0';
-        char data_buf[32];
-        int dl = evt->data_len < (int)sizeof(data_buf) - 1
-                     ? evt->data_len
-                     : (int)sizeof(data_buf) - 1;
-        if (dl > 0) {
-            memcpy(data_buf, evt->data, dl);
-        }
-        data_buf[dl] = '\0';
-        ESP_LOGI(TAG, "mqtt RX: topic='%s' (len=%d) data='%s' (len=%d)",
-                 topic_buf, evt->topic_len, data_buf, evt->data_len);
-
+    case MQTT_EVENT_DATA:
         if (evt->topic != NULL &&
             evt->topic_len == (int)strlen(TOPIC_CMD_RAW_STREAM) &&
             memcmp(evt->topic, TOPIC_CMD_RAW_STREAM, evt->topic_len) == 0) {
             handle_raw_stream_cmd(evt->data, evt->data_len);
         }
         break;
-    }
     default:
         break;
     }

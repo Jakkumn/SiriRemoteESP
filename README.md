@@ -4,10 +4,11 @@ An ESP32 BLE bridge that pairs with an Apple Siri Remote (gen 3) and forwards
 button + clickpad events to Home Assistant via MQTT, with Home Assistant
 auto-discovery so the remote shows up as a device automatically.
 
-**Status:** Phase 2 — Wi-Fi + MQTT + HA integration. Buttons, swipes, and
-pickup events publish to MQTT; HA auto-discovers an Event entity and a
-runtime Switch for the optional raw touch stream. Touch coordinate decoding
-and battery/charging publishing are deferred to Phase 3.
+**Status:** Phase 3A complete — buttons, swipes, pickup, battery, and
+charging all publish to MQTT with HA auto-discovery (Event entity, Switch
+for raw touch stream, Sensors for battery + charging). Connected-low-power
+mode is the default to ensure 100 % wake-press reliability — see
+[Always-connected mode](#always-connected-mode-default) below.
 
 ## Hardware
 

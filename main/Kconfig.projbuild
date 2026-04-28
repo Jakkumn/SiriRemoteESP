@@ -72,29 +72,19 @@ menu "Siri Bridge Configuration"
         default 0
         range 0 3600000
         help
-            After this many milliseconds with no notifications from the
-            remote, the bridge proactively terminates the BLE connection.
-            **Default is 0 (always-connected mode), which is the
-            recommended setting** — see below.
+            Idle window after which the bridge proactively terminates
+            the BLE link.
 
-            Wake-press loss caveat: Apple's BLE accessory firmware drops
-            the press that wakes the remote if the bridge has been
-            disconnected for longer than ~30s. Investigation in Phase 3A.7
-            confirmed this is server-side and unrecoverable from the
-            central regardless of GATT-level interventions tried.
+            0 (default): always-connected mode. The link stays up forever
+            using the remote's preferred low-power conn params (slave
+            latency 80) so the remote still deep-sleeps between events.
+            CR2032 lifetime ~10–15 months vs ~18–24 months disconnected,
+            in exchange for 100% wake-press reliability.
 
-            With 0 (the default), the bridge stays connected forever and
-            relies on the remote's preferred slave-latency = 80 (configured
-            after setup completes) to let the remote deep-sleep between
-            conn events. Effective duty cycle is ~0.1%; CR2032 lifetime
-            stays at ~10-15 months instead of ~18-24 months disconnected.
-            Trade ~1.5x battery for 100% wake-press reliability.
-
-            With a non-zero value (e.g. 60000), the bridge auto-disconnects
-            after the idle window so the remote enters deep sleep. Battery
-            is better, but any wake-press after >30s of disconnect drops
-            the button identity (the synthesized `pickup` event still
-            fires as a generic wake signal). Use this if battery matters
-            more than knowing which button was pressed to wake the remote.
+            Non-zero (e.g. 60000): auto-disconnect on idle. Better battery,
+            but Apple drops the press that wakes the remote if the bridge
+            has been disconnected for >30s — the synthesized `pickup`
+            event still fires as a generic wake signal. See README's
+            "Always-connected mode" section.
 
 endmenu
