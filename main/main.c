@@ -24,6 +24,7 @@
 #include "nimble/nimble_port_freertos.h"
 
 #include "event_state.h"
+#include "mqtt_entity.h"
 #include "report_decoder.h"
 #include "siri_ble.h"
 
@@ -33,31 +34,32 @@ void ble_store_config_init(void);
 
 static const char *TAG = "main";
 
-#define NVS_NS        "siri_bridge"
-#define NVS_KEY_RAW   "raw_stream"
 #define TICK_PERIOD_MS 50
 
-// MQTT topic constants.
+// MQTT topic constants. Switch / Number / Button entities use the
+// mqtt_entity helper, which generates topics from each entity's
+// unique_id — so they don't appear here.
 #define TOPIC_EVENT                  "siri_remote/event"
 #define TOPIC_TOUCH_RAW              "siri_remote/touch_raw"
 #define TOPIC_CONN                   "siri_remote/connection"
 #define TOPIC_REMOTE_STATUS          "siri_remote/remote_status"
 #define TOPIC_BATTERY                "siri_remote/battery"
 #define TOPIC_CHARGING               "siri_remote/charging"
-#define TOPIC_CMD_RAW_STREAM         "siri_remote/cmd/raw_stream"
-#define TOPIC_STATE_RAW_STREAM       "siri_remote/state/raw_stream"
 #define TOPIC_DISCOVERY_EVENT        "homeassistant/event/siri_remote/config"
-#define TOPIC_DISCOVERY_SWITCH       "homeassistant/switch/siri_remote_raw_stream/config"
 #define TOPIC_DISCOVERY_BATTERY      "homeassistant/sensor/siri_remote_battery/config"
 #define TOPIC_DISCOVERY_CHARGING     "homeassistant/sensor/siri_remote_charging/config"
+
+// HA-side device identifier — every entity attaches to this so they all
+// group as one device in the HA UI.
+#define HA_DEVICE_ID "siri_remote_bridge"
 
 // State.
 static esp_mqtt_client_handle_t s_mqtt;
 static event_state_t           *s_es;
 static SemaphoreHandle_t        s_es_lock;
 static volatile bool            s_mqtt_connected;
-static volatile bool            s_raw_stream_enabled;
 static esp_timer_handle_t       s_tick_timer;
+static mqtt_entity_t           *s_raw_stream_entity;
 // Activity tracking for idle-disconnect. Updated on every BLE notification
 // from the remote. 0 = no remote activity yet (post-disconnect or pre-first-event).
 static volatile uint32_t        s_last_activity_ms;
@@ -65,32 +67,6 @@ static volatile uint32_t        s_last_activity_ms;
 static uint32_t now_ms(void)
 {
     return (uint32_t)(esp_timer_get_time() / 1000);
-}
-
-// --- NVS for raw-stream toggle ---
-
-static bool nvs_load_raw_stream_enabled(void)
-{
-    nvs_handle_t h;
-    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) {
-        return false;
-    }
-    uint8_t v = 0;
-    esp_err_t err = nvs_get_u8(h, NVS_KEY_RAW, &v);
-    nvs_close(h);
-    return err == ESP_OK && v != 0;
-}
-
-static void nvs_save_raw_stream_enabled(bool on)
-{
-    nvs_handle_t h;
-    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
-        ESP_LOGW(TAG, "nvs_open for raw_stream save failed");
-        return;
-    }
-    (void)nvs_set_u8(h, NVS_KEY_RAW, on ? 1 : 0);
-    (void)nvs_commit(h);
-    nvs_close(h);
 }
 
 // --- MQTT publish helpers ---
@@ -101,12 +77,6 @@ static void mqtt_publish(const char *topic, const char *payload, int len, int qo
         return;
     }
     esp_mqtt_client_publish(s_mqtt, topic, payload, len, qos, retain ? 1 : 0);
-}
-
-static void publish_raw_stream_state(void)
-{
-    const char *s = s_raw_stream_enabled ? "on" : "off";
-    mqtt_publish(TOPIC_STATE_RAW_STREAM, s, 0, 1, /*retain*/ true);
 }
 
 static void publish_ha_discovery_event(void)
@@ -216,28 +186,6 @@ static void publish_charging(uint8_t state_byte)
     }
     ESP_LOGI(TAG, "charging state=0x%02x => %s", state_byte, s);
     mqtt_publish(TOPIC_CHARGING, s, 0, 1, /*retain*/ true);
-}
-
-static void publish_ha_discovery_switch(void)
-{
-    static const char PAYLOAD[] =
-        "{"
-        "\"name\":\"Raw Touch Stream\","
-        "\"unique_id\":\"siri_remote_raw_stream\","
-        "\"command_topic\":\"" TOPIC_CMD_RAW_STREAM "\","
-        "\"state_topic\":\"" TOPIC_STATE_RAW_STREAM "\","
-        "\"payload_on\":\"on\","
-        "\"payload_off\":\"off\","
-        "\"state_on\":\"on\","
-        "\"state_off\":\"off\","
-        "\"device\":{\"identifiers\":[\"siri_remote_bridge\"]},"
-        "\"availability_topic\":\"" TOPIC_CONN "\","
-        "\"payload_available\":\"online\","
-        "\"payload_not_available\":\"offline\","
-        "\"entity_category\":\"config\","
-        "\"icon\":\"mdi:gesture-tap-hold\""
-        "}";
-    mqtt_publish(TOPIC_DISCOVERY_SWITCH, PAYLOAD, sizeof(PAYLOAD) - 1, 1, /*retain*/ true);
 }
 
 static void publish_touch_raw(const siri_touch_frame_t *f)
@@ -358,7 +306,7 @@ static void on_notify_cb(uint16_t attr_handle, const uint8_t *data, size_t len, 
             xSemaphoreTake(s_es_lock, portMAX_DELAY);
             event_state_feed_touch(s_es, &frame, now_ms());
             xSemaphoreGive(s_es_lock);
-            if (s_raw_stream_enabled) {
+            if (mqtt_entity_get_value(s_raw_stream_entity)) {
                 publish_touch_raw(&frame);
             }
         }
@@ -453,26 +401,6 @@ static void wifi_start(void)
 
 // --- MQTT ---
 
-static void handle_raw_stream_cmd(const char *data, int len)
-{
-    bool on;
-    if (len == 2 && memcmp(data, "on", 2) == 0) {
-        on = true;
-    } else if (len == 3 && memcmp(data, "off", 3) == 0) {
-        on = false;
-    } else {
-        ESP_LOGW(TAG, "mqtt: unknown raw_stream command (%d bytes)", len);
-        return;
-    }
-    if (on == s_raw_stream_enabled) {
-        return;
-    }
-    s_raw_stream_enabled = on;
-    nvs_save_raw_stream_enabled(on);
-    publish_raw_stream_state();
-    ESP_LOGI(TAG, "raw_stream %s", on ? "ON" : "OFF");
-}
-
 static void mqtt_event_handler(void *args, esp_event_base_t base, int32_t id, void *data)
 {
     (void)args; (void)base;
@@ -483,14 +411,14 @@ static void mqtt_event_handler(void *args, esp_event_base_t base, int32_t id, vo
         s_mqtt_connected = true;
         esp_mqtt_client_publish(s_mqtt, TOPIC_CONN, "online", 0, 1, /*retain*/ 1);
         publish_ha_discovery_event();
-        publish_ha_discovery_switch();
         publish_ha_discovery_battery();
         publish_ha_discovery_charging();
-        publish_raw_stream_state();
         // Default remote status to disconnected on MQTT (re)connect — BLE
         // callbacks will flip it to "connected" once encryption succeeds.
         publish_remote_status(false);
-        esp_mqtt_client_subscribe(s_mqtt, TOPIC_CMD_RAW_STREAM, 1);
+        // Helper-managed entities (raw-stream Switch, future Buttons/Numbers)
+        // (re)publish their discovery + state and (re)subscribe to commands.
+        mqtt_entity_on_mqtt_connected(s_mqtt);
         break;
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "mqtt: disconnected");
@@ -500,11 +428,8 @@ static void mqtt_event_handler(void *args, esp_event_base_t base, int32_t id, vo
         ESP_LOGI(TAG, "mqtt: subscribed (msg_id=%d)", evt->msg_id);
         break;
     case MQTT_EVENT_DATA:
-        if (evt->topic != NULL &&
-            evt->topic_len == (int)strlen(TOPIC_CMD_RAW_STREAM) &&
-            memcmp(evt->topic, TOPIC_CMD_RAW_STREAM, evt->topic_len) == 0) {
-            handle_raw_stream_cmd(evt->data, evt->data_len);
-        }
+        (void)mqtt_entity_dispatch_data(evt->topic, evt->topic_len,
+                                        evt->data, evt->data_len);
         break;
     default:
         break;
@@ -551,8 +476,20 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    s_raw_stream_enabled = nvs_load_raw_stream_enabled();
-    ESP_LOGI(TAG, "raw_stream initial state: %s", s_raw_stream_enabled ? "ON" : "OFF");
+    s_raw_stream_entity = mqtt_entity_create(&(mqtt_entity_config_t){
+        .kind               = MQTT_ENTITY_SWITCH,
+        .unique_id          = "siri_remote_raw_stream",
+        .display_name       = "Raw Touch Stream",
+        .icon               = "mdi:gesture-tap-hold",
+        .device_id          = HA_DEVICE_ID,
+        .availability_topic = TOPIC_CONN,
+        .nvs_key            = "raw_stream",
+        .default_value      = 0,
+        .on_change          = NULL,  // value already cached via mqtt_entity_get_value
+    });
+    assert(s_raw_stream_entity != NULL);
+    ESP_LOGI(TAG, "raw_stream initial state: %s",
+             mqtt_entity_get_value(s_raw_stream_entity) ? "ON" : "OFF");
 
     s_es_lock = xSemaphoreCreateMutex();
     assert(s_es_lock != NULL);

@@ -76,19 +76,31 @@ static const ble_uuid128_t APPLE_CUSTOM_SVC_UUID =
 
 #endif
 
-// Connection parameters requested AFTER setup completes — these match the
-// remote's PPCP exactly (read at handle 0x0007: 06 00 0c 00 50 00 58 02).
-// At 15 ms intervals with slave latency 80 the peripheral may skip up to
-// 80 conn events ≈ 1.2 s of effective deep-sleep, but breaks out instantly
-// when it has a button press to send. This is what lets us keep the link
-// alive forever (CONFIG_IDLE_DISCONNECT_MS=0) without melting the CR2032
-// — and avoids the wake-press loss entirely, since there's no disconnect/
-// reconnect path for Apple's session state to expire across.
+// Connection parameters requested AFTER setup completes. itvl_min/itvl_max
+// match the remote's PPCP (read at handle 0x0007: 06 00 0c 00 50 00 58 02).
+// We push slave_latency well above the remote's preferred 80 — Apple's
+// peripheral accepts up to at least 400, verified empirically against a
+// real gen-3 unit. At 15 ms intervals with latency 400 the peripheral may
+// skip up to 400 conn events ≈ 6 s of effective deep-sleep, but breaks out
+// instantly when it has a button press to send. This is what lets us keep
+// the link alive forever (CONFIG_IDLE_DISCONNECT_MS=0) without melting the
+// CR2032 — and avoids the wake-press loss entirely, since there's no
+// disconnect/reconnect path for Apple's session state to expire across.
+//
+// supervision_timeout must satisfy spec rule:
+//   timeout > 2 * itvl_max * (1 + latency)
+// At itvl_max=12 (15ms) and latency=400 the lower bound is 12.03 s; 1500
+// (15 s) gives ~25 % margin, the cost being that a runaway remote takes
+// ~15 s to register as gone.
+//
+// Phase 3B.8 exposes itvl_max / latency / supervision_timeout as runtime
+// MQTT Number entities so users can trade battery-life vs. responsiveness
+// vs. disconnect-detection latency without reflashing.
 static const struct ble_gap_upd_params LOW_POWER_CONN_PARAMS = {
-    .itvl_min            = 6,    // 6 * 1.25ms = 7.5ms
-    .itvl_max            = 12,   // 12 * 1.25ms = 15ms
-    .latency             = 80,
-    .supervision_timeout = 600,  // 600 * 10ms = 6s
+    .itvl_min            = 6,     // 6 * 1.25ms = 7.5ms
+    .itvl_max            = 12,    // 12 * 1.25ms = 15ms
+    .latency             = 400,
+    .supervision_timeout = 1500,  // 1500 * 10ms = 15s
     .min_ce_len          = 0,
     .max_ce_len          = 0,
 };
