@@ -83,23 +83,21 @@ def _pin_sdkconfig():
 
 
 async def to_code(config):
-    if not CORE.using_esp_idf:
+    if not (CORE.is_esp32 and not CORE.using_arduino):
         raise cv.Invalid(
-            "siri_remote requires `framework: type: esp-idf` "
+            "siri_remote requires `framework: type: esp-idf` on an ESP32 "
             "(Arduino framework lacks the NimBLE central API surface we use)"
         )
 
     _pin_sdkconfig()
 
-    # Opus decoder. Submodules are required — micro-opus references
-    # upstream xiph/opus and the ogg-demuxer as nested submodules;
-    # without them the staging step fails to apply patches because
-    # lib/opus/ is empty.
+    # Opus decoder, sourced via the IDF Component Manager registry
+    # (`esphome/micro-opus`). The registry archive bundles the upstream
+    # xiph/opus + ogg-demuxer source — no submodule init step needed.
+    # Pinned identically to the standalone `components/siri_audio/idf_component.yml`.
     esp32.add_idf_component(
-        name="micro-opus",
-        repo="https://github.com/esphome-libs/micro-opus",
-        ref="v0.3.6",
-        submodules=["lib/opus", "lib/micro-ogg-demuxer"],
+        name="esphome/micro-opus",
+        ref="~0.3.3",
     )
 
     # esp_central.h is an internal header used by siri_ble.c + peer.c.
@@ -135,3 +133,9 @@ async def to_code(config):
         cg.add_build_flag("-DCONFIG_VOICE_ENABLED=1")
     if config[CONF_DEBUG_WAKE_PROBE]:
         cg.add_build_flag("-DCONFIG_DEBUG_WAKE_PROBE=1")
+
+    # Enable the HA service-call / event-fire path. ESPHome 2026.4 made
+    # this opt-in via api: homeassistant_services: true; emit_event needs
+    # it unconditionally, so add the define here regardless of the api:
+    # block's value.
+    cg.add_define("USE_API_HOMEASSISTANT_SERVICES")

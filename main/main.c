@@ -219,19 +219,7 @@ static void publish_battery(uint8_t level)
 static void publish_charging(uint8_t state_byte)
 {
     s_last_charging_byte = state_byte;
-    // BLE-standard 0x2A1A "Battery Power State" is a single byte with four
-    // 2-bit fields. Bits 4..5 = charging field, 2..3 = discharging field.
-    // Value 3 in either means "yes that state is active".
-    uint8_t discharging = (state_byte >> 2) & 0x03;
-    uint8_t charging    = (state_byte >> 4) & 0x03;
-    const char *s;
-    if (charging == 3) {
-        s = "charging";
-    } else if (discharging == 3) {
-        s = "discharging";
-    } else {
-        s = "plugged_in";
-    }
+    const char *s = siri_decode_charging_state(state_byte);
     ESP_LOGI(TAG, "charging state=0x%02x => %s", state_byte, s);
     mqtt_publish(TOPIC_CHARGING, s, 0, 1, /*retain*/ true);
 }
@@ -254,25 +242,10 @@ static void publish_touch_raw(const siri_touch_frame_t *f)
 
 // --- event_state emit callback ---
 
-static const char *action_to_event_type(event_action_t a)
-{
-    switch (a) {
-    case EVT_CLICK:        return "click";
-    case EVT_DOUBLE_CLICK: return "double_click";
-    case EVT_HOLD_START:   return "hold_start";
-    case EVT_HOLD_END:     return "hold_end";
-    case EVT_SWIPE_UP:     return "swipe_up";
-    case EVT_SWIPE_DOWN:   return "swipe_down";
-    case EVT_SWIPE_LEFT:   return "swipe_left";
-    case EVT_SWIPE_RIGHT:  return "swipe_right";
-    }
-    return NULL;
-}
-
 static void emit_cb(const event_state_event_t *evt, void *user)
 {
     (void)user;
-    const char *event_type = action_to_event_type(evt->action);
+    const char *event_type = event_state_action_name(evt->action);
     if (event_type == NULL) {
         return;
     }

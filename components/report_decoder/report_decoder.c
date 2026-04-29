@@ -59,3 +59,12 @@ const char *siri_button_name(siri_button_bit_t bit)
     }
     return NULL;
 }
+
+const char *siri_decode_charging_state(uint8_t state_byte)
+{
+    uint8_t discharging = (state_byte >> 2) & 0x03;
+    uint8_t charging    = (state_byte >> 4) & 0x03;
+    if (charging == 3)    return "charging";
+    if (discharging == 3) return "discharging";
+    return "plugged_in";
+}

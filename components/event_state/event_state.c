@@ -89,6 +89,21 @@ void event_state_destroy(event_state_t *es)
     free(es);
 }
 
+const char *event_state_action_name(event_action_t action)
+{
+    switch (action) {
+    case EVT_CLICK:        return "click";
+    case EVT_DOUBLE_CLICK: return "double_click";
+    case EVT_HOLD_START:   return "hold_start";
+    case EVT_HOLD_END:     return "hold_end";
+    case EVT_SWIPE_UP:     return "swipe_up";
+    case EVT_SWIPE_DOWN:   return "swipe_down";
+    case EVT_SWIPE_LEFT:   return "swipe_left";
+    case EVT_SWIPE_RIGHT:  return "swipe_right";
+    }
+    return NULL;
+}
+
 static void emit_pending_click(event_state_t *es, per_button_t *b,
                                siri_button_bit_t bit, uint32_t now_ms)
 {

@@ -37,3 +37,31 @@ ota:
 
 # Defaults are fine — voice on, always-connected, no debug knobs.
 siri_remote:
+
+binary_sensor:
+  - platform: siri_remote
+    type: voice_active
+    name: "Siri Remote Voice Active"
+    device_class: running
+
+sensor:
+  - platform: siri_remote
+    type: battery
+    name: "Siri Remote Battery"
+
+text_sensor:
+  - platform: siri_remote
+    type: charging
+    name: "Siri Remote Charging"
+
+switch:
+  - platform: siri_remote
+    type: raw_stream
+    name: "Siri Remote Raw Touch Stream"
+
+# Pressing this wipes the BLE bond — the user must hold Back+VolUp on the
+# remote within ~5 minutes to re-pair.
+button:
+  - platform: siri_remote
+    type: repair
+    name: "Siri Remote Re-pair"

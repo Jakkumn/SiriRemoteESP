@@ -47,6 +47,11 @@ event_state_t *event_state_create(const event_state_config_t *cfg,
                                   void *user);
 void event_state_destroy(event_state_t *es);
 
+// Canonical string for an event_action_t — "click", "swipe_up", etc.
+// Returns NULL for an unknown value. Both build paths use the same
+// string set; HA event names depend on it.
+const char *event_state_action_name(event_action_t action);
+
 void event_state_feed_buttons(event_state_t *es, uint16_t buttons, uint32_t now_ms);
 void event_state_feed_touch(event_state_t *es, const siri_touch_frame_t *frame, uint32_t now_ms);
 void event_state_tick(event_state_t *es, uint32_t now_ms);

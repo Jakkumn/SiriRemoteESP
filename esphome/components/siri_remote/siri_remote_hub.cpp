@@ -1,7 +1,10 @@
 #include "siri_remote_hub.h"
 
 #include <cinttypes>
+#include <string>
 
+#include "esphome/components/api/api_pb2.h"
+#include "esphome/components/api/api_server.h"
 #include "esphome/core/helpers.h"
 
 #include "esp_err.h"
@@ -28,8 +31,7 @@ static const char *const TAG = "siri_remote";
 
 static constexpr uint32_t TICK_PERIOD_MS = 50;
 
-// Match the standalone build's CONFIG_EVENT_* defaults. 4.D will replace
-// these with values restored from each Number entity at setup time.
+// Match the standalone build's CONFIG_EVENT_* defaults.
 static constexpr uint32_t DEFAULT_DOUBLE_CLICK_MAX_MS = 300;
 static constexpr uint32_t DEFAULT_HOLD_MIN_MS = 700;
 static constexpr int32_t DEFAULT_SWIPE_MIN_DISTANCE = 40;
@@ -196,13 +198,18 @@ void SiriRemoteHub::on_ble_notify(uint16_t attr_handle, const uint8_t *data,
       }
       uint16_t btns = siri_decode_button_bytes(data, len);
 
-      if (voice_enabled_) {
-        bool mic_was = (prev_buttons_ & SIRI_BTN_MIC) != 0;
-        bool mic_now = (btns & SIRI_BTN_MIC) != 0;
-        if (mic_now && !mic_was) {
-          siri_audio_session_start();
-        } else if (!mic_now && mic_was) {
-          siri_audio_session_end();
+      bool mic_was = (prev_buttons_ & SIRI_BTN_MIC) != 0;
+      bool mic_now = (btns & SIRI_BTN_MIC) != 0;
+      if (mic_now != mic_was) {
+        if (voice_enabled_) {
+          if (mic_now) {
+            siri_audio_session_start();
+          } else {
+            siri_audio_session_end();
+          }
+        }
+        if (voice_active_sensor_ != nullptr) {
+          this->defer([this, mic_now] { voice_active_sensor_->publish_state(mic_now); });
         }
       }
       prev_buttons_ = btns;
@@ -220,28 +227,33 @@ void SiriRemoteHub::on_ble_notify(uint16_t attr_handle, const uint8_t *data,
 
     case SIRI_HANDLE_BATTERY:
       if (len >= 1) {
-        ESP_LOGI(TAG, "battery=%u%%", (unsigned) data[0]);
+        const uint8_t lvl = data[0];
+        if (lvl == last_battery_pct_) return;
+        last_battery_pct_ = lvl;
+        ESP_LOGI(TAG, "battery=%u%%", (unsigned) lvl);
+        if (battery_sensor_ != nullptr) {
+          this->defer([this, lvl] { battery_sensor_->publish_state(lvl); });
+        }
       }
       return;
 
     case SIRI_HANDLE_CHARGING:
       if (len >= 1) {
-        // BLE-standard 0x2A1A: bits 4..5 = charging field, 2..3 = discharging.
-        // Value 3 in either means "yes that state is active".
-        uint8_t b = data[0];
-        uint8_t discharging = (b >> 2) & 0x03;
-        uint8_t charging = (b >> 4) & 0x03;
-        const char *s = charging == 3 ? "charging"
-                        : discharging == 3 ? "discharging"
-                                           : "plugged_in";
+        const uint8_t b = data[0];
+        if (b == last_charging_byte_) return;
+        last_charging_byte_ = b;
+        const char *s = siri_decode_charging_state(b);
         ESP_LOGI(TAG, "charging state=0x%02x => %s", b, s);
+        if (charging_text_sensor_ != nullptr) {
+          this->defer([this, s] { charging_text_sensor_->publish_state(s); });
+        }
       }
       return;
 
     case SIRI_HANDLE_TOUCH: {
       siri_touch_frame_t frame;
       if (siri_decode_touch_frame(data, len, &frame)) {
-        if (debug_touch_frames_) {
+        if (debug_touch_frames_ || raw_stream_enabled_) {
           ESP_LOGI(TAG,
                    "touch x=%" PRId32 " y=%" PRId32 " p=%u down=%d ctr=%" PRIu32,
                    frame.x, frame.y, (unsigned) frame.pressure,
@@ -273,34 +285,85 @@ void SiriRemoteHub::on_ble_disconnected() {
   event_state_reset(es_, now_ms());
 }
 
-// 4.B will defer() into the loop and call event::Event::trigger() here.
+// emit_event runs on the BLE host (or esp_timer) task — defer the HA
+// service call to the main loop. evt is invalid after we return, so we
+// snapshot its fields by value into the lambda.
 void SiriRemoteHub::emit_event(const event_state_event_t *evt) {
-  const char *type;
-  switch (evt->action) {
-    case EVT_CLICK:        type = "click"; break;
-    case EVT_DOUBLE_CLICK: type = "double_click"; break;
-    case EVT_HOLD_START:   type = "hold_start"; break;
-    case EVT_HOLD_END:     type = "hold_end"; break;
-    case EVT_SWIPE_UP:     type = "swipe_up"; break;
-    case EVT_SWIPE_DOWN:   type = "swipe_down"; break;
-    case EVT_SWIPE_LEFT:   type = "swipe_left"; break;
-    case EVT_SWIPE_RIGHT:  type = "swipe_right"; break;
-    default: return;
-  }
-  switch (evt->action) {
-    case EVT_CLICK:
-    case EVT_DOUBLE_CLICK:
-    case EVT_HOLD_START:
-    case EVT_HOLD_END: {
-      const char *btn = siri_button_name(evt->button);
-      ESP_LOGI(TAG, "event=%s button=%s duration=%" PRIu32 "ms", type,
-               btn ? btn : "unknown", evt->duration_ms);
-      break;
+  const char *type = event_state_action_name(evt->action);
+  if (type == nullptr) return;
+
+  const bool is_button_event = evt->action == EVT_CLICK
+                            || evt->action == EVT_DOUBLE_CLICK
+                            || evt->action == EVT_HOLD_START
+                            || evt->action == EVT_HOLD_END;
+  // hold_start fires at the threshold-cross with no duration yet; same for
+  // double_click which carries no duration in the standalone payload.
+  const bool has_duration = evt->action == EVT_CLICK || evt->action == EVT_HOLD_END;
+
+  std::string action(type);
+  std::string button;
+  uint32_t duration_ms = evt->duration_ms;
+  int32_t distance = evt->distance;
+
+  if (is_button_event) {
+    const char *btn = siri_button_name(evt->button);
+    button.assign(btn != nullptr ? btn : "unknown");
+    if (has_duration) {
+      ESP_LOGI(TAG, "event=%s button=%s duration=%" PRIu32 "ms",
+               type, button.c_str(), duration_ms);
+    } else {
+      ESP_LOGI(TAG, "event=%s button=%s", type, button.c_str());
     }
-    default:
-      ESP_LOGI(TAG, "event=%s distance=%" PRId32, type, evt->distance);
-      break;
+  } else {
+    ESP_LOGI(TAG, "event=%s distance=%" PRId32, type, distance);
   }
+
+  this->defer([action, button, duration_ms, distance, is_button_event, has_duration] {
+    if (api::global_api_server == nullptr) return;
+    // String storage must outlive the send call: every StringRef inside
+    // resp points back into these locals (the FixedVector entries don't
+    // copy). Captures-by-value in this lambda live until the lambda
+    // returns, after which send_homeassistant_action has already
+    // serialized the message.
+    static const std::string SERVICE = "esphome.siri_remote_event";
+    static const std::string K_ACTION = "action";
+    static const std::string K_BUTTON = "button";
+    static const std::string K_DURATION_MS = "duration_ms";
+    static const std::string K_DISTANCE = "distance";
+    const std::string duration_str = is_button_event && has_duration
+                                       ? std::to_string(duration_ms)
+                                       : std::string();
+    const std::string distance_str = is_button_event ? std::string()
+                                                     : std::to_string(distance);
+
+    api::HomeassistantActionRequest resp;
+    resp.service = StringRef(SERVICE);
+    resp.is_event = true;
+
+    const size_t n_pairs = is_button_event ? (has_duration ? 3 : 2) : 2;
+    resp.data.init(n_pairs);
+
+    auto &kv0 = resp.data.emplace_back();
+    kv0.key = StringRef(K_ACTION);
+    kv0.value = StringRef(action);
+
+    if (is_button_event) {
+      auto &kv1 = resp.data.emplace_back();
+      kv1.key = StringRef(K_BUTTON);
+      kv1.value = StringRef(button);
+      if (has_duration) {
+        auto &kv2 = resp.data.emplace_back();
+        kv2.key = StringRef(K_DURATION_MS);
+        kv2.value = StringRef(duration_str);
+      }
+    } else {
+      auto &kv1 = resp.data.emplace_back();
+      kv1.key = StringRef(K_DISTANCE);
+      kv1.value = StringRef(distance_str);
+    }
+
+    api::global_api_server->send_homeassistant_action(resp);
+  });
 }
 
 #ifdef SIRI_REMOTE_DEBUG_PCM_TCP

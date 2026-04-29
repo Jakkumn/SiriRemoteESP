@@ -3,6 +3,9 @@
 #include <cstdint>
 #include <string>
 
+#include "esphome/components/binary_sensor/binary_sensor.h"
+#include "esphome/components/sensor/sensor.h"
+#include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/core/component.h"
 #include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
@@ -35,6 +38,15 @@ class SiriRemoteHub : public Component {
     pcm_tcp_host_ = host;
     pcm_tcp_port_ = port;
   }
+
+  void set_voice_active_sensor(binary_sensor::BinarySensor *s) {
+    voice_active_sensor_ = s;
+  }
+  void set_battery_sensor(sensor::Sensor *s) { battery_sensor_ = s; }
+  void set_charging_text_sensor(text_sensor::TextSensor *s) {
+    charging_text_sensor_ = s;
+  }
+  void set_raw_stream_enabled(bool enabled) { raw_stream_enabled_ = enabled; }
 
   // siri_ble callbacks (registered as C function pointers; user = this).
   void on_ble_notify(uint16_t attr_handle, const uint8_t *data, size_t len);
@@ -81,6 +93,20 @@ class SiriRemoteHub : public Component {
   // visibility.
   volatile uint32_t last_activity_ms_{0};
   uint16_t prev_buttons_{0};
+
+  binary_sensor::BinarySensor *voice_active_sensor_{nullptr};
+  sensor::Sensor *battery_sensor_{nullptr};
+  text_sensor::TextSensor *charging_text_sensor_{nullptr};
+
+  // 0xFF sentinel = unknown; suppresses no-change publish_state spam when
+  // the remote re-notifies the same byte.
+  uint8_t last_battery_pct_{0xFF};
+  uint8_t last_charging_byte_{0xFF};
+
+  // Written by the loop task (Switch::write_state callback), read by the
+  // NimBLE host task in the touch handler. Single 32-bit word, atomic on
+  // Xtensa; volatile documents the cross-task intent.
+  volatile bool raw_stream_enabled_{false};
 
 #ifdef SIRI_REMOTE_DEBUG_PCM_TCP
   int pcm_socket_{-1};

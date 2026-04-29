@@ -50,6 +50,13 @@ bool siri_decode_touch_frame(const uint8_t *data, size_t len, siri_touch_frame_t
 // Returns NULL for an unknown or zero value.
 const char *siri_button_name(siri_button_bit_t bit);
 
+// Decode a BLE-standard 0x2A1A "Battery Power State" byte. Returns
+// "charging", "discharging", or "plugged_in" (the residual case
+// covering "present + not discharging + not charging" — i.e. on power
+// at full). Bits 4..5 = charging field, 2..3 = discharging field;
+// value 3 in either means "yes that state is active".
+const char *siri_decode_charging_state(uint8_t state_byte);
+
 #ifdef __cplusplus
 }
 #endif
