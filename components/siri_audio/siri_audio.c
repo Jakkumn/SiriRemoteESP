@@ -5,7 +5,6 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
-#include "esp_timer.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -63,7 +62,6 @@ static volatile bool       s_session_active;
 
 static esp_err_t allocate_decoder(void)
 {
-    int err = OPUS_OK;
     int size = opus_decoder_get_size(1);  // 1 channel (mono)
     if (size <= 0) {
         ESP_LOGE(TAG, "opus_decoder_get_size returned %d", size);
@@ -76,7 +74,7 @@ static esp_err_t allocate_decoder(void)
         ESP_LOGE(TAG, "PSRAM allocation for OpusDecoder (%d bytes) failed", size);
         return ESP_ERR_NO_MEM;
     }
-    err = opus_decoder_init(s_decoder, SIRI_AUDIO_SAMPLE_RATE, 1);
+    int err = opus_decoder_init(s_decoder, SIRI_AUDIO_SAMPLE_RATE, 1);
     if (err != OPUS_OK) {
         ESP_LOGE(TAG, "opus_decoder_init failed: %s", opus_strerror(err));
         heap_caps_free(s_decoder);
