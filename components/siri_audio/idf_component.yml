@@ -1,0 +1,7 @@
+## Phase 5 audio: Opus decode for the Siri Remote gen-3 voice stream.
+## esphome/micro-opus is the same library ESPHome uses for voice components,
+## so when Phase 4's ESPHome wrapper lands the dependency stays identical.
+
+dependencies:
+  esphome/micro-opus: "~0.3.3"
+  idf: ">=5.0"

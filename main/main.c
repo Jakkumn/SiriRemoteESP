@@ -23,9 +23,16 @@
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 
+#ifdef CONFIG_DEBUG_AUDIO_PCM_TCP
+#include "lwip/sockets.h"
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#endif
+
 #include "event_state.h"
 #include "mqtt_entity.h"
 #include "report_decoder.h"
+#include "siri_audio.h"
 #include "siri_ble.h"
 
 // Forward-declared — ESP-IDF ships the implementation in libbt.a but doesn't
@@ -304,6 +311,76 @@ static void emit_cb(const event_state_event_t *evt, void *user)
     }
 }
 
+#ifdef CONFIG_DEBUG_AUDIO_PCM_TCP
+// --- Phase 5.A.3 TCP PCM sink (development validation only) ---
+//
+// On Mic-button-driven audio session start: open a TCP connection to the
+// configured host:port. For each decoded Opus frame: send the raw int16
+// PCM samples. On session end: close. Listener side runs:
+//
+//   nc -l <PORT> | ffplay -f s16le -ar 16000 -ac 1 -
+//
+// All errors (failed connect, send failure, host unreachable) are logged
+// once and the socket is dropped — we don't want to interrupt the BLE
+// path or the decoder over a debug channel. Streaming resumes on the
+// next session.
+
+static volatile int s_pcm_socket = -1;
+
+static void pcm_tcp_open_socket(void *user)
+{
+    (void)user;
+    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock < 0) {
+        ESP_LOGW(TAG, "pcm_tcp: socket() rc=%d errno=%d", sock, errno);
+        return;
+    }
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_port   = htons(CONFIG_AUDIO_PCM_TCP_PORT),
+    };
+    if (inet_aton(CONFIG_AUDIO_PCM_TCP_HOST, &addr.sin_addr) == 0) {
+        ESP_LOGW(TAG, "pcm_tcp: inet_aton('%s') failed", CONFIG_AUDIO_PCM_TCP_HOST);
+        close(sock);
+        return;
+    }
+    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        ESP_LOGW(TAG, "pcm_tcp: connect %s:%d errno=%d (run `nc -l %d` on the host)",
+                 CONFIG_AUDIO_PCM_TCP_HOST, CONFIG_AUDIO_PCM_TCP_PORT,
+                 errno, CONFIG_AUDIO_PCM_TCP_PORT);
+        close(sock);
+        return;
+    }
+    ESP_LOGI(TAG, "pcm_tcp: streaming to %s:%d",
+             CONFIG_AUDIO_PCM_TCP_HOST, CONFIG_AUDIO_PCM_TCP_PORT);
+    s_pcm_socket = sock;
+}
+
+static void pcm_tcp_close_socket(void *user)
+{
+    (void)user;
+    int sock = s_pcm_socket;
+    s_pcm_socket = -1;
+    if (sock >= 0) {
+        close(sock);
+        ESP_LOGI(TAG, "pcm_tcp: stream closed");
+    }
+}
+
+static void pcm_tcp_send_frame(const int16_t *samples, size_t count, void *user)
+{
+    (void)user;
+    int sock = s_pcm_socket;
+    if (sock < 0) return;
+    ssize_t n = send(sock, samples, count * sizeof(int16_t), 0);
+    if (n < 0) {
+        ESP_LOGW(TAG, "pcm_tcp: send errno=%d; closing", errno);
+        s_pcm_socket = -1;
+        close(sock);
+    }
+}
+#endif  // CONFIG_DEBUG_AUDIO_PCM_TCP
+
 // --- siri_ble callbacks ---
 
 static void on_notify_cb(uint16_t attr_handle, const uint8_t *data, size_t len, void *user)
@@ -316,9 +393,29 @@ static void on_notify_cb(uint16_t attr_handle, const uint8_t *data, size_t len, 
             return;
         }
         uint16_t btns = siri_decode_button_bytes(data, len);
+
+#ifdef CONFIG_VOICE_ENABLED
+        // Detect Mic-button transitions to drive audio session lifecycle.
+        // gen-3 doesn't use the gen-1 sentinels — the Mic bit on the
+        // standard button bitmap *is* the session marker.
+        static uint16_t s_prev_btns;
+        bool mic_was = (s_prev_btns & SIRI_BTN_MIC) != 0;
+        bool mic_now = (btns        & SIRI_BTN_MIC) != 0;
+        if (mic_now && !mic_was) {
+            siri_audio_session_start();
+        } else if (!mic_now && mic_was) {
+            siri_audio_session_end();
+        }
+        s_prev_btns = btns;
+#endif
+
         xSemaphoreTake(s_es_lock, portMAX_DELAY);
         event_state_feed_buttons(s_es, btns, now_ms());
         xSemaphoreGive(s_es_lock);
+#ifdef CONFIG_VOICE_ENABLED
+    } else if (attr_handle == SIRI_HANDLE_AUDIO) {
+        siri_audio_dispatch_packet(data, len);
+#endif
     } else if (attr_handle == SIRI_HANDLE_BATTERY) {
         if (len >= 1) {
             publish_battery(data[0]);
@@ -724,6 +821,26 @@ void app_main(void)
     // Push the persisted BLE slave-latency into siri_ble *before* siri_ble_start
     // so the first conn-param update (post-setup) uses the right value.
     siri_ble_set_slave_latency((uint16_t)mqtt_entity_get_value(s_ble_lat_entity));
+
+#ifdef CONFIG_VOICE_ENABLED
+    // Phase 5.A.2 voice pipeline. Allocates OpusDecoder + decode task on
+    // CPU1 + FreeRTOS queue. Must come after PSRAM init (handled implicitly
+    // by ESP-IDF startup before app_main) and before siri_ble_start so the
+    // dispatcher is ready when the first audio packet arrives.
+    siri_audio_config_t audio_cfg = {
+#ifdef CONFIG_DEBUG_AUDIO_PCM_TCP
+        .on_pcm           = pcm_tcp_send_frame,
+        .on_session_start = pcm_tcp_open_socket,
+        .on_session_end   = pcm_tcp_close_socket,
+#else
+        .on_pcm           = NULL,  // Phase 5.B will swap this for ESPHome voice_assistant
+        .on_session_start = NULL,
+        .on_session_end   = NULL,
+#endif
+        .user             = NULL,
+    };
+    ESP_ERROR_CHECK(siri_audio_start(&audio_cfg));
+#endif
 
     esp_timer_create_args_t ta = {
         .callback = tick_timer_cb,

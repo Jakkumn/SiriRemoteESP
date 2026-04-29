@@ -389,6 +389,13 @@ static const setup_step_t SETUP_STEPS[] = {
     {SETUP_KIND_WRITE, MAGIC_HANDLE,         MAGIC_VALUE,   sizeof(MAGIC_VALUE),   "magic unlock"},
     {SETUP_KIND_READ,  0x002E,               NULL,          0,                     "battery initial read"},
     {SETUP_KIND_READ,  0x0031,               NULL,          0,                     "charging initial read"},
+#ifdef CONFIG_VOICE_ENABLED
+    // Audio characteristic CCCD (val handle 0x0035, CCCD 0x0036). Subscribes
+    // the bridge to the Opus-encoded voice stream that the remote emits
+    // while the Mic button is held. siri_audio component decodes the frames
+    // and dispatches PCM downstream.
+    {SETUP_KIND_WRITE, 0x0036,               ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "audio CCCD"},
+#endif
 #ifdef CONFIG_DEBUG_WAKE_PROBE
     // CCCD probes for the three remaining notify-capable HID Reports on
     // gen-3 (0x0041/0x0045/0x0049). Confirmed real CCCDs via peer_disc_all.

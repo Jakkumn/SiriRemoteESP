@@ -14,11 +14,12 @@ extern "C" {
 // to dispatch on `attr_handle` from notify / read callbacks. CCCD handles
 // for these characteristics are siri_ble's internal concern (the bridge
 // subscribes during the setup chain) and stay private to the component.
-#define SIRI_HANDLE_BUTTON   0x0039  // 16-bit button bitmap (notify)
-#define SIRI_HANDLE_TOUCH    0x003D  // 11-byte touch frames (notify, ~50/sec)
-#define SIRI_HANDLE_AUDIO    0x0035  // Opus audio (Phase 5)
-#define SIRI_HANDLE_BATTERY  0x002E  // single-byte percentage (read + notify)
-#define SIRI_HANDLE_CHARGING 0x0031  // BLE-standard 0x2A1A power-state byte (read + notify)
+#define SIRI_HANDLE_BUTTON      0x0039  // 16-bit button bitmap (notify)
+#define SIRI_HANDLE_TOUCH       0x003D  // 11-byte touch frames (notify, ~50/sec)
+#define SIRI_HANDLE_AUDIO       0x0035  // Opus audio (Phase 5)
+#define SIRI_HANDLE_AUDIO_CCCD  0x0036  // CCCD for SIRI_HANDLE_AUDIO
+#define SIRI_HANDLE_BATTERY     0x002E  // single-byte percentage (read + notify)
+#define SIRI_HANDLE_CHARGING    0x0031  // BLE-standard 0x2A1A power-state byte (read + notify)
 
 // Raw notification from the remote. `attr_handle` lets the caller
 // distinguish button / touch / audio / battery / charging etc — see the

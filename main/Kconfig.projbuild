@@ -41,6 +41,62 @@ menu "Siri Bridge Configuration"
             Adds significant log spam during touchpad use (~50 lines/sec).
             Disable for normal operation.
 
+    config DEBUG_AUDIO_PCM_TCP
+        bool "Stream decoded PCM over TCP (Phase 5.A.3 validation)"
+        depends on VOICE_ENABLED
+        default n
+        help
+            Diagnostic transport for the Phase 5.A.3 voice validation.
+            On every Mic-button-driven audio session the bridge opens a
+            TCP connection to AUDIO_PCM_TCP_HOST:AUDIO_PCM_TCP_PORT and
+            streams the decoded 16 kHz mono int16le PCM frames as they
+            come out of opus_decode(). On session end the socket closes.
+
+            Listener (run on the host machine before pressing Mic):
+                nc -l <PORT> | ffplay -f s16le -ar 16000 -ac 1 -
+
+            Or save then play:
+                nc -l <PORT> > capture.pcm
+                ffplay -f s16le -ar 16000 -ac 1 capture.pcm
+
+            Disable for normal operation. Phase 5.B replaces this with
+            ESPHome's voice_assistant transport.
+
+    config AUDIO_PCM_TCP_HOST
+        string "TCP host for decoded PCM stream"
+        depends on DEBUG_AUDIO_PCM_TCP
+        default "192.168.1.100"
+        help
+            IPv4 address of the listener host. Override for your dev
+            machine via menuconfig.
+
+    config AUDIO_PCM_TCP_PORT
+        int "TCP port for decoded PCM stream"
+        depends on DEBUG_AUDIO_PCM_TCP
+        default 8000
+        range 1 65535
+
+    config VOICE_ENABLED
+        bool "Voice capture (Mic-button → Opus decode)"
+        default y
+        help
+            When enabled, the bridge subscribes to the Siri Remote's
+            audio characteristic (val handle 0x0035, CCCD 0x0036) and
+            decodes the Opus frame stream during a Mic-button hold using
+            the esphome/micro-opus library. Decoder runs on a dedicated
+            task pinned to CPU1; OpusDecoder state lives in PSRAM
+            (~50 KB). Per-frame RMS energy is logged to UART every ~1s
+            for diagnostic visibility.
+
+            With this disabled the bridge skips the audio CCCD subscribe
+            (saving ~5 KB BLE buffer overhead) and doesn't allocate the
+            decoder. Useful for users who don't want voice and want the
+            smallest possible firmware.
+
+            Phase 5.A.3 (TCP validation sink) and Phase 5.B (ESPHome
+            voice_assistant integration) build on this; both require it
+            to be enabled.
+
     config DEBUG_WAKE_PROBE
         bool "Wake-press loss probe (diagnostic)"
         default n
