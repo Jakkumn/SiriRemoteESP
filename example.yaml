@@ -1,0 +1,39 @@
+# Working ESPHome config for the Siri Remote bridge.
+#
+#   esphome run example.yaml
+#
+# First-time pairing: hold Back + Vol Up on the remote for ~5 s once the
+# bridge logs "siri_remote setup complete" — same dance as the standalone
+# build.
+
+esphome:
+  name: siri-bridge
+
+esp32:
+  board: seeed_xiao_esp32s3
+  flash_size: 8MB
+  framework:
+    type: esp-idf
+
+external_components:
+  - source:
+      type: local
+      path: esphome/components
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+# Defaults are fine — voice on, always-connected, no debug knobs.
+siri_remote:

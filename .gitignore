@@ -9,3 +9,7 @@ dependencies.lock
 .DS_Store
 *.pyc
 .claude
+# ESPHome
+secrets.yaml
+.esphome/
+.esphome-build/

@@ -4,6 +4,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // Button bitmap carried in a 2-byte HID report from handle 0x0039 on gen-3.
 // Empirically verified — each bit maps to one physical control. The report
 // is a 16-bit mask; multiple bits can be set simultaneously (chord presses).
@@ -45,3 +49,7 @@ bool siri_decode_touch_frame(const uint8_t *data, size_t len, siri_touch_frame_t
 // Enum → string for JSON serialization: "volume_up", "play_pause", etc.
 // Returns NULL for an unknown or zero value.
 const char *siri_button_name(siri_button_bit_t bit);
+
+#ifdef __cplusplus
+}
+#endif
