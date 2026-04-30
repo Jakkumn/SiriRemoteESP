@@ -15,6 +15,8 @@
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 
+#include "siri_remote_microphone.h"
+
 #ifdef SIRI_REMOTE_DEBUG_PCM_TCP
 #include "lwip/sockets.h"
 #include <netinet/in.h>
@@ -65,17 +67,15 @@ static void tick_thunk(void *user) {
   static_cast<SiriRemoteHub *>(user)->tick();
 }
 
-#ifdef SIRI_REMOTE_DEBUG_PCM_TCP
 static void audio_session_start_thunk(void *user) {
-  static_cast<SiriRemoteHub *>(user)->pcm_tcp_open();
+  static_cast<SiriRemoteHub *>(user)->on_audio_session_start();
 }
 static void audio_session_end_thunk(void *user) {
-  static_cast<SiriRemoteHub *>(user)->pcm_tcp_close();
+  static_cast<SiriRemoteHub *>(user)->on_audio_session_end();
 }
 static void audio_pcm_thunk(const int16_t *samples, size_t count, void *user) {
-  static_cast<SiriRemoteHub *>(user)->pcm_tcp_send(samples, count);
+  static_cast<SiriRemoteHub *>(user)->on_pcm(samples, count);
 }
-#endif
 
 static void nimble_host_task(void *param) {
   (void) param;
@@ -148,14 +148,10 @@ void SiriRemoteHub::dump_config() {
 
 void SiriRemoteHub::start_audio_() {
   siri_audio_config_t audio_cfg = {};
-#ifdef SIRI_REMOTE_DEBUG_PCM_TCP
   audio_cfg.on_pcm = audio_pcm_thunk;
   audio_cfg.on_session_start = audio_session_start_thunk;
   audio_cfg.on_session_end = audio_session_end_thunk;
   audio_cfg.user = this;
-#else
-  audio_cfg.user = nullptr;
-#endif
   esp_err_t rc = siri_audio_start(&audio_cfg);
   if (rc != ESP_OK) {
     ESP_LOGE(TAG, "siri_audio_start failed: %s", esp_err_to_name(rc));
@@ -333,6 +329,40 @@ void SiriRemoteHub::apply_knob_change(SiriRemoteKnob kind, float value) {
       siri_ble_set_slave_latency(static_cast<uint16_t>(value));
       return;
   }
+}
+
+void SiriRemoteHub::on_audio_session_start() {
+  // Real audio is about to flow — stop any post-release silence injection
+  // so we don't mix silence with decoded frames.
+  if (microphone_ != nullptr) {
+    microphone_->stop_silence();
+  }
+#ifdef SIRI_REMOTE_DEBUG_PCM_TCP
+  pcm_tcp_open();
+#endif
+}
+
+void SiriRemoteHub::on_audio_session_end() {
+  // Apple stops sending audio packets at Mic-release. Without a continuous
+  // signal HA's VAD stalls in "Listening" until its 9 s stt-stream-failed
+  // timeout. Inject 20 ms-paced silence so VAD detects end-of-speech and
+  // finalizes STT; the mic's own stop() (called by voice_assistant when it
+  // transitions out of STREAMING_MICROPHONE) cancels the timer.
+  if (microphone_ != nullptr) {
+    microphone_->start_silence();
+  }
+#ifdef SIRI_REMOTE_DEBUG_PCM_TCP
+  pcm_tcp_close();
+#endif
+}
+
+void SiriRemoteHub::on_pcm(const int16_t *samples, size_t count) {
+  if (microphone_ != nullptr) {
+    microphone_->fire_data(samples, count);
+  }
+#ifdef SIRI_REMOTE_DEBUG_PCM_TCP
+  pcm_tcp_send(samples, count);
+#endif
 }
 
 // emit_event runs on the BLE host (or esp_timer) task — defer the HA

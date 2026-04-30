@@ -29,7 +29,7 @@ wifi:
   password: !secret wifi_password
 
 logger:
-  level: INFO
+  level: DEBUG
 
 api:
   encryption:
@@ -47,6 +47,28 @@ binary_sensor:
     type: voice_active
     name: "Siri Remote Voice Active"
     device_class: running
+    # Mic press starts the session; voice_assistant's VAD finalizes STT
+    # when it detects end-of-speech silence. Don't fire voice_assistant.stop
+    # on release — it's a hard abort that drops the in-flight utterance if
+    # the user releases before VAD completes. Comment this block (or the
+    # microphone:/voice_assistant: blocks) to disable voice entirely.
+    on_press:
+      - voice_assistant.start
+
+microphone:
+  - platform: siri_remote
+    id: siri_remote_mic
+
+voice_assistant:
+  microphone:
+    microphone: siri_remote_mic
+  use_wake_word: false
+  # The XIAO S3 has no audio-out hardware, so TTS responses can't play on
+  # the bridge. Don't disable TTS at the pipeline level (that affects every
+  # satellite) — instead create a TTS-free Assist pipeline in HA and point
+  # this device's auto-generated `select.siri_bridge_assist_pipeline` at
+  # it. Other satellites (Voice PE, phones, etc.) keep spoken responses.
+  # See README.md "Disabling the spoken response" for the step-by-step.
 
 sensor:
   - platform: siri_remote

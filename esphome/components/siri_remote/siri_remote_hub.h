@@ -21,6 +21,8 @@
 namespace esphome {
 namespace siri_remote {
 
+class SiriRemoteMicrophone;
+
 class SiriRemoteHub : public Component {
  public:
   void setup() override;
@@ -49,6 +51,8 @@ class SiriRemoteHub : public Component {
   }
   void set_raw_stream_enabled(bool enabled) { raw_stream_enabled_ = enabled; }
 
+  void set_microphone(SiriRemoteMicrophone *m) { microphone_ = m; }
+
   void set_swipe_y_pri_number(SiriRemoteNumber *n) { swipe_y_pri_number_ = n; }
   void set_swipe_dist_number(SiriRemoteNumber *n) { swipe_dist_number_ = n; }
   void set_dbl_ms_number(SiriRemoteNumber *n) { dbl_ms_number_ = n; }
@@ -72,6 +76,13 @@ class SiriRemoteHub : public Component {
   // Public so the esp_timer C trampoline can invoke it without a friend
   // declaration.
   void tick();
+
+  // siri_audio callbacks (registered as C function pointers; user = this).
+  // Fan out a single decode-task callback to both the optional TCP debug
+  // sink and the optional ESPHome microphone consumer.
+  void on_audio_session_start();
+  void on_audio_session_end();
+  void on_pcm(const int16_t *samples, size_t count);
 
 #ifdef SIRI_REMOTE_DEBUG_PCM_TCP
   void pcm_tcp_open();
@@ -121,6 +132,11 @@ class SiriRemoteHub : public Component {
   // NimBLE host task in the touch handler. Single 32-bit word, atomic on
   // Xtensa; volatile documents the cross-task intent.
   volatile bool raw_stream_enabled_{false};
+
+  // Decoded-PCM consumer. Populated by microphone.py if the user adds the
+  // siri_remote microphone platform; null otherwise. Read from the
+  // siri_audio decode task in start_audio_'s on_pcm thunk.
+  SiriRemoteMicrophone *microphone_{nullptr};
 
   // Six runtime-tunable Numbers. Pointers populated by number.py to_code
   // before our setup() runs; we read each one's `state` field after

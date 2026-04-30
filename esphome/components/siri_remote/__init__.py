@@ -16,6 +16,12 @@ from esphome.core import CORE
 CODEOWNERS = ["@cmehl"]
 DEPENDENCIES = ["esp32"]
 
+# siri_remote_hub.cpp always includes siri_remote_microphone.h (the hub's
+# on_pcm fan-out calls into the mic component). AUTO_LOAD forces the
+# microphone module onto the include path even when the user doesn't add
+# a `microphone:` block. Negligible build cost; no runtime cost.
+AUTO_LOAD = ["microphone"]
+
 siri_remote_ns = cg.esphome_ns.namespace("siri_remote")
 SiriRemoteHub = siri_remote_ns.class_("SiriRemoteHub", cg.Component)
 

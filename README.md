@@ -71,6 +71,56 @@ Discrete remote events (clicks, double-clicks, holds, swipes) fire as a Home
 Assistant event called `esphome.siri_remote_event` with full payload — see
 [Home Assistant automation patterns](#home-assistant-automation-patterns).
 
+### Voice in HA Assist (optional)
+
+Holding the Mic button on the remote pushes decoded audio into Home
+Assistant's Assist pipeline as push-to-talk — wake-word disabled. The
+`microphone:` and `voice_assistant:` blocks in `example.yaml` enable
+this. Comment them out (and the `on_press` automation on the
+`voice_active` binary_sensor) if you don't want voice — the rest of
+the bridge keeps working.
+
+Mic press fires `voice_assistant.start`; voice_assistant's built-in
+VAD finalizes STT when it detects end-of-speech silence. Mic *release*
+is intentionally **not** wired to `voice_assistant.stop` — that action
+is a hard abort that drops the in-flight utterance if the user
+releases before VAD completes. Trade-off: pressing Mic and staying
+silent lets voice_assistant sit in `STREAMING_MICROPHONE` for a second
+or two until VAD's no-voice timeout fires. Acceptable for push-to-talk.
+
+After Mic-release the firmware also injects 20 ms-paced silence frames
+into the audio stream (since Apple stops sending audio packets at
+release) so HA's VAD has a continuous signal to analyze and can
+detect end-of-speech naturally. Without this the satellite would sit
+in HA's "Listening" state until its `stt-stream-failed` timeout (~9 s)
+fired and discarded the captured utterance. The silence stops as soon
+as voice_assistant finishes the cycle.
+
+#### Disabling the spoken response (no speaker on the bridge)
+
+The XIAO S3 has no audio-out hardware, so any TTS response HA
+generates is wasted work — the response URL fires but there's nothing
+to play it on. ESPHome doesn't expose a per-call "skip TTS" knob, so
+the right place to disable it is on the **HA Assist pipeline**.
+Configure this **per-satellite** rather than globally so your other
+satellites (HA Voice PE, ESP32-S3-BOX, phone Assist, etc.) keep
+spoken responses:
+
+1. **Create a TTS-free pipeline.** Settings → Voice Assistants → "Add
+   Assistant" → name it `siri-bridge-no-tts` → set Speech-to-text to
+   your real engine (Whisper / Home Assistant Cloud / etc.) → set
+   **Text-to-speech** to `(none)`. Save.
+2. **Point the bridge at it.** Settings → Devices & Services → ESPHome
+   → siri-bridge → find `select.siri_bridge_assist_pipeline` (auto-
+   created by HA for every voice satellite) and set it to
+   `siri-bridge-no-tts`.
+
+The bridge now sends audio to a TTS-free pipeline; intents process
+and actions run, but no audio response is generated. Other devices on
+the default pipeline still get TTS as configured. The select entity
+also lets you flip pipelines from automations or the dashboard if you
+ever wire a speaker to the bridge later.
+
 ### Caveats
 
 - **Don't add `esp32_ble_tracker:` to the same YAML.** NimBLE is single-host
@@ -316,9 +366,9 @@ main/
   Kconfig.projbuild               # standalone Wi-Fi + MQTT credential config
 esphome/components/siri_remote/   # ESPHome external component
   __init__.py                     # parent component schema, sdkconfig pinning
-  binary_sensor.py / sensor.py / text_sensor.py / switch.py / button.py / number.py
+  binary_sensor.py / sensor.py / text_sensor.py / switch.py / button.py / number.py / microphone.py
   siri_remote_hub.{h,cpp}         # Component subclass — orchestrates BLE + audio + entity bridging
-  siri_remote_{switch,button,number}.{h,cpp}  # entity subclasses
+  siri_remote_{switch,button,number,microphone}.{h,cpp}  # entity subclasses
   *.c, *.h                        # symlinks to ../../components/*/ — both build paths share C
 example.yaml                      # working ESPHome config (the recommended user starting point)
 secrets.yaml.example              # template for the secrets ESPHome reads
