@@ -16,6 +16,7 @@
 #include "report_decoder.h"
 #include "siri_audio.h"
 #include "siri_ble.h"
+#include "siri_remote_number.h"
 
 namespace esphome {
 namespace siri_remote {
@@ -47,6 +48,19 @@ class SiriRemoteHub : public Component {
     charging_text_sensor_ = s;
   }
   void set_raw_stream_enabled(bool enabled) { raw_stream_enabled_ = enabled; }
+
+  void set_swipe_y_pri_number(SiriRemoteNumber *n) { swipe_y_pri_number_ = n; }
+  void set_swipe_dist_number(SiriRemoteNumber *n) { swipe_dist_number_ = n; }
+  void set_dbl_ms_number(SiriRemoteNumber *n) { dbl_ms_number_ = n; }
+  void set_hold_ms_number(SiriRemoteNumber *n) { hold_ms_number_ = n; }
+  void set_bat_low_number(SiriRemoteNumber *n) { bat_low_number_ = n; }
+  void set_ble_lat_number(SiriRemoteNumber *n) { ble_lat_number_ = n; }
+
+  // Dispatch from SiriRemoteNumber::control (loop task) into the right
+  // event_state setter or siri_ble API. Mirrors the standalone main.c
+  // mutex semantics: event_state setters take es_lock_; siri_ble owns
+  // its own locking; battery threshold has no setter (read at publish).
+  void apply_knob_change(SiriRemoteKnob kind, float value);
 
   // siri_ble callbacks (registered as C function pointers; user = this).
   void on_ble_notify(uint16_t attr_handle, const uint8_t *data, size_t len);
@@ -107,6 +121,17 @@ class SiriRemoteHub : public Component {
   // NimBLE host task in the touch handler. Single 32-bit word, atomic on
   // Xtensa; volatile documents the cross-task intent.
   volatile bool raw_stream_enabled_{false};
+
+  // Six runtime-tunable Numbers. Pointers populated by number.py to_code
+  // before our setup() runs; we read each one's `state` field after
+  // restore (the Numbers' own DATA-priority setup() has already fired by
+  // the time our LATE setup() runs).
+  SiriRemoteNumber *swipe_y_pri_number_{nullptr};
+  SiriRemoteNumber *swipe_dist_number_{nullptr};
+  SiriRemoteNumber *dbl_ms_number_{nullptr};
+  SiriRemoteNumber *hold_ms_number_{nullptr};
+  SiriRemoteNumber *bat_low_number_{nullptr};
+  SiriRemoteNumber *ble_lat_number_{nullptr};
 
 #ifdef SIRI_REMOTE_DEBUG_PCM_TCP
   int pcm_socket_{-1};

@@ -31,11 +31,18 @@ static const char *const TAG = "siri_remote";
 
 static constexpr uint32_t TICK_PERIOD_MS = 50;
 
-// Match the standalone build's CONFIG_EVENT_* defaults.
-static constexpr uint32_t DEFAULT_DOUBLE_CLICK_MAX_MS = 300;
-static constexpr uint32_t DEFAULT_HOLD_MIN_MS = 700;
-static constexpr int32_t DEFAULT_SWIPE_MIN_DISTANCE = 40;
-static constexpr int32_t DEFAULT_SWIPE_Y_PRIORITY = 30;
+// Fallbacks for the case where YAML omits a Number entirely. Match the
+// standalone build's CONFIG_EVENT_* defaults so a wrap missing all six
+// Numbers still behaves like the standalone first-boot.
+static constexpr uint32_t FALLBACK_DOUBLE_CLICK_MAX_MS = 300;
+static constexpr uint32_t FALLBACK_HOLD_MIN_MS = 700;
+static constexpr int32_t FALLBACK_SWIPE_MIN_DISTANCE = 40;
+static constexpr int32_t FALLBACK_SWIPE_Y_PRIORITY = 30;
+static constexpr uint16_t FALLBACK_BLE_SLAVE_LATENCY = 400;
+
+static float knob_value(SiriRemoteNumber *n, float fallback) {
+  return (n != nullptr && n->has_state()) ? n->state : fallback;
+}
 
 static void ble_notify_thunk(uint16_t attr_handle, const uint8_t *data,
                              size_t len, void *user) {
@@ -94,10 +101,14 @@ void SiriRemoteHub::setup() {
   }
 
   event_state_config_t es_cfg = {};
-  es_cfg.double_click_max_ms = DEFAULT_DOUBLE_CLICK_MAX_MS;
-  es_cfg.hold_min_ms = DEFAULT_HOLD_MIN_MS;
-  es_cfg.swipe_min_distance = DEFAULT_SWIPE_MIN_DISTANCE;
-  es_cfg.swipe_y_priority_threshold = DEFAULT_SWIPE_Y_PRIORITY;
+  es_cfg.double_click_max_ms = static_cast<uint32_t>(
+      knob_value(dbl_ms_number_, FALLBACK_DOUBLE_CLICK_MAX_MS));
+  es_cfg.hold_min_ms = static_cast<uint32_t>(
+      knob_value(hold_ms_number_, FALLBACK_HOLD_MIN_MS));
+  es_cfg.swipe_min_distance = static_cast<int32_t>(
+      knob_value(swipe_dist_number_, FALLBACK_SWIPE_MIN_DISTANCE));
+  es_cfg.swipe_y_priority_threshold = static_cast<int32_t>(
+      knob_value(swipe_y_pri_number_, FALLBACK_SWIPE_Y_PRIORITY));
   es_ = event_state_create(&es_cfg, emit_thunk, this);
   if (es_ == nullptr) {
     ESP_LOGE(TAG, "event_state_create failed");
@@ -111,6 +122,12 @@ void SiriRemoteHub::setup() {
 
   start_tick_timer_();
   start_nimble_();
+
+  // siri_ble_set_slave_latency caches the value internally and applies it
+  // on the next CONN_UPDATE (or on the next bonded reconnect if no
+  // connection is up yet). Safe to call after siri_ble_start.
+  siri_ble_set_slave_latency(static_cast<uint16_t>(
+      knob_value(ble_lat_number_, FALLBACK_BLE_SLAVE_LATENCY)));
 
   ESP_LOGI(TAG, "siri_remote setup complete");
 }
@@ -283,6 +300,39 @@ void SiriRemoteHub::on_ble_disconnected() {
   last_activity_ms_ = 0;
   LockGuard guard(es_lock_);
   event_state_reset(es_, now_ms());
+}
+
+void SiriRemoteHub::apply_knob_change(SiriRemoteKnob kind, float value) {
+  switch (kind) {
+    case SiriRemoteKnob::SwipeYPriority: {
+      LockGuard guard(es_lock_);
+      event_state_set_swipe_y_priority(es_, static_cast<int32_t>(value));
+      return;
+    }
+    case SiriRemoteKnob::SwipeMinDistance: {
+      LockGuard guard(es_lock_);
+      event_state_set_swipe_min_distance(es_, static_cast<int32_t>(value));
+      return;
+    }
+    case SiriRemoteKnob::DoubleWindowMs: {
+      LockGuard guard(es_lock_);
+      event_state_set_double_click_max_ms(es_, static_cast<uint32_t>(value));
+      return;
+    }
+    case SiriRemoteKnob::HoldThresholdMs: {
+      LockGuard guard(es_lock_);
+      event_state_set_hold_min_ms(es_, static_cast<uint32_t>(value));
+      return;
+    }
+    case SiriRemoteKnob::BatteryLowPct:
+      // No setter — bat_low_number_->state is read at publish_battery time
+      // by future low-battery-derivation code. The Number persists for
+      // forward use; runtime adjustment is the persistence side effect.
+      return;
+    case SiriRemoteKnob::BleSlaveLatency:
+      siri_ble_set_slave_latency(static_cast<uint16_t>(value));
+      return;
+  }
 }
 
 // emit_event runs on the BLE host (or esp_timer) task — defer the HA

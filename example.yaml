@@ -65,3 +65,29 @@ button:
   - platform: siri_remote
     type: repair
     name: "Siri Remote Re-pair"
+
+# Runtime-tunable thresholds. All NVS-persisted via ESPHome Preferences.
+# Defaults match the standalone Kconfig defaults; override min/max/step in
+# YAML if you want a different slider range.
+number:
+  - platform: siri_remote
+    type: swipe_y_priority
+    name: "Siri Remote Swipe Y Priority"
+  - platform: siri_remote
+    type: swipe_min_distance
+    name: "Siri Remote Swipe Min Distance"
+  - platform: siri_remote
+    type: double_click_window_ms
+    name: "Siri Remote Double-Click Window"
+    unit_of_measurement: "ms"
+  - platform: siri_remote
+    type: hold_threshold_ms
+    name: "Siri Remote Hold Threshold"
+    unit_of_measurement: "ms"
+  - platform: siri_remote
+    type: battery_low_pct
+    name: "Siri Remote Battery Low Threshold"
+    unit_of_measurement: "%"
+  - platform: siri_remote
+    type: ble_slave_latency
+    name: "Siri Remote BLE Slave Latency"
