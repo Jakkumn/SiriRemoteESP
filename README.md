@@ -1,28 +1,89 @@
 # siri-remote-ha-bridge
 
-An ESP32 BLE bridge that pairs with an Apple Siri Remote (gen 3) and forwards
-button + clickpad events to Home Assistant via MQTT, with Home Assistant
-auto-discovery so the remote shows up as a device automatically.
+An ESP32 BLE bridge that pairs with an Apple Siri Remote (gen 3) and surfaces
+button + clickpad + voice events to Home Assistant. Two install paths: an
+ESPHome external component for end users, and a standalone ESP-IDF build for
+hacking on the C components.
 
-**Status:** Phase 3 closed; Phase 5.A (voice capture + Opus decode) shipped
-and verified end-to-end. The bridge auto-discovers the remote on first
-boot, exposes buttons / swipes / battery / charging / runtime tunables to
-HA via MQTT auto-discovery, and decodes the Mic-button audio stream with
-the `esphome/micro-opus` library. Connected-low-power mode is the default
-to ensure 100 % wake-press reliability — see
-[Always-connected mode](#always-connected-mode-default) below. Phase 4
-(ESPHome external-component wrap) is next; Phase 5.B will swap voice
-transport to ESPHome's `voice_assistant` once the wrap lands.
+**Status:** Phase 4 closed. ESPHome wrap is the recommended install path; the
+standalone build remains available for development. Phase 5.A (voice capture
++ on-device Opus decode) is shipped and verified end-to-end. Phase 5.B will
+swap the dev-only TCP audio sink for ESPHome's `voice_assistant` transport.
 
 ## Hardware
 
 - **MCU**: XIAO ESP32-S3 (Seeed Studio 3-pack — 8 MB flash, 8 MB octal PSRAM,
-  native USB-C, BLE 5.0). Project migrated to this board in Phase 3.M; the
-  ESP32-WROOM-32 path was the development target through Phase 3B but is no
-  longer the primary build.
-- **Remote**: Apple Siri Remote, 3rd generation (2022, USB-C)
+  native USB-C, BLE 5.0).
+- **Remote**: Apple Siri Remote, 3rd generation (2022, USB-C).
 
-## Prerequisites
+## Install — ESPHome (recommended)
+
+The bridge ships as an ESPHome external component. Drop it into a YAML config,
+fill in your secrets, run `esphome run`. No ESP-IDF or `make` knowledge needed.
+
+1. Clone (or pin via the GitHub form below).
+   ```bash
+   git clone https://github.com/cmehl/siri-remote-ha-bridge
+   cd siri-remote-ha-bridge
+   ```
+2. Create your secrets file from the template:
+   ```bash
+   cp secrets.yaml.example secrets.yaml
+   $EDITOR secrets.yaml
+   ```
+   `secrets.yaml.example` documents how to generate the API encryption key.
+3. Flash:
+   ```bash
+   uv run esphome run example.yaml
+   ```
+
+After the bridge boots, follow [Pairing your remote](#pairing-your-remote)
+below.
+
+### Pinning a release
+
+To consume the component without cloning, point ESPHome at the GitHub repo:
+
+```yaml
+external_components:
+  - source: github://cmehl/siri-remote-ha-bridge@v0.4.0
+    path: esphome/components
+```
+
+Pinning to a tag (rather than `@main`) is recommended so a downstream change
+won't break your install on the next `esphome run`.
+
+### What you get in Home Assistant
+
+The wrap registers seven entity types under one device:
+
+- `binary_sensor.siri_remote_voice_active` — `on` while Mic is held.
+- `sensor.siri_remote_battery` — battery level (%).
+- `text_sensor.siri_remote_charging` — `charging` / `discharging` / `plugged_in`.
+- `switch.siri_remote_raw_touch_stream` — toggles UART logging of the touchpad
+  packets (diagnostic; off by default).
+- `button.siri_remote_re_pair` — wipes the BLE bond and re-enters discovery.
+- Six `number.siri_remote_*` sliders for runtime-tunable thresholds (swipe
+  sensitivity, double-click window, hold threshold, battery-low %, BLE slave
+  latency). All persist across reboot via ESPHome Preferences.
+
+Discrete remote events (clicks, double-clicks, holds, swipes) fire as a Home
+Assistant event called `esphome.siri_remote_event` with full payload — see
+[Home Assistant automation patterns](#home-assistant-automation-patterns).
+
+### Caveats
+
+- **Don't add `esp32_ble_tracker:` to the same YAML.** NimBLE is single-host
+  and the bridge owns it. Mixing the two crashes at bring-up.
+- **Don't combine with another voice satellite component on the same chip.**
+  The siri_audio decoder owns one CPU's free cycles when Mic is held.
+
+## Install — standalone (for ESP-IDF developers)
+
+Use this path if you want to hack on the C components, run `make test`, or
+build firmware without ESPHome's YAML layer.
+
+### Prerequisites
 
 - macOS or Linux
 - `cmake`, `ninja`, `dfu-util` (on macOS: `brew install cmake ninja dfu-util`)
@@ -33,7 +94,7 @@ transport to ESPHome's `voice_assistant` once the wrap lands.
 - A running Home Assistant instance with the **MQTT integration** enabled
   (Mosquitto add-on or any external broker)
 
-## Quick start
+### Quick start
 
 ```bash
 make test          # host-side unit tests, no hardware required
@@ -44,13 +105,42 @@ make fm            # flash + monitor the connected device
 
 Run `make` with no arguments to see all targets.
 
+### Standalone configuration knobs (`menuconfig`)
+
+| Menu | Key | Default | Purpose |
+|---|---|---|---|
+| Siri Bridge Configuration | `WIFI_SSID` / `WIFI_PASSWORD` | empty | Wi-Fi credentials |
+| Siri Bridge Configuration | `MQTT_BROKER_URI` | `mqtt://homeassistant.local:1883` | MQTT broker |
+| Siri Bridge Configuration | `MQTT_USERNAME` / `MQTT_PASSWORD` | empty | MQTT auth |
+| Event state machine | `EVENT_DOUBLE_WINDOW_MS` | 300 | Double-click window |
+| Event state machine | `EVENT_HOLD_THRESHOLD_MS` | 700 | Hold detection |
+| Event state machine | `EVENT_SWIPE_MIN_DISTANCE` | 40 | Swipe threshold |
+| Siri Bridge Configuration | `IDLE_DISCONNECT_MS` | **0** (always-connected) | See "Always-connected mode" below |
+
+`= 0` on the timing fields disables that feature (clean kill-switch). The
+ESPHome path exposes the same knobs as runtime Number entities; the table
+above only applies to the standalone build.
+
+### Standalone-only MQTT topics
+
+The standalone build publishes these topics directly. The ESPHome path does
+not — events flow over the ESPHome API instead. Bind to these only if you're
+running the standalone firmware.
+
+| Topic | Retained | Purpose |
+|---|---|---|
+| `siri_remote/event` | no | Discrete events (click/double_click/hold_start/hold_end/swipe_*) |
+| `siri_remote/touch_raw` | no | Raw touch frames at ~50/sec — only when the HA Switch is on |
+| `siri_remote/connection` | yes (LWT) | `online` / `offline` |
+| `siri_remote/state/raw_stream` | yes | Current Switch state, mirrored from NVS |
+
 ## Pairing your remote
 
-The bridge has no hardcoded MAC. On first boot (empty NVS) it enters a 5-minute
-**discovery window**: an active BLE scan filtered on the HID service UUID
-(`0x1812`), with a proximity gate (RSSI ≥ −55 dBm) and a post-connect
-fingerprint check (HID + ≥3 Report chars + Apple custom service + button
-value handle `0x0039`).
+Both build paths use the same pairing flow. The bridge has no hardcoded MAC.
+On first boot (empty NVS) it enters a 5-minute **discovery window**: an active
+BLE scan filtered on the HID service UUID (`0x1812`), with a proximity gate
+(RSSI ≥ −55 dBm) and a post-connect fingerprint check (HID + ≥3 Report chars
++ Apple custom service + button value handle `0x0039`).
 
 ### First-time pair (or pair to a new bridge)
 
@@ -86,7 +176,7 @@ correctly-pressed pairing combo recovers quickly).
 The remote remembers bonded peers on its side too. If the bond is still
 present on the remote and you press the HA repair button on the bridge:
 
-- In Home Assistant, press **`button.siri_remote_repair`** (icon
+- In Home Assistant, press **`button.siri_remote_re_pair`** (icon
   `mdi:bluetooth-refresh`). The bridge wipes the bond, terminates the active
   connection, and re-enters the 5-minute discovery window.
 - Press **any button** on the remote (no combo needed — the remote still has
@@ -95,61 +185,45 @@ present on the remote and you press the HA repair button on the bridge:
 If the discovery window expires without finding a remote, the bridge logs a
 warning and goes idle until the next repair-button press.
 
-## Configuration knobs (`menuconfig`)
-
-| Menu | Key | Default | Purpose |
-|---|---|---|---|
-| Siri Bridge Configuration | `WIFI_SSID` / `WIFI_PASSWORD` | empty | Wi-Fi credentials |
-| Siri Bridge Configuration | `MQTT_BROKER_URI` | `mqtt://homeassistant.local:1883` | MQTT broker |
-| Siri Bridge Configuration | `MQTT_USERNAME` / `MQTT_PASSWORD` | empty | MQTT auth |
-| Event state machine | `EVENT_DOUBLE_WINDOW_MS` | 300 | Double-click window |
-| Event state machine | `EVENT_HOLD_THRESHOLD_MS` | 700 | Hold detection |
-| Event state machine | `EVENT_SWIPE_MIN_DISTANCE` | 40 | Swipe threshold |
-| Siri Bridge Configuration | `IDLE_DISCONNECT_MS` | **0** (always-connected) | See "Always-connected mode" below |
-
-`= 0` on the timing fields disables that feature (clean kill-switch).
-
 ## Always-connected mode (default)
 
 The bridge keeps a permanent BLE link with the remote and pushes the connection to high-latency low-power params (15 ms intervals, slave latency 400, 15 s supervision timeout) so the remote can deep-sleep up to ~6 s between mandatory radio events while the link stays alive. Button presses break out of the slave-latency window and arrive within ~15 ms. The remote's PPCP advertises latency 80 as its preference, but Apple's peripheral accepts at least 400 — verified empirically and pushed into firmware after the latency-sweep experiment in `experiments/wake_minimal/`.
 
 The reason we stay connected: Apple's BLE accessory firmware has an undocumented server-side timer that drops the *wake-press* (the press that wakes the remote from sleep) if the bridge has been disconnected for more than ~30 s. We tested every reasonable workaround at the GATT layer — different chain orders, claim writes to the Apple custom service, conn-param tuning, peer_disc_all priming — and none of them recovered the press once Apple discarded it. Implementing the full MagicPairing accessory-authentication protocol (which doesn't even gate HID delivery, per the [WiSec '20 paper](https://arxiv.org/pdf/2005.07255)) is not feasible without a hardware BLE sniffer and access to Apple's per-device LTK material. So we accept the trade-off: keep the link alive, button identity is always preserved.
 
-**Battery cost:** ~5–10 µA average draw on the remote in connected-low-power mode at latency 400, vs. ~1 µA disconnected. CR2032 (≈ 225 mAh) lifetime drops from ~18–24 months to ~14–18 months. Roughly 1.2× drain for 100 % wake-press reliability — a Phase 3B Number entity will let you tune slave latency live to trade battery vs. disconnect-detection latency without reflashing.
+**Battery cost:** ~5–10 µA average draw on the remote in connected-low-power mode at latency 400, vs. ~1 µA disconnected. CR2032 (≈ 225 mAh) lifetime drops from ~18–24 months to ~14–18 months. Roughly 1.2× drain for 100 % wake-press reliability — the ESPHome path exposes `number.siri_remote_ble_slave_latency` as a live slider so you can trade battery vs. disconnect-detection latency without reflashing.
 
-**Opting out:** set `CONFIG_IDLE_DISCONNECT_MS` to a non-zero value (e.g. 60000) via `idf.py menuconfig`. The bridge will proactively terminate the link after that many milliseconds of inactivity, the remote enters its deepest sleep, and battery improves — but any button press after >30 s of disconnect arrives without the button identity. Choose this if battery matters more than knowing which specific button was pressed to wake.
+**Opting out:**
 
-## MQTT topics published
+- **ESPHome path:** set `idle_disconnect_ms:` on the `siri_remote:` block in
+  YAML to a non-zero value (e.g. `60000`).
+- **Standalone path:** set `CONFIG_IDLE_DISCONNECT_MS` via `idf.py menuconfig`.
 
-| Topic | Retained | Purpose |
-|---|---|---|
-| `siri_remote/event` | no | Discrete events (click/double_click/hold_start/hold_end/swipe_*) |
-| `siri_remote/touch_raw` | no | Raw touch frames at ~50/sec — only when the HA Switch is on |
-| `siri_remote/connection` | yes (LWT) | `online` / `offline` |
-| `siri_remote/state/raw_stream` | yes | Current Switch state, mirrored from NVS |
+The bridge will proactively terminate the link after that many milliseconds of inactivity, the remote enters its deepest sleep, and battery improves — but any button press after >30 s of disconnect arrives without the button identity. Choose this if battery matters more than knowing which specific button was pressed to wake.
 
 ## Home Assistant automation patterns
 
-The bridge auto-discovers as a single **Event entity** with these `event_type`
-values: `click`, `double_click`, `hold_start`, `hold_end`, `swipe_up`,
-`swipe_down`, `swipe_left`, `swipe_right`. Event payloads include
-`button` (for button events), `duration_ms` (for click/hold_end), and
-`distance` (for swipes).
+### ESPHome path
 
-For "bridge came back online" automations (Wi-Fi outage recovery, bridge
-reboot, etc.), bind to the bridge LWT availability topic
-`siri_remote/connection` and watch for an `offline → online` transition —
-the previously-emitted `pickup` event was a duplicate of this signal with
-worse semantics in always-connected mode and was removed in Phase 3.N.
+Discrete remote events fire as a Home Assistant event `esphome.siri_remote_event`
+with the following `event_data` shape:
 
-**Toggle a light on click:**
+| Field | Type | Present on |
+|---|---|---|
+| `action` | string | always — one of `click`, `double_click`, `hold_start`, `hold_end`, `swipe_up`, `swipe_down`, `swipe_left`, `swipe_right` |
+| `button` | string | button events only — `select`, `tv`, `mic`, `volume_up`, `volume_down`, `back`, `play_pause`, etc. |
+| `duration_ms` | integer | `click` and `hold_end` only |
+| `distance` | integer | swipe events only |
+
+**Toggle a light on a click:**
+
 ```yaml
 trigger:
-  platform: state
-  entity_id: event.siri_remote
-condition: >
-  {{ trigger.to_state.attributes.event_type == 'click'
-     and trigger.to_state.attributes.button == 'volume_up' }}
+  platform: event
+  event_type: esphome.siri_remote_event
+  event_data:
+    action: click
+    button: volume_up
 action:
   service: light.toggle
   target:
@@ -157,17 +231,23 @@ action:
 ```
 
 **Dim while holding** (start a loop on `hold_start`, stop on `hold_end`):
+
 ```yaml
 - alias: "Vol Down hold dims"
   trigger:
-    platform: state
-    entity_id: event.siri_remote
-  condition: >
-    {{ trigger.to_state.attributes.event_type == 'hold_start'
-       and trigger.to_state.attributes.button == 'volume_down' }}
+    platform: event
+    event_type: esphome.siri_remote_event
+    event_data:
+      action: hold_start
+      button: volume_down
   action:
     repeat:
-      while: "{{ states('input_boolean.dimming') == 'on' }}"
+      until:
+        - platform: event
+          event_type: esphome.siri_remote_event
+          event_data:
+            action: hold_end
+            button: volume_down
       sequence:
         - service: light.turn_on
           data:
@@ -176,31 +256,74 @@ action:
         - delay: "00:00:00.1"
 ```
 
-**Welcome-home on bridge recovery:** subscribe to MQTT topic
-`siri_remote/connection` and trigger on the `offline → online` transition.
-The bridge LWT publishes `online` when it boots and the broker pushes
-`offline` after the keepalive expires; HA's `mqtt.state` trigger handles
-this directly without needing a synthetic event.
+**Magnitude-aware swipe** (HA template trigger — swipe_up only fires when
+distance > 100):
 
-**Magnitude-aware swipe:**
 ```yaml
-condition: >
-  {{ trigger.to_state.attributes.event_type == 'swipe_up'
-     and trigger.to_state.attributes.distance | int > 100 }}
+trigger:
+  platform: event
+  event_type: esphome.siri_remote_event
+  event_data:
+    action: swipe_up
+condition: "{{ trigger.event.data.distance | int > 100 }}"
 ```
+
+**Pause media while voice is active:**
+
+```yaml
+trigger:
+  platform: state
+  entity_id: binary_sensor.siri_remote_voice_active
+  to: "on"
+action:
+  service: media_player.media_pause
+  target:
+    entity_id: media_player.living_room
+```
+
+### Standalone path
+
+The MQTT-only build publishes events on `siri_remote/event` and an Event
+entity is auto-discovered with the same `event_type` values as above. Bind
+to the entity directly:
+
+```yaml
+trigger:
+  platform: state
+  entity_id: event.siri_remote
+condition: >
+  {{ trigger.to_state.attributes.event_type == 'click'
+     and trigger.to_state.attributes.button == 'volume_up' }}
+```
+
+For "bridge came back online" automations (Wi-Fi outage recovery, bridge
+reboot, etc.), bind to the bridge LWT availability topic
+`siri_remote/connection` and watch for an `offline → online` transition. The
+ESPHome path uses the ESPHome API's native availability signal instead and
+does not need a separate topic subscription.
 
 ## Project layout
 
 ```
-components/
-  siri_ble/         # BLE central — scan, pair, discover, magic unlock, notify dispatch
-  report_decoder/   # Pure-C parsers (button bitmap, touch frame, name lookup)
-  event_state/      # Pure-C state machine — derives semantic events from raw input
+components/                       # standalone-only IDF C
+  siri_ble/                       # BLE central — scan, pair, discover, magic unlock, notify dispatch
+  siri_audio/                     # Opus decode pipeline (gen-3 audio packet parser + decoder task)
+  report_decoder/                 # Pure-C parsers (button bitmap, touch frame, charging-state, name lookup)
+  event_state/                    # Pure-C state machine — derives semantic events from raw input
+  mqtt_entity/                    # MQTT helper for Switch / Number / Button HA-discovery (standalone-only)
 main/
-  main.c            # Wi-Fi, MQTT, NVS, HA auto-discovery, glue
-  Kconfig.projbuild # Wi-Fi + MQTT credential config
-tests/host/         # Host unit tests (no hardware required) — ASan + UBSan enabled
-  fixtures/         # Captured per-button + per-swipe byte sequences from real hardware
+  main.c                          # standalone build — Wi-Fi, MQTT, NVS, HA auto-discovery, glue
+  Kconfig.projbuild               # standalone Wi-Fi + MQTT credential config
+esphome/components/siri_remote/   # ESPHome external component
+  __init__.py                     # parent component schema, sdkconfig pinning
+  binary_sensor.py / sensor.py / text_sensor.py / switch.py / button.py / number.py
+  siri_remote_hub.{h,cpp}         # Component subclass — orchestrates BLE + audio + entity bridging
+  siri_remote_{switch,button,number}.{h,cpp}  # entity subclasses
+  *.c, *.h                        # symlinks to ../../components/*/ — both build paths share C
+example.yaml                      # working ESPHome config (the recommended user starting point)
+secrets.yaml.example              # template for the secrets ESPHome reads
+tests/host/                       # Host unit tests (no hardware required) — ASan + UBSan enabled
+  fixtures/                       # Captured per-button + per-swipe byte sequences from real hardware
 ```
 
 ## Acknowledgments
@@ -217,7 +340,7 @@ of prior art:
   format. Gen 2/3 coverage lives on the `gen-3` branch.
 
 This project translates that protocol knowledge into ESP-IDF + NimBLE C
-running on an ESP32.
+running on an ESP32, with an ESPHome external-component layer on top.
 
 ## License
 

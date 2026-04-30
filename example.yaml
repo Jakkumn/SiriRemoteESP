@@ -1,10 +1,14 @@
 # Working ESPHome config for the Siri Remote bridge.
 #
-#   esphome run example.yaml
+#   cp secrets.yaml.example secrets.yaml   # then edit and fill in real values
+#   uv run esphome run example.yaml
+#
+# secrets.yaml must define: wifi_ssid, wifi_password, api_key, ota_password.
+# See secrets.yaml.example for how to generate api_key.
 #
 # First-time pairing: hold Back + Vol Up on the remote for ~5 s once the
-# bridge logs "siri_remote setup complete" — same dance as the standalone
-# build.
+# bridge logs "siri_remote setup complete". See README.md for the full
+# pairing flow and re-pair instructions.
 
 esphome:
   name: siri-bridge
@@ -91,3 +95,23 @@ number:
   - platform: siri_remote
     type: ble_slave_latency
     name: "Siri Remote BLE Slave Latency"
+
+# -----------------------------------------------------------------------------
+# Home Assistant automation example (paste into HA's automations.yaml).
+# Discrete remote events fire as `esphome.siri_remote_event` with payload
+# {action, button, duration_ms, distance}. See README.md for the full field
+# table + more examples (hold-to-dim, magnitude-aware swipes, voice_active).
+#
+# automation:
+#   - alias: "Volume Up click toggles living-room light"
+#     trigger:
+#       platform: event
+#       event_type: esphome.siri_remote_event
+#       event_data:
+#         action: click
+#         button: volume_up
+#     action:
+#       service: light.toggle
+#       target:
+#         entity_id: light.living_room
+# -----------------------------------------------------------------------------
