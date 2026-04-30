@@ -3,8 +3,11 @@
 #include <cinttypes>
 #include <string>
 
+#include "esphome/components/api/api_connection.h"
 #include "esphome/components/api/api_pb2.h"
 #include "esphome/components/api/api_server.h"
+#include "esphome/components/voice_assistant/voice_assistant.h"
+#include "esphome/core/automation.h"
 #include "esphome/core/helpers.h"
 
 #include "esp_err.h"
@@ -83,6 +86,22 @@ static void nimble_host_task(void *param) {
   nimble_port_freertos_deinit();
 }
 
+// Action attached to voice_assistant's tts_end_trigger so we can react
+// at TTS_END time without owning a media_player. Forwards to the hub's
+// signal_response_finished(); allocated once at setup and never freed.
+class FinishResponseAction : public Action<std::string> {
+ public:
+  explicit FinishResponseAction(SiriRemoteHub *hub) : hub_(hub) {}
+  void play(const std::string & /*url*/) override {
+    if (this->hub_ != nullptr) {
+      this->hub_->signal_response_finished();
+    }
+  }
+
+ private:
+  SiriRemoteHub *hub_;
+};
+
 void SiriRemoteHub::setup() {
   ESP_LOGI(TAG, "siri_remote setup: voice=%d idle_disconnect_ms=%" PRIu32,
            (int) voice_enabled_, idle_disconnect_ms_);
@@ -128,6 +147,17 @@ void SiriRemoteHub::setup() {
   // connection is up yet). Safe to call after siri_ble_start.
   siri_ble_set_slave_latency(static_cast<uint16_t>(
       knob_value(ble_lat_number_, FALLBACK_BLE_SLAVE_LATENCY)));
+
+  if (voice_assistant_ != nullptr && auto_finish_response_) {
+    // Bind a one-shot Action onto voice_assistant's tts_end_trigger so we
+    // can fan out an AnnounceFinished message ourselves. Without this,
+    // HA's assist_satellite UI sticks on "Responding" forever when no
+    // media_player is configured (upstream voice_assistant only sends
+    // AnnounceFinished from its playback timeout).
+    auto *automation = new Automation<std::string>(
+        voice_assistant_->get_tts_end_trigger());
+    automation->add_actions({new FinishResponseAction(this)});
+  }
 
   ESP_LOGI(TAG, "siri_remote setup complete");
 }
@@ -223,6 +253,15 @@ void SiriRemoteHub::on_ble_notify(uint16_t attr_handle, const uint8_t *data,
         }
         if (voice_active_sensor_ != nullptr) {
           this->defer([this, mic_now] { voice_active_sensor_->publish_state(mic_now); });
+        }
+        // Direct trigger when the user opted in via voice_assistant_id:
+        // skips the binary_sensor → on_press automation hop (~5–15 ms).
+        // Still defers because voice_assistant entity APIs are loop-task only.
+        if (mic_now && voice_assistant_ != nullptr) {
+          this->defer([this] {
+            voice_assistant_->request_start(/*continuous=*/false,
+                                            /*silence_detection=*/true);
+          });
         }
       }
       prev_buttons_ = btns;
@@ -329,6 +368,15 @@ void SiriRemoteHub::apply_knob_change(SiriRemoteKnob kind, float value) {
       siri_ble_set_slave_latency(static_cast<uint16_t>(value));
       return;
   }
+}
+
+void SiriRemoteHub::signal_response_finished() {
+  if (this->voice_assistant_ == nullptr) return;
+  api::APIConnection *client = this->voice_assistant_->get_api_connection();
+  if (client == nullptr) return;
+  api::VoiceAssistantAnnounceFinished msg;
+  msg.success = true;
+  client->send_message(msg);
 }
 
 void SiriRemoteHub::on_audio_session_start() {

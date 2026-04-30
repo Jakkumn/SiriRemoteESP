@@ -39,36 +39,46 @@ ota:
   - platform: esphome
     password: !secret ota_password
 
-# Defaults are fine — voice on, always-connected, no debug knobs.
 siri_remote:
+  # Hand the firmware a pointer to voice_assistant. Two behaviors come
+  # along with this:
+  #  1. Mic press fires voice_assistant.start directly from the BLE
+  #     callback (saves ~5–15 ms vs the binary_sensor → on_press hop).
+  #  2. With auto_finish_response: true (default), the hub sends
+  #     VoiceAssistantAnnounceFinished on TTS_END so HA's
+  #     assist_satellite UI cleanly returns to Idle even though the
+  #     bridge has no speaker. Set to false if you wire a real speaker
+  #     or media_player on voice_assistant: (those paths already send
+  #     AnnounceFinished and you'd get duplicates otherwise).
+  voice_assistant_id: siri_voice_assistant
+  # auto_finish_response: true   # default
 
 binary_sensor:
   - platform: siri_remote
     type: voice_active
     name: "Siri Remote Voice Active"
     device_class: running
-    # Mic press starts the session; voice_assistant's VAD finalizes STT
-    # when it detects end-of-speech silence. Don't fire voice_assistant.stop
-    # on release — it's a hard abort that drops the in-flight utterance if
-    # the user releases before VAD completes. Comment this block (or the
-    # microphone:/voice_assistant: blocks) to disable voice entirely.
-    on_press:
-      - voice_assistant.start
+    # No on_press: voice_assistant.start here — voice_assistant_id above
+    # already fires it from the firmware. Adding it back would double-fire.
+    # Mic-release is also intentionally NOT wired to voice_assistant.stop;
+    # voice_assistant's VAD finalizes STT on detected silence. Aborting via
+    # release drops in-flight utterances when the user releases before VAD
+    # completes (5.B silence injection feeds zeros so VAD can detect end).
 
 microphone:
   - platform: siri_remote
     id: siri_remote_mic
 
 voice_assistant:
+  id: siri_voice_assistant
   microphone:
     microphone: siri_remote_mic
   use_wake_word: false
-  # The XIAO S3 has no audio-out hardware, so TTS responses can't play on
-  # the bridge. Don't disable TTS at the pipeline level (that affects every
-  # satellite) — instead create a TTS-free Assist pipeline in HA and point
-  # this device's auto-generated `select.siri_bridge_assist_pipeline` at
-  # it. Other satellites (Voice PE, phones, etc.) keep spoken responses.
-  # See README.md "Disabling the spoken response" for the step-by-step.
+  # No speaker:/media_player: configured — bridge has no audio-out. The
+  # auto_finish_response knob on siri_remote: handles the assist_satellite
+  # state transition that voice_assistant would normally do via playback
+  # timeout. See README "TTS playback options" for routing TTS to a
+  # different HA media_player (Sonos, Echo) or wiring a real speaker.
 
 sensor:
   - platform: siri_remote

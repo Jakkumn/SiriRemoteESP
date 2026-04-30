@@ -9,7 +9,7 @@ import os
 
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.components import esp32
+from esphome.components import esp32, voice_assistant
 from esphome.const import CONF_ID, CONF_PORT
 from esphome.core import CORE
 
@@ -33,6 +33,8 @@ CONF_DEBUG_TOUCH_FRAMES = "debug_touch_frames"
 CONF_DEBUG_WAKE_PROBE = "debug_wake_probe"
 CONF_DEBUG_PCM_TCP = "debug_pcm_tcp"
 CONF_HOST = "host"
+CONF_VOICE_ASSISTANT_ID = "voice_assistant_id"
+CONF_AUTO_FINISH_RESPONSE = "auto_finish_response"
 
 DEBUG_PCM_TCP_SCHEMA = cv.Schema({
     cv.Required(CONF_HOST): cv.ipv4address,
@@ -47,6 +49,8 @@ CONFIG_SCHEMA = cv.Schema({
     cv.Optional(CONF_DEBUG_TOUCH_FRAMES, default=False): cv.boolean,
     cv.Optional(CONF_DEBUG_WAKE_PROBE, default=False): cv.boolean,
     cv.Optional(CONF_DEBUG_PCM_TCP): DEBUG_PCM_TCP_SCHEMA,
+    cv.Optional(CONF_VOICE_ASSISTANT_ID): cv.use_id(voice_assistant.VoiceAssistant),
+    cv.Optional(CONF_AUTO_FINISH_RESPONSE, default=True): cv.boolean,
 }).extend(cv.COMPONENT_SCHEMA)
 
 
@@ -130,6 +134,11 @@ async def to_code(config):
         pcm = config[CONF_DEBUG_PCM_TCP]
         cg.add(var.set_debug_pcm_tcp(str(pcm[CONF_HOST]), pcm[CONF_PORT]))
         cg.add_build_flag("-DSIRI_REMOTE_DEBUG_PCM_TCP")
+
+    if CONF_VOICE_ASSISTANT_ID in config:
+        va = await cg.get_variable(config[CONF_VOICE_ASSISTANT_ID])
+        cg.add(var.set_voice_assistant(va))
+        cg.add(var.set_auto_finish_response(config[CONF_AUTO_FINISH_RESPONSE]))
 
     # The shared siri_ble.c uses #ifdef CONFIG_VOICE_ENABLED to gate the
     # audio CCCD subscribe and #ifdef CONFIG_DEBUG_WAKE_PROBE for probe

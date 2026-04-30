@@ -76,50 +76,122 @@ Assistant event called `esphome.siri_remote_event` with full payload — see
 Holding the Mic button on the remote pushes decoded audio into Home
 Assistant's Assist pipeline as push-to-talk — wake-word disabled. The
 `microphone:` and `voice_assistant:` blocks in `example.yaml` enable
-this. Comment them out (and the `on_press` automation on the
-`voice_active` binary_sensor) if you don't want voice — the rest of
-the bridge keeps working.
+this. Comment them out (and remove `voice_assistant_id:` from the
+`siri_remote:` block) if you don't want voice — the rest of the bridge
+keeps working.
 
-Mic press fires `voice_assistant.start`; voice_assistant's built-in
-VAD finalizes STT when it detects end-of-speech silence. Mic *release*
-is intentionally **not** wired to `voice_assistant.stop` — that action
-is a hard abort that drops the in-flight utterance if the user
-releases before VAD completes. Trade-off: pressing Mic and staying
-silent lets voice_assistant sit in `STREAMING_MICROPHONE` for a second
-or two until VAD's no-voice timeout fires. Acceptable for push-to-talk.
+Mic press fires `voice_assistant.start` directly from the firmware
+(see `voice_assistant_id:` in `example.yaml`). voice_assistant's
+built-in VAD finalizes STT when it detects end-of-speech silence. Mic
+*release* is intentionally **not** wired to `voice_assistant.stop` —
+that action is a hard abort that drops the in-flight utterance if the
+user releases before VAD completes. Trade-off: pressing Mic and
+staying silent lets voice_assistant sit in `STREAMING_MICROPHONE` for
+a second or two until VAD's no-voice timeout fires. Acceptable for
+push-to-talk.
 
-After Mic-release the firmware also injects 20 ms-paced silence frames
-into the audio stream (since Apple stops sending audio packets at
-release) so HA's VAD has a continuous signal to analyze and can
+After Mic-release the firmware also injects 20 ms-paced silence
+frames into the audio stream (since Apple stops sending audio packets
+at release) so HA's VAD has a continuous signal to analyze and can
 detect end-of-speech naturally. Without this the satellite would sit
 in HA's "Listening" state until its `stt-stream-failed` timeout (~9 s)
 fired and discarded the captured utterance. The silence stops as soon
 as voice_assistant finishes the cycle.
 
-#### Disabling the spoken response (no speaker on the bridge)
+#### TTS playback options
 
-The XIAO S3 has no audio-out hardware, so any TTS response HA
-generates is wasted work — the response URL fires but there's nothing
-to play it on. ESPHome doesn't expose a per-call "skip TTS" knob, so
-the right place to disable it is on the **HA Assist pipeline**.
-Configure this **per-satellite** rather than globally so your other
-satellites (HA Voice PE, ESP32-S3-BOX, phone Assist, etc.) keep
-spoken responses:
+The XIAO S3 has no audio-out hardware, so the bridge by itself can't
+play voice responses. There are three usable patterns; pick whichever
+fits your install. Don't try to remove TTS from the Assist pipeline
+itself — ESPHome's `voice_assistant` always advertises that it can
+receive audio responses (`FEATURE_API_AUDIO` is hardcoded), and HA's
+pipeline validator rejects pipelines without TTS for satellites that
+advertise it (`validation-error - the pipeline does not support
+text-to-speech`).
 
-1. **Create a TTS-free pipeline.** Settings → Voice Assistants → "Add
-   Assistant" → name it `siri-bridge-no-tts` → set Speech-to-text to
-   your real engine (Whisper / Home Assistant Cloud / etc.) → set
-   **Text-to-speech** to `(none)`. Save.
-2. **Point the bridge at it.** Settings → Devices & Services → ESPHome
-   → siri-bridge → find `select.siri_bridge_assist_pipeline` (auto-
-   created by HA for every voice satellite) and set it to
-   `siri-bridge-no-tts`.
+**A — local speaker on the bridge.** If you have I²S audio hardware
+wired up, add an ESPHome `speaker:` block and reference it from
+`voice_assistant.speaker:`. voice_assistant handles playback +
+end-of-response signalling itself — set
+`siri_remote: auto_finish_response: false` in this case so we don't
+send a duplicate `VoiceAssistantAnnounceFinished` message.
 
-The bridge now sends audio to a TTS-free pipeline; intents process
-and actions run, but no audio response is generated. Other devices on
-the default pipeline still get TTS as configured. The select entity
-also lets you flip pipelines from automations or the dashboard if you
-ever wire a speaker to the bridge later.
+**B — route TTS to an existing HA media_player.** If you have a Sonos,
+Echo, Voice PE, etc. already in HA and want voice responses to play
+there, add a top-level automation hook on the voice_assistant block:
+
+```yaml
+voice_assistant:
+  id: siri_voice_assistant
+  microphone:
+    microphone: siri_remote_mic
+  use_wake_word: false
+  on_tts_end:
+    - homeassistant.service:
+        service: media_player.play_media
+        data:
+          entity_id: media_player.kitchen
+          media_content_id: !lambda 'return x;'
+          media_content_type: music
+```
+
+Leave `auto_finish_response: true` (the default) so HA's
+`assist_satellite` UI returns to Idle promptly — voice_assistant's
+built-in playback timeout doesn't run when no local speaker /
+media_player is attached, so the firmware fan-out fills the gap.
+
+**C — no speaker anywhere (the default).** Voice commands process and
+intents run, but no audio response is generated locally. HA still
+generates the TTS audio (a few hundred ms of compute on the HA side);
+the bridge silently discards it. The
+`siri_remote: voice_assistant_id: siri_voice_assistant` opt-in in
+`example.yaml` enables this with `auto_finish_response: true` (the
+default), so the firmware mirrors what `voice_assistant`'s playback
+timeout would have done if a media_player were attached: it sends
+`VoiceAssistantAnnounceFinished` when HA reports TTS_END, and the
+`assist_satellite.<bridge>` entity in HA cleanly transitions
+`responding` → `idle` instead of getting stuck on Responding.
+
+#### Reducing voice latency
+
+Press → audio in HA Assist takes ~150–250 ms today (firmware + HA
+round-trip). What feels slower is user reaction time after press
+(500–1500 ms) and HA's VAD silence-detection lag (600 ms+). The wins
+below stack:
+
+1. **HA Aggressive VAD.** Settings → Voice Assistants → your pipeline
+   → **Finished speaking detection** → **Aggressive**. Saves
+   ~200–400 ms on end-of-utterance. Slow speakers may get the last
+   syllable clipped — fall back to Default if it bites.
+2. **HA cue automation.** Bind to `assist_satellite.<bridge>` state
+   transitions. Once `auto_finish_response: true` is on (Scenario C
+   above), the satellite cleanly cycles `idle` → `listening` →
+   `processing` → `idle` per command, so HA-side automations on those
+   transitions actually work. Example — flash a hue lamp while listening:
+   ```yaml
+   automation:
+     - alias: "Siri bridge listening cue"
+       trigger:
+         platform: state
+         entity_id: assist_satellite.siri_bridge
+         to: "listening"
+       action:
+         service: light.turn_on
+         target: { entity_id: light.living_room_lamp }
+         data: { rgb_color: [0, 100, 255], brightness: 80 }
+   ```
+   The auto-derived satellite name is `assist_satellite.<esphome_name>`.
+3. **Firmware-side direct trigger** (already wired in `example.yaml`).
+   Setting `voice_assistant_id:` on the `siri_remote:` block fires
+   `voice_assistant.start` directly from the BLE callback, skipping
+   the binary_sensor → on_press automation hop. ~5–15 ms saving;
+   sub-perceptual but stacks with the rest.
+
+What's deliberately out of scope: continuous-stream pre-warm
+(privacy + 24/7 HA STT compute on silence), cross-task direct calls
+into voice_assistant (ESPHome thread model forbids), and the HA-side
+network round-trip itself (~100–200 ms — controlled by HA's STT
+engine choice, not the bridge).
 
 ### Caveats
 

@@ -19,6 +19,11 @@
 #include "siri_remote_number.h"
 
 namespace esphome {
+
+namespace voice_assistant {
+class VoiceAssistant;
+}
+
 namespace siri_remote {
 
 class SiriRemoteMicrophone;
@@ -52,6 +57,17 @@ class SiriRemoteHub : public Component {
   void set_raw_stream_enabled(bool enabled) { raw_stream_enabled_ = enabled; }
 
   void set_microphone(SiriRemoteMicrophone *m) { microphone_ = m; }
+
+  void set_voice_assistant(voice_assistant::VoiceAssistant *va) { voice_assistant_ = va; }
+  void set_auto_finish_response(bool v) { auto_finish_response_ = v; }
+
+  // Sends api::VoiceAssistantAnnounceFinished to HA — mirrors what
+  // voice_assistant::start_playback_timeout_() does when a media_player
+  // is configured. Bound to voice_assistant's tts_end_trigger at setup
+  // time so HA's assist_satellite UI returns to Idle even when the
+  // bridge has no playback hardware. No-op if voice_assistant_ is null
+  // or has no active API client.
+  void signal_response_finished();
 
   void set_swipe_y_pri_number(SiriRemoteNumber *n) { swipe_y_pri_number_ = n; }
   void set_swipe_dist_number(SiriRemoteNumber *n) { swipe_dist_number_ = n; }
@@ -137,6 +153,14 @@ class SiriRemoteHub : public Component {
   // siri_remote microphone platform; null otherwise. Read from the
   // siri_audio decode task in start_audio_'s on_pcm thunk.
   SiriRemoteMicrophone *microphone_{nullptr};
+
+  // Optional voice_assistant pointer. When set, the hub fires
+  // request_start() directly on Mic press (saves the binary_sensor →
+  // on_press automation hop) and — if auto_finish_response_ is true —
+  // sends VoiceAssistantAnnounceFinished on TTS_END so HA's
+  // assist_satellite UI cleanly returns to Idle without a media_player.
+  voice_assistant::VoiceAssistant *voice_assistant_{nullptr};
+  bool auto_finish_response_{true};
 
   // Six runtime-tunable Numbers. Pointers populated by number.py to_code
   // before our setup() runs; we read each one's `state` field after
