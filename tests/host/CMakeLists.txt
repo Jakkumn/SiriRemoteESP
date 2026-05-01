@@ -32,6 +32,15 @@ add_library(event_state STATIC
 target_include_directories(event_state PUBLIC ${EVENT_STATE_DIR}/include)
 target_link_libraries(event_state PUBLIC report_decoder)
 
+# Just the pure validator from siri_audio. The full siri_audio.c pulls in
+# opus + FreeRTOS + esp-log, which we deliberately avoid in the host
+# environment — siri_audio_validate.c has no such deps.
+set(SIRI_AUDIO_DIR "${CMAKE_CURRENT_LIST_DIR}/../../components/siri_audio")
+add_library(siri_audio_validate STATIC
+    ${SIRI_AUDIO_DIR}/siri_audio_validate.c
+)
+target_include_directories(siri_audio_validate PUBLIC ${SIRI_AUDIO_DIR}/include)
+
 enable_testing()
 
 # One executable per test file — CTest runs each independently so a crash
@@ -46,3 +55,6 @@ target_link_libraries(test_report_decoder PRIVATE report_decoder)
 
 add_host_test(test_event_state)
 target_link_libraries(test_event_state PRIVATE event_state)
+
+add_host_test(test_siri_audio)
+target_link_libraries(test_siri_audio PRIVATE siri_audio_validate)

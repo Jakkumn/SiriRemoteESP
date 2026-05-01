@@ -22,6 +22,15 @@ namespace siri_remote {
 // can then finalize STT naturally on detected silence.
 class SiriRemoteMicrophone : public microphone::Microphone, public Component {
  public:
+  // Base classes (microphone::Microphone, Component) lack virtual destructors,
+  // so don't mark this override — but we still need it to free the
+  // periodic-silence timer if the component is ever torn down.
+  ~SiriRemoteMicrophone() {
+    if (this->silence_timer_ != nullptr) {
+      esp_timer_stop(this->silence_timer_);
+      esp_timer_delete(this->silence_timer_);
+    }
+  }
   void setup() override;
   void dump_config() override;
   float get_setup_priority() const override { return setup_priority::DATA; }

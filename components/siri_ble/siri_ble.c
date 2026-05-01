@@ -35,12 +35,12 @@ static const char *TAG = "siri_ble";
 // the fingerprint check, but bonded reconnects use these constants directly.
 // Phase 3B.7 plans a runtime "discovery mode" Switch for cross-gen units
 // where the layout differs.
-#define BUTTON_CCCD_HANDLE   0x003A
-#define TOUCH_CCCD_HANDLE    0x003E
-#define BATTERY_CCCD_HANDLE  0x002F  // svc 0x180F, char 0x2A19 (battery level)
+#define BUTTON_CCCD_HANDLE 0x003A
+#define TOUCH_CCCD_HANDLE 0x003E
+#define BATTERY_CCCD_HANDLE 0x002F   // svc 0x180F, char 0x2A19 (battery level)
 #define CHARGING_CCCD_HANDLE 0x0032  // svc 0x180F, char 0x2A1A (battery power state)
-#define MAGIC_HANDLE         0x004D
-static const uint8_t MAGIC_VALUE[2]   = {0xF0, 0x00};
+#define MAGIC_HANDLE 0x004D
+static const uint8_t MAGIC_VALUE[2] = {0xF0, 0x00};
 static const uint8_t ENABLE_NOTIFY[2] = {0x01, 0x00};
 
 static siri_ble_config_t s_cfg;
@@ -71,14 +71,14 @@ static siri_ble_mode_t s_mode = MODE_IDLE;
 // resolving list translates outbound connect commands when the peer's
 // random-resolvable address matches a bonded IRK).
 static ble_addr_t s_bonded_peer;
-static bool       s_have_bonded_peer;
+static bool s_have_bonded_peer;
 
 // Address of the candidate we're currently connecting to / fingerprinting.
 // Stashed at BLE_GAP_EVENT_DISC time so we can blacklist + delete-bond on
 // fingerprint failure even though the NimBLE GAP event for the failure is
 // the disconnect (which doesn't carry the peer addr).
 static ble_addr_t s_pending_candidate;
-static bool       s_pending_candidate_set;
+static bool s_pending_candidate_set;
 
 // In-RAM candidate blacklist. Discovery walks every nearby HID adv; once
 // we've rejected one (fingerprint mismatch, or LL connect-establish failure
@@ -87,43 +87,43 @@ static bool       s_pending_candidate_set;
 // every adv interval. Lost on reboot — fine, since reboot also clears any
 // stuck NimBLE state.
 typedef struct {
-    uint8_t  addr[6];
+    uint8_t addr[6];
     uint32_t expire_ms;
 } blacklist_entry_t;
-#define BLACKLIST_SIZE                   8
-#define BLACKLIST_TTL_FINGERPRINT_MS     60000  // wrong device entirely
-#define BLACKLIST_TTL_FAILED_CONNECT_MS  5000   // LL handshake didn't complete —
-                                                // most often the remote isn't in
-                                                // pairing mode for our identity yet.
-                                                // Short TTL so the user pressing
-                                                // Back+VolUp recovers quickly.
+#define BLACKLIST_SIZE 8
+#define BLACKLIST_TTL_FINGERPRINT_MS 60000  // wrong device entirely
+#define BLACKLIST_TTL_FAILED_CONNECT_MS                                                            \
+    5000  // LL handshake didn't complete —
+          // most often the remote isn't in
+          // pairing mode for our identity yet.
+          // Short TTL so the user pressing
+          // Back+VolUp recovers quickly.
 static blacklist_entry_t s_blacklist[BLACKLIST_SIZE];
-static size_t            s_blacklist_next;       // ring index for replacement on overflow
-static portMUX_TYPE      s_blacklist_mux = portMUX_INITIALIZER_UNLOCKED;
-                                                 // protects s_blacklist + s_blacklist_next:
-                                                 // writes/reads from BLE host task (DISC
-                                                 // event, fingerprint reject), clears from
-                                                 // MQTT task (siri_ble_repair).
+static size_t s_blacklist_next;  // ring index for replacement on overflow
+static portMUX_TYPE s_blacklist_mux = portMUX_INITIALIZER_UNLOCKED;
+// protects s_blacklist + s_blacklist_next:
+// writes/reads from BLE host task (DISC
+// event, fingerprint reject), clears from
+// MQTT task (siri_ble_repair).
 
 // Discovery window — keeps the bridge from sitting in active scan forever
 // after a failed/abandoned pairing attempt. Cancelled on fingerprint pass
 // or repair-button press (both restart it from scratch).
-#define DISCOVERY_WINDOW_MS  (5 * 60 * 1000)
-#define DISCOVERY_RSSI_MIN   -55
+#define DISCOVERY_WINDOW_MS (5 * 60 * 1000)
+#define DISCOVERY_RSSI_MIN -55
 static esp_timer_handle_t s_discovery_window_timer;
 
 // HID service + Report char UUIDs (16-bit) for adv filter + fingerprint walk.
-#define HID_SVC_UUID16              0x1812
-#define HID_REPORT_UUID16           0x2A4D
-#define HID_REPORT_BUTTON_VAL       0x0039  // gen-3 button bitmap value handle
-#define APPLE_FINGERPRINT_MIN_REPORTS 3     // gen-3 has 9; require ≥3 for fingerprint pass
+#define HID_SVC_UUID16 0x1812
+#define HID_REPORT_UUID16 0x2A4D
+#define HID_REPORT_BUTTON_VAL 0x0039     // gen-3 button bitmap value handle
+#define APPLE_FINGERPRINT_MIN_REPORTS 3  // gen-3 has 9; require ≥3 for fingerprint pass
 
 // Apple custom service UUID `8341f2b4-c013-4f04-8197-c4cdb42e26dc` (LE byte
 // order). Required member of the gen-3 fingerprint; also used by the optional
 // CONFIG_DEBUG_WAKE_PROBE path below for post-setup notify subscription.
-static const ble_uuid128_t APPLE_CUSTOM_SVC_UUID =
-    BLE_UUID128_INIT(0xdc, 0x26, 0x2e, 0xb4, 0xcd, 0xc4, 0x97, 0x81,
-                     0x04, 0x4f, 0x13, 0xc0, 0xb4, 0xf2, 0x41, 0x83);
+static const ble_uuid128_t APPLE_CUSTOM_SVC_UUID = BLE_UUID128_INIT(
+    0xdc, 0x26, 0x2e, 0xb4, 0xcd, 0xc4, 0x97, 0x81, 0x04, 0x4f, 0x13, 0xc0, 0xb4, 0xf2, 0x41, 0x83);
 
 // Deferred-setup state. apply_remote_setup is held back until the *second*
 // ENC_CHANGE for a connection — Apple's accessory framework re-encrypts the
@@ -132,8 +132,8 @@ static const ble_uuid128_t APPLE_CUSTOM_SVC_UUID =
 // the GATT layer (CCCD writes etc.) before the secondary phase completes.
 // By waiting, the wake-press Apple has held since the user pressed a button
 // to wake the remote is delivered cleanly once our CCCD subscribes land.
-static uint16_t           s_pending_setup_conn = 0xFFFF;
-static uint32_t           s_pending_setup_idle_ms;
+static uint16_t s_pending_setup_conn = 0xFFFF;
+static uint32_t s_pending_setup_idle_ms;
 static esp_timer_handle_t s_setup_fallback_timer;
 
 // Worst-case wait between the two ENC_CHANGE events before we run setup
@@ -163,12 +163,12 @@ static esp_timer_handle_t s_setup_fallback_timer;
 // `siri_ble_set_slave_latency` mutates this struct + auto-recomputes
 // supervision_timeout to satisfy the BLE spec rule with ~25 % margin.
 static struct ble_gap_upd_params s_low_power_conn_params = {
-    .itvl_min            = 6,     // 6 * 1.25ms = 7.5ms
-    .itvl_max            = 12,    // 12 * 1.25ms = 15ms
-    .latency             = 400,
+    .itvl_min = 6,   // 6 * 1.25ms = 7.5ms
+    .itvl_max = 12,  // 12 * 1.25ms = 15ms
+    .latency = 400,
     .supervision_timeout = 1500,  // 1500 * 10ms = 15s
-    .min_ce_len          = 0,
-    .max_ce_len          = 0,
+    .min_ce_len = 0,
+    .max_ce_len = 0,
 };
 
 static int gap_event_cb(struct ble_gap_event *event, void *arg);
@@ -185,17 +185,17 @@ static uint32_t now_ms(void)
 }
 
 #ifdef CONFIG_DEBUG_WAKE_PROBE
-#define WAKE_PROBE_LOG(fmt, ...) \
-    ESP_LOGI(TAG, "wake_probe t=%lums " fmt, \
-             (unsigned long)(now_ms() - s_connect_ms), ##__VA_ARGS__)
+#define WAKE_PROBE_LOG(fmt, ...)                                                                   \
+    ESP_LOGI(TAG, "wake_probe t=%lums " fmt, (unsigned long)(now_ms() - s_connect_ms),             \
+             ##__VA_ARGS__)
 #else
 #define WAKE_PROBE_LOG(fmt, ...) ((void)0)
 #endif
 
 static void log_addr(const char *prefix, const uint8_t val[6])
 {
-    ESP_LOGI(TAG, "%s %02x:%02x:%02x:%02x:%02x:%02x",
-             prefix, val[5], val[4], val[3], val[2], val[1], val[0]);
+    ESP_LOGI(TAG, "%s %02x:%02x:%02x:%02x:%02x:%02x", prefix, val[5], val[4], val[3], val[2],
+             val[1], val[0]);
 }
 
 // --- Candidate blacklist (RAM only, ~60 s TTL) -----------------------------
@@ -206,7 +206,8 @@ static bool blacklist_contains(const uint8_t addr[6])
     portENTER_CRITICAL(&s_blacklist_mux);
     uint32_t now = now_ms();
     for (size_t i = 0; i < BLACKLIST_SIZE; i++) {
-        if (s_blacklist[i].expire_ms == 0) continue;
+        if (s_blacklist[i].expire_ms == 0)
+            continue;
         if (s_blacklist[i].expire_ms <= now) {
             s_blacklist[i].expire_ms = 0;  // expired, evict lazily
             continue;
@@ -278,19 +279,20 @@ static void start_discovery(void)
 
     if (s_discovery_window_timer != NULL) {
         (void)esp_timer_stop(s_discovery_window_timer);
-        (void)esp_timer_start_once(s_discovery_window_timer,
-                                   (uint64_t)DISCOVERY_WINDOW_MS * 1000);
+        (void)esp_timer_start_once(s_discovery_window_timer, (uint64_t)DISCOVERY_WINDOW_MS * 1000);
     }
-    ESP_LOGI(TAG, "DISCOVERING — for a NEW bridge, hold Back+VolUp on the remote ~5s to "
-                  "enter pairing mode; for a previously-paired remote, any button press "
-                  "should suffice (window=%d min, filter=HID UUID 0x1812, RSSI ≥ %d dBm)",
+    ESP_LOGI(TAG,
+             "DISCOVERING — for a NEW bridge, hold Back+VolUp on the remote ~5s to "
+             "enter pairing mode; for a previously-paired remote, any button press "
+             "should suffice (window=%d min, filter=HID UUID 0x1812, RSSI ≥ %d dBm)",
              DISCOVERY_WINDOW_MS / 60000, DISCOVERY_RSSI_MIN);
 }
 
 static void start_bonded_reconnect(void)
 {
     if (!s_have_bonded_peer) {
-        ESP_LOGW(TAG, "start_bonded_reconnect called with no stored peer; falling back to discovery");
+        ESP_LOGW(TAG,
+                 "start_bonded_reconnect called with no stored peer; falling back to discovery");
         start_discovery();
         return;
     }
@@ -298,8 +300,8 @@ static void start_bonded_reconnect(void)
     s_pending_candidate_set = false;
 
     log_addr("BONDED_RECONNECT to", s_bonded_peer.val);
-    int rc = ble_gap_connect(s_own_addr_type, &s_bonded_peer, BLE_HS_FOREVER,
-                             NULL, gap_event_cb, NULL);
+    int rc =
+        ble_gap_connect(s_own_addr_type, &s_bonded_peer, BLE_HS_FOREVER, NULL, gap_event_cb, NULL);
     if (rc != 0 && rc != BLE_HS_EALREADY && rc != BLE_HS_EBUSY) {
         ESP_LOGE(TAG, "ble_gap_connect (bonded) failed rc=%d; entering discovery", rc);
         s_have_bonded_peer = false;
@@ -311,7 +313,7 @@ static void start_bonded_reconnect(void)
 // gates, cancel scan and connect. Stashes the candidate addr in
 // s_pending_candidate so fingerprint failure can blacklist + delete bond.
 static void try_connect_candidate(const struct ble_gap_disc_desc *disc,
-                                   const struct ble_hs_adv_fields *fields)
+                                  const struct ble_hs_adv_fields *fields)
 {
     if (s_pending_candidate_set) {
         // Already mid-connect to a candidate; ignore concurrent advs.
@@ -331,12 +333,11 @@ static void try_connect_candidate(const struct ble_gap_disc_desc *disc,
     log_addr("HID candidate", disc->addr.val);
     ESP_LOGI(TAG, "  rssi=%d, attempting connect+fingerprint", disc->rssi);
 
-    s_pending_candidate     = disc->addr;
+    s_pending_candidate = disc->addr;
     s_pending_candidate_set = true;
 
     (void)ble_gap_disc_cancel();
-    int rc = ble_gap_connect(s_own_addr_type, &disc->addr, 30000, NULL,
-                             gap_event_cb, NULL);
+    int rc = ble_gap_connect(s_own_addr_type, &disc->addr, 30000, NULL, gap_event_cb, NULL);
     if (rc != 0) {
         ESP_LOGE(TAG, "ble_gap_connect failed: rc=%d", rc);
         s_pending_candidate_set = false;
@@ -350,8 +351,9 @@ static void discovery_window_expired_cb(void *arg)
     if (s_mode != MODE_DISCOVERING) {
         return;
     }
-    ESP_LOGW(TAG, "discovery window (%d min) expired without finding a remote — "
-                  "press the HA Repair button to retry",
+    ESP_LOGW(TAG,
+             "discovery window (%d min) expired without finding a remote — "
+             "press the HA Repair button to retry",
              DISCOVERY_WINDOW_MS / 60000);
     (void)ble_gap_disc_cancel();
     s_mode = MODE_IDLE;
@@ -374,27 +376,27 @@ typedef enum {
 } setup_kind_t;
 
 typedef struct {
-    setup_kind_t   kind;
-    uint16_t       handle;
+    setup_kind_t kind;
+    uint16_t handle;
     const uint8_t *value;  // SETUP_KIND_WRITE only
-    size_t         len;    // SETUP_KIND_WRITE only
-    const char    *label;
+    size_t len;            // SETUP_KIND_WRITE only
+    const char *label;
 } setup_step_t;
 
 static const setup_step_t SETUP_STEPS[] = {
-    {SETUP_KIND_WRITE, BUTTON_CCCD_HANDLE,   ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "button CCCD"},
-    {SETUP_KIND_WRITE, TOUCH_CCCD_HANDLE,    ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "touch CCCD"},
-    {SETUP_KIND_WRITE, BATTERY_CCCD_HANDLE,  ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "battery CCCD"},
+    {SETUP_KIND_WRITE, BUTTON_CCCD_HANDLE, ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "button CCCD"},
+    {SETUP_KIND_WRITE, TOUCH_CCCD_HANDLE, ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "touch CCCD"},
+    {SETUP_KIND_WRITE, BATTERY_CCCD_HANDLE, ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "battery CCCD"},
     {SETUP_KIND_WRITE, CHARGING_CCCD_HANDLE, ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "charging CCCD"},
-    {SETUP_KIND_WRITE, MAGIC_HANDLE,         MAGIC_VALUE,   sizeof(MAGIC_VALUE),   "magic unlock"},
-    {SETUP_KIND_READ,  0x002E,               NULL,          0,                     "battery initial read"},
-    {SETUP_KIND_READ,  0x0031,               NULL,          0,                     "charging initial read"},
+    {SETUP_KIND_WRITE, MAGIC_HANDLE, MAGIC_VALUE, sizeof(MAGIC_VALUE), "magic unlock"},
+    {SETUP_KIND_READ, 0x002E, NULL, 0, "battery initial read"},
+    {SETUP_KIND_READ, 0x0031, NULL, 0, "charging initial read"},
 #ifdef CONFIG_VOICE_ENABLED
     // Audio characteristic CCCD (val handle 0x0035, CCCD 0x0036). Subscribes
     // the bridge to the Opus-encoded voice stream that the remote emits
     // while the Mic button is held. siri_audio component decodes the frames
     // and dispatches PCM downstream.
-    {SETUP_KIND_WRITE, 0x0036,               ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "audio CCCD"},
+    {SETUP_KIND_WRITE, 0x0036, ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "audio CCCD"},
 #endif
 #ifdef CONFIG_DEBUG_WAKE_PROBE
     // CCCD probes for the three remaining notify-capable HID Reports on
@@ -411,37 +413,37 @@ static const setup_step_t SETUP_STEPS[] = {
     {SETUP_KIND_WRITE, 0x0036, ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "probe CCCD 0x0036 (audio)"},
     // 0x0025 (Apple-svc CCCD) is now subscribed in the EARLY block above.
     // GAP service reads — Apple's claim handshake might check these.
-    {SETUP_KIND_READ,  0x0003, NULL, 0, "probe read GAP name 0x0003"},
-    {SETUP_KIND_READ,  0x0005, NULL, 0, "probe read GAP appearance 0x0005"},
-    {SETUP_KIND_READ,  0x0007, NULL, 0, "probe read GAP ppcp 0x0007"},
-    {SETUP_KIND_READ,  0x0009, NULL, 0, "probe read GAP car 0x0009"},
+    {SETUP_KIND_READ, 0x0003, NULL, 0, "probe read GAP name 0x0003"},
+    {SETUP_KIND_READ, 0x0005, NULL, 0, "probe read GAP appearance 0x0005"},
+    {SETUP_KIND_READ, 0x0007, NULL, 0, "probe read GAP ppcp 0x0007"},
+    {SETUP_KIND_READ, 0x0009, NULL, 0, "probe read GAP car 0x0009"},
     // Device Info Service reads — Apple's accessory framework on iOS hosts
     // reads these as part of standard claim. Strings (mfg/model/serial/
     // hw_rev/fw_rev) print as ASCII via the read-bytes log; PnP ID is a
     // 7-byte struct.
-    {SETUP_KIND_READ,  0x000d, NULL, 0, "probe read mfg 0x000d"},
-    {SETUP_KIND_READ,  0x000f, NULL, 0, "probe read model 0x000f"},
-    {SETUP_KIND_READ,  0x0011, NULL, 0, "probe read serial 0x0011"},
-    {SETUP_KIND_READ,  0x0013, NULL, 0, "probe read hw_rev 0x0013"},
-    {SETUP_KIND_READ,  0x0015, NULL, 0, "probe read fw_rev 0x0015"},
-    {SETUP_KIND_READ,  0x0017, NULL, 0, "probe read PnP 0x0017"},
+    {SETUP_KIND_READ, 0x000d, NULL, 0, "probe read mfg 0x000d"},
+    {SETUP_KIND_READ, 0x000f, NULL, 0, "probe read model 0x000f"},
+    {SETUP_KIND_READ, 0x0011, NULL, 0, "probe read serial 0x0011"},
+    {SETUP_KIND_READ, 0x0013, NULL, 0, "probe read hw_rev 0x0013"},
+    {SETUP_KIND_READ, 0x0015, NULL, 0, "probe read fw_rev 0x0015"},
+    {SETUP_KIND_READ, 0x0017, NULL, 0, "probe read PnP 0x0017"},
     // Apple custom service reads — six read-only characteristics whose
     // contents Phase 1 never inspected. Reading them may also be part of
     // Apple's claim handshake.
-    {SETUP_KIND_READ,  0x001a, NULL, 0, "probe read Apple 0x001a"},
-    {SETUP_KIND_READ,  0x001c, NULL, 0, "probe read Apple 0x001c"},
-    {SETUP_KIND_READ,  0x001e, NULL, 0, "probe read Apple 0x001e"},
-    {SETUP_KIND_READ,  0x0020, NULL, 0, "probe read Apple 0x0020"},
-    {SETUP_KIND_READ,  0x0022, NULL, 0, "probe read Apple 0x0022"},
-    {SETUP_KIND_READ,  0x0024, NULL, 0, "probe read Apple 0x0024"},
+    {SETUP_KIND_READ, 0x001a, NULL, 0, "probe read Apple 0x001a"},
+    {SETUP_KIND_READ, 0x001c, NULL, 0, "probe read Apple 0x001c"},
+    {SETUP_KIND_READ, 0x001e, NULL, 0, "probe read Apple 0x001e"},
+    {SETUP_KIND_READ, 0x0020, NULL, 0, "probe read Apple 0x0020"},
+    {SETUP_KIND_READ, 0x0022, NULL, 0, "probe read Apple 0x0022"},
+    {SETUP_KIND_READ, 0x0024, NULL, 0, "probe read Apple 0x0024"},
     // Bond Management feature read.
-    {SETUP_KIND_READ,  0x0028, NULL, 0, "probe read BondMgmt feat 0x0028"},
+    {SETUP_KIND_READ, 0x0028, NULL, 0, "probe read BondMgmt feat 0x0028"},
 #endif
 };
 #define SETUP_STEP_COUNT (sizeof(SETUP_STEPS) / sizeof(SETUP_STEPS[0]))
 
 static uint16_t s_setup_step_conn;
-static size_t   s_setup_step_idx;
+static size_t s_setup_step_idx;
 
 static int on_setup_step_done(uint16_t conn_handle, const struct ble_gatt_error *error,
                               struct ble_gatt_attr *attr, void *arg);
@@ -468,12 +470,10 @@ static void issue_setup_step(size_t idx)
     const setup_step_t *step = &SETUP_STEPS[idx];
     int rc;
     if (step->kind == SETUP_KIND_WRITE) {
-        rc = ble_gattc_write_flat(s_setup_step_conn, step->handle,
-                                  step->value, step->len,
+        rc = ble_gattc_write_flat(s_setup_step_conn, step->handle, step->value, step->len,
                                   on_setup_step_done, (void *)step);
     } else {
-        rc = ble_gattc_read(s_setup_step_conn, step->handle,
-                            on_setup_step_done, (void *)step);
+        rc = ble_gattc_read(s_setup_step_conn, step->handle, on_setup_step_done, (void *)step);
     }
     if (rc != 0) {
         ESP_LOGE(TAG, "%s: queue failed: rc=%d", step->label, rc);
@@ -489,8 +489,8 @@ static int on_setup_step_done(uint16_t conn_handle, const struct ble_gatt_error 
     const setup_step_t *step = arg;
     WAKE_PROBE_LOG("setup step '%s' done status=0x%x", step->label, error->status);
     if (error->status != 0) {
-        ESP_LOGE(TAG, "%s failed: status=0x%x att_handle=0x%04x",
-                 step->label, error->status, error->att_handle);
+        ESP_LOGE(TAG, "%s failed: status=0x%x att_handle=0x%04x", step->label, error->status,
+                 error->att_handle);
     } else if (step->kind == SETUP_KIND_READ && attr != NULL && attr->om != NULL) {
         uint16_t len = OS_MBUF_PKTLEN(attr->om);
         uint8_t buf[64];
@@ -506,19 +506,18 @@ static int on_setup_step_done(uint16_t conn_handle, const struct ble_gatt_error 
                 snprintf(&hex[i * 3], 4, "%02x ", buf[i]);
             }
             hex[n * 3] = '\0';
-            ESP_LOGI(TAG, "%s ok (handle=0x%04x len=%u) %s",
-                     step->label, attr->handle, (unsigned)copied, hex);
+            ESP_LOGI(TAG, "%s ok (handle=0x%04x len=%u) %s", step->label, attr->handle,
+                     (unsigned)copied, hex);
 #else
-            ESP_LOGI(TAG, "%s ok (handle=0x%04x len=%u)",
-                     step->label, attr->handle, (unsigned)copied);
+            ESP_LOGI(TAG, "%s ok (handle=0x%04x len=%u)", step->label, attr->handle,
+                     (unsigned)copied);
 #endif
             if (s_cfg.on_notify != NULL) {
                 s_cfg.on_notify(attr->handle, buf, copied, s_cfg.user);
             }
         }
     } else {
-        ESP_LOGI(TAG, "%s ok (handle=0x%04x)",
-                 step->label, attr != NULL ? attr->handle : 0);
+        ESP_LOGI(TAG, "%s ok (handle=0x%04x)", step->label, attr != NULL ? attr->handle : 0);
     }
     s_setup_step_idx++;
     issue_setup_step(s_setup_step_idx);
@@ -544,7 +543,7 @@ static void apply_remote_setup(uint16_t conn_handle)
     }
     s_setup_done_conn = conn_handle;
     s_setup_step_conn = conn_handle;
-    s_setup_step_idx  = 0;
+    s_setup_step_idx = 0;
     issue_setup_step(0);
 }
 
@@ -568,7 +567,7 @@ static void complete_setup_chain(uint16_t conn_handle, uint32_t idle_ms)
 // Returns NULL on pass; otherwise a static string describing the failed check.
 static const char *fingerprint_check(const struct peer *peer)
 {
-    const ble_uuid16_t hid_svc_uuid    = BLE_UUID16_INIT(HID_SVC_UUID16);
+    const ble_uuid16_t hid_svc_uuid = BLE_UUID16_INIT(HID_SVC_UUID16);
     const ble_uuid16_t hid_report_uuid = BLE_UUID16_INIT(HID_REPORT_UUID16);
 
     const struct peer_svc *hid = peer_svc_find_uuid(peer, &hid_svc_uuid.u);
@@ -579,7 +578,8 @@ static const char *fingerprint_check(const struct peer *peer)
     int report_notify_count = 0;
     bool button_handle_present = false;
     const struct peer_chr *chr;
-    SLIST_FOREACH(chr, &hid->chrs, next) {
+    SLIST_FOREACH(chr, &hid->chrs, next)
+    {
         if (ble_uuid_cmp(&chr->chr.uuid.u, &hid_report_uuid.u) != 0) {
             continue;
         }
@@ -608,8 +608,7 @@ static void on_fingerprint_disc_complete(const struct peer *peer, int status, vo
     uint16_t conn = peer->conn_handle;
 
     if (status != 0) {
-        ESP_LOGW(TAG, "fingerprint: peer_disc_all failed status=%d — rejecting candidate",
-                 status);
+        ESP_LOGW(TAG, "fingerprint: peer_disc_all failed status=%d — rejecting candidate", status);
         goto reject;
     }
 
@@ -621,8 +620,8 @@ static void on_fingerprint_disc_complete(const struct peer *peer, int status, vo
 
     ESP_LOGI(TAG, "fingerprint PASS — gen-3 Siri Remote confirmed, proceeding with setup");
     if (s_pending_candidate_set) {
-        s_bonded_peer       = s_pending_candidate;
-        s_have_bonded_peer  = true;
+        s_bonded_peer = s_pending_candidate;
+        s_have_bonded_peer = true;
         s_pending_candidate_set = false;
     }
     if (s_discovery_window_timer != NULL) {
@@ -691,22 +690,23 @@ static void on_probe_disc_complete(const struct peer *peer, int status, void *ar
     }
     ESP_LOGI(TAG, "wake_probe: GATT layout (conn=%d):", peer->conn_handle);
     const struct peer_svc *svc;
-    SLIST_FOREACH(svc, &peer->svcs, next) {
+    SLIST_FOREACH(svc, &peer->svcs, next)
+    {
         char uuid_buf[BLE_UUID_STR_LEN];
         ble_uuid_to_str(&svc->svc.uuid.u, uuid_buf);
-        ESP_LOGI(TAG, "  svc %s handles=0x%04x..0x%04x",
-                 uuid_buf, svc->svc.start_handle, svc->svc.end_handle);
+        ESP_LOGI(TAG, "  svc %s handles=0x%04x..0x%04x", uuid_buf, svc->svc.start_handle,
+                 svc->svc.end_handle);
         const struct peer_chr *chr;
-        SLIST_FOREACH(chr, &svc->chrs, next) {
+        SLIST_FOREACH(chr, &svc->chrs, next)
+        {
             ble_uuid_to_str(&chr->chr.uuid.u, uuid_buf);
-            ESP_LOGI(TAG, "    chr %s def=0x%04x val=0x%04x props=0x%02x",
-                     uuid_buf, chr->chr.def_handle, chr->chr.val_handle,
-                     chr->chr.properties);
+            ESP_LOGI(TAG, "    chr %s def=0x%04x val=0x%04x props=0x%02x", uuid_buf,
+                     chr->chr.def_handle, chr->chr.val_handle, chr->chr.properties);
             const struct peer_dsc *dsc;
-            SLIST_FOREACH(dsc, &chr->dscs, next) {
+            SLIST_FOREACH(dsc, &chr->dscs, next)
+            {
                 ble_uuid_to_str(&dsc->dsc.uuid.u, uuid_buf);
-                ESP_LOGI(TAG, "      dsc %s handle=0x%04x",
-                         uuid_buf, dsc->dsc.handle);
+                ESP_LOGI(TAG, "      dsc %s handle=0x%04x", uuid_buf, dsc->dsc.handle);
             }
         }
     }
@@ -717,23 +717,23 @@ static void on_probe_disc_complete(const struct peer *peer, int status, void *ar
         return;
     }
     const struct peer_chr *chr;
-    SLIST_FOREACH(chr, &apple->chrs, next) {
+    SLIST_FOREACH(chr, &apple->chrs, next)
+    {
         if (!(chr->chr.properties & BLE_GATT_CHR_PROP_NOTIFY)) {
             continue;
         }
         const struct peer_dsc *dsc;
-        SLIST_FOREACH(dsc, &chr->dscs, next) {
+        SLIST_FOREACH(dsc, &chr->dscs, next)
+        {
             if (ble_uuid_u16(&dsc->dsc.uuid.u) != BLE_GATT_DSC_CLT_CFG_UUID16) {
                 continue;
             }
             ESP_LOGI(TAG, "wake_probe: subscribing Apple-svc CCCD 0x%04x (val=0x%04x)",
                      dsc->dsc.handle, chr->chr.val_handle);
-            int rc = ble_gattc_write_flat(peer->conn_handle, dsc->dsc.handle,
-                                          ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY),
-                                          NULL, NULL);
+            int rc = ble_gattc_write_flat(peer->conn_handle, dsc->dsc.handle, ENABLE_NOTIFY,
+                                          sizeof(ENABLE_NOTIFY), NULL, NULL);
             if (rc != 0) {
-                ESP_LOGW(TAG, "wake_probe: CCCD 0x%04x write failed rc=%d",
-                         dsc->dsc.handle, rc);
+                ESP_LOGW(TAG, "wake_probe: CCCD 0x%04x write failed rc=%d", dsc->dsc.handle, rc);
             }
             break;
         }
@@ -776,8 +776,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
             return 0;
         }
         struct ble_hs_adv_fields fields;
-        if (ble_hs_adv_parse_fields(&fields, event->disc.data,
-                                    event->disc.length_data) != 0) {
+        if (ble_hs_adv_parse_fields(&fields, event->disc.data, event->disc.length_data) != 0) {
             return 0;  // malformed adv
         }
         try_connect_candidate(&event->disc, &fields);
@@ -788,8 +787,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         if (event->connect.status != 0) {
             ESP_LOGE(TAG, "connect failed: status=%d", event->connect.status);
             if (s_mode == MODE_DISCOVERING && s_pending_candidate_set) {
-                blacklist_add(s_pending_candidate.val,
-                              BLACKLIST_TTL_FAILED_CONNECT_MS);
+                blacklist_add(s_pending_candidate.val, BLACKLIST_TTL_FAILED_CONNECT_MS);
             }
             s_pending_candidate_set = false;
             if (s_mode == MODE_BONDED_RECONNECT) {
@@ -829,27 +827,23 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_CONN_UPDATE: {
         struct ble_gap_conn_desc desc;
         if (ble_gap_conn_find(event->conn_update.conn_handle, &desc) == 0) {
-            WAKE_PROBE_LOG("CONN_UPDATE status=%d itvl=%u lat=%u sup=%u",
-                           event->conn_update.status,
-                           desc.conn_itvl, desc.conn_latency,
-                           desc.supervision_timeout);
+            WAKE_PROBE_LOG("CONN_UPDATE status=%d itvl=%u lat=%u sup=%u", event->conn_update.status,
+                           desc.conn_itvl, desc.conn_latency, desc.supervision_timeout);
         } else {
-            WAKE_PROBE_LOG("CONN_UPDATE status=%d (conn_find failed)",
-                           event->conn_update.status);
+            WAKE_PROBE_LOG("CONN_UPDATE status=%d (conn_find failed)", event->conn_update.status);
         }
         return 0;
     }
 
     case BLE_GAP_EVENT_DISCONNECT: {
         bool failed_pre_fingerprint =
-            (s_mode == MODE_DISCOVERING && s_pending_candidate_set &&
-             s_setup_done_conn == 0xFFFF);
+            (s_mode == MODE_DISCOVERING && s_pending_candidate_set && s_setup_done_conn == 0xFFFF);
         ESP_LOGI(TAG, "disconnected, reason=0x%04x", event->disconnect.reason);
         peer_delete(event->disconnect.conn.conn_handle);
         s_last_disconnect_ms = now_ms();
-        s_has_disconnected   = true;
-        s_setup_done_conn    = 0xFFFF;
-        s_active_conn        = 0xFFFF;
+        s_has_disconnected = true;
+        s_setup_done_conn = 0xFFFF;
+        s_active_conn = 0xFFFF;
         if (s_pending_setup_conn != 0xFFFF) {
             (void)esp_timer_stop(s_setup_fallback_timer);
             s_pending_setup_conn = 0xFFFF;
@@ -860,11 +854,11 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
             // until the user puts the remote in pairing mode (Back+VolUp).
             // Short blacklist breaks the retry loop while still recovering
             // quickly when the user does press the combo.
-            ESP_LOGI(TAG, "candidate failed pre-fingerprint — blacklisting %d s, "
-                          "hold Back+VolUp ~5s on the remote to pair",
+            ESP_LOGI(TAG,
+                     "candidate failed pre-fingerprint — blacklisting %d s, "
+                     "hold Back+VolUp ~5s on the remote to pair",
                      BLACKLIST_TTL_FAILED_CONNECT_MS / 1000);
-            blacklist_add(s_pending_candidate.val,
-                          BLACKLIST_TTL_FAILED_CONNECT_MS);
+            blacklist_add(s_pending_candidate.val, BLACKLIST_TTL_FAILED_CONNECT_MS);
         }
         if (s_cfg.on_disconnected != NULL) {
             s_cfg.on_disconnected(s_cfg.user);
@@ -911,11 +905,10 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         }
 #endif
         ESP_LOGI(TAG, "encryption changed, status=%d", event->enc_change.status);
-        WAKE_PROBE_LOG("ENC_CHANGE status=%d %s",
-                       event->enc_change.status,
-                       s_setup_done_conn == event->enc_change.conn_handle ? "(post-setup)"
+        WAKE_PROBE_LOG("ENC_CHANGE status=%d %s", event->enc_change.status,
+                       s_setup_done_conn == event->enc_change.conn_handle      ? "(post-setup)"
                        : s_pending_setup_conn == event->enc_change.conn_handle ? "(secondary)"
-                       : "(initial)");
+                                                                               : "(initial)");
         if (event->enc_change.status != 0) {
             return 0;
         }
@@ -943,7 +936,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
                 // gate the buffered-button suppression window.
                 idle = now_ms();
             }
-            s_pending_setup_conn    = conn;
+            s_pending_setup_conn = conn;
             s_pending_setup_idle_ms = idle;
             (void)esp_timer_start_once(s_setup_fallback_timer,
                                        (uint64_t)ENC_CHANGE_FALLBACK_MS * 1000);
@@ -998,8 +991,8 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
             }
             hex[n * 3] = '\0';
             ESP_LOGI(TAG, "notify t=%lums h=0x%04x len=%u %s",
-                     (unsigned long)(now_ms() - s_connect_ms),
-                     event->notify_rx.attr_handle, copied, hex);
+                     (unsigned long)(now_ms() - s_connect_ms), event->notify_rx.attr_handle, copied,
+                     hex);
         }
 #endif
         if (s_cfg.on_notify != NULL) {
@@ -1041,7 +1034,7 @@ void siri_ble_repair(void)
     if (rc != 0) {
         ESP_LOGW(TAG, "ble_store_clear rc=%d", rc);
     }
-    s_have_bonded_peer      = false;
+    s_have_bonded_peer = false;
     s_pending_candidate_set = false;
     blacklist_clear();
 
@@ -1074,15 +1067,17 @@ void siri_ble_set_slave_latency(uint16_t latency)
     // field's safe upper bound (1500 = 15 s; longer means runaway-detection
     // delay > 15 s which is already the high end of acceptable).
     uint32_t numerator = (uint32_t)(1 + latency) * s_low_power_conn_params.itvl_max * 25;
-    uint32_t timeout   = (numerator + 79) / 80;  // ceil(numerator / 80)
-    if (timeout < 100) timeout = 100;            // 1 s floor
-    if (timeout > 1500) timeout = 1500;          // 15 s ceiling
+    uint32_t timeout = (numerator + 79) / 80;  // ceil(numerator / 80)
+    if (timeout < 100)
+        timeout = 100;  // 1 s floor
+    if (timeout > 1500)
+        timeout = 1500;  // 15 s ceiling
 
-    s_low_power_conn_params.latency             = latency;
+    s_low_power_conn_params.latency = latency;
     s_low_power_conn_params.supervision_timeout = (uint16_t)timeout;
 
-    ESP_LOGI(TAG, "slave_latency=%u sup_timeout=%lu (= %lu ms)",
-             latency, (unsigned long)timeout, (unsigned long)timeout * 10);
+    ESP_LOGI(TAG, "slave_latency=%u sup_timeout=%lu (= %lu ms)", latency, (unsigned long)timeout,
+             (unsigned long)timeout * 10);
 
     if (s_setup_done_conn != 0xFFFF) {
         int rc = ble_gap_update_params(s_setup_done_conn, &s_low_power_conn_params);
@@ -1116,9 +1111,8 @@ static void on_sync(void)
     // resolvable random adv automatically. If the store is empty (first boot
     // or post-repair), enter the 5-minute discovery window.
     ble_addr_t peer_id_addrs[CONFIG_BT_NIMBLE_MAX_BONDS];
-    int        num_bonded = 0;
-    int rc = ble_store_util_bonded_peers(peer_id_addrs, &num_bonded,
-                                          CONFIG_BT_NIMBLE_MAX_BONDS);
+    int num_bonded = 0;
+    int rc = ble_store_util_bonded_peers(peer_id_addrs, &num_bonded, CONFIG_BT_NIMBLE_MAX_BONDS);
     if (rc != 0) {
         ESP_LOGW(TAG, "ble_store_util_bonded_peers rc=%d; entering discovery", rc);
         num_bonded = 0;
@@ -1127,13 +1121,13 @@ static void on_sync(void)
     (void)ble_store_util_count(BLE_STORE_OBJ_TYPE_OUR_SEC, &our_count);
     int cccd_count = 0;
     (void)ble_store_util_count(BLE_STORE_OBJ_TYPE_CCCD, &cccd_count);
-    ESP_LOGI(TAG, "bond store: %d peer-sec / %d our-sec / %d CCCD record(s)",
-             num_bonded, our_count, cccd_count);
+    ESP_LOGI(TAG, "bond store: %d peer-sec / %d our-sec / %d CCCD record(s)", num_bonded, our_count,
+             cccd_count);
 
     if (num_bonded > 0) {
         // Use the first bonded peer. We never expect more than one — the
         // bridge bonds to exactly one remote — but tolerate the array form.
-        s_bonded_peer      = peer_id_addrs[0];
+        s_bonded_peer = peer_id_addrs[0];
         s_have_bonded_peer = true;
         start_bonded_reconnect();
     } else {
@@ -1149,15 +1143,15 @@ esp_err_t siri_ble_start(const siri_ble_config_t *cfg)
     }
     s_cfg = *cfg;
 
-    ble_hs_cfg.sm_io_cap         = BLE_HS_IO_NO_INPUT_OUTPUT;
-    ble_hs_cfg.sm_bonding        = 1;
-    ble_hs_cfg.sm_sc             = 1;
-    ble_hs_cfg.sm_mitm           = 0;
-    ble_hs_cfg.sm_our_key_dist   = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+    ble_hs_cfg.sm_io_cap = BLE_HS_IO_NO_INPUT_OUTPUT;
+    ble_hs_cfg.sm_bonding = 1;
+    ble_hs_cfg.sm_sc = 1;
+    ble_hs_cfg.sm_mitm = 0;
+    ble_hs_cfg.sm_our_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
     ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
-    ble_hs_cfg.store_status_cb   = ble_store_util_status_rr;
+    ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
 
-    ble_hs_cfg.sync_cb  = on_sync;
+    ble_hs_cfg.sync_cb = on_sync;
     ble_hs_cfg.reset_cb = on_reset;
 
     // Register the standard GAP (0x1800) and GATT (0x1801) services so Apple's
@@ -1178,7 +1172,7 @@ esp_err_t siri_ble_start(const siri_ble_config_t *cfg)
 
     const esp_timer_create_args_t setup_timer_args = {
         .callback = setup_fallback_cb,
-        .name     = "siri_setup_fallback",
+        .name = "siri_setup_fallback",
     };
     if (esp_timer_create(&setup_timer_args, &s_setup_fallback_timer) != ESP_OK) {
         ESP_LOGE(TAG, "esp_timer_create (setup_fallback) failed");
@@ -1186,7 +1180,7 @@ esp_err_t siri_ble_start(const siri_ble_config_t *cfg)
     }
     const esp_timer_create_args_t window_timer_args = {
         .callback = discovery_window_expired_cb,
-        .name     = "siri_disc_window",
+        .name = "siri_disc_window",
     };
     if (esp_timer_create(&window_timer_args, &s_discovery_window_timer) != ESP_OK) {
         ESP_LOGE(TAG, "esp_timer_create (discovery_window) failed");

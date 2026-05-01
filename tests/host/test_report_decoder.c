@@ -74,8 +74,7 @@ static void test_decode_touch_frame_valid(void)
 {
     // First frame of the captured swipe_up fixture:
     // 32 f2 76 01 51 de c0 51 1e 06 eb
-    uint8_t frame[11] = {
-        0x32, 0xf2, 0x76, 0x01, 0x51, 0xde, 0xc0, 0x51, 0x1e, 0x06, 0xeb};
+    uint8_t frame[11] = {0x32, 0xf2, 0x76, 0x01, 0x51, 0xde, 0xc0, 0x51, 0x1e, 0x06, 0xeb};
     siri_touch_frame_t t;
     assert(siri_decode_touch_frame(frame, 11, &t));
     // X is signed 11-bit. Raw = 0x51 | ((0xde & 0x07) << 8) = 81 | (6<<8) = 1617.
@@ -93,8 +92,7 @@ static void test_decode_touch_frame_valid(void)
 static void test_decode_touch_frame_finger_up(void)
 {
     // Last frame of swipe_up fixture: 32 ae 7a 00 f6 1e 0a 00 00 00 e8
-    uint8_t frame[11] = {
-        0x32, 0xae, 0x7a, 0x00, 0xf6, 0x1e, 0x0a, 0x00, 0x00, 0x00, 0xe8};
+    uint8_t frame[11] = {0x32, 0xae, 0x7a, 0x00, 0xf6, 0x1e, 0x0a, 0x00, 0x00, 0x00, 0xe8};
     siri_touch_frame_t t;
     assert(siri_decode_touch_frame(frame, 11, &t));
     assert(t.y == 10);

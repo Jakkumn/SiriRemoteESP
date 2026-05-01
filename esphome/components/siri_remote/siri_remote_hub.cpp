@@ -184,7 +184,13 @@ void SiriRemoteHub::start_audio_() {
   audio_cfg.user = this;
   esp_err_t rc = siri_audio_start(&audio_cfg);
   if (rc != ESP_OK) {
+    // No decoder + no decode task = no PCM ever, but BLE notify on the
+    // audio CCCD would still happily drive siri_audio_dispatch_packet,
+    // and a Mic press would still kick voice_assistant.start. Disable
+    // voice and mark the component failed so the user sees it.
     ESP_LOGE(TAG, "siri_audio_start failed: %s", esp_err_to_name(rc));
+    voice_enabled_ = false;
+    this->mark_failed();
   }
 }
 
@@ -251,9 +257,7 @@ void SiriRemoteHub::on_ble_notify(uint16_t attr_handle, const uint8_t *data,
             siri_audio_session_end();
           }
         }
-        if (voice_active_sensor_ != nullptr) {
-          this->defer([this, mic_now] { voice_active_sensor_->publish_state(mic_now); });
-        }
+        this->defer_publish_(voice_active_sensor_, mic_now);
         // Direct trigger when the user opted in via voice_assistant_id:
         // skips the binary_sensor → on_press automation hop (~5–15 ms).
         // Still defers because voice_assistant entity APIs are loop-task only.
@@ -283,9 +287,7 @@ void SiriRemoteHub::on_ble_notify(uint16_t attr_handle, const uint8_t *data,
         if (lvl == last_battery_pct_) return;
         last_battery_pct_ = lvl;
         ESP_LOGI(TAG, "battery=%u%%", (unsigned) lvl);
-        if (battery_sensor_ != nullptr) {
-          this->defer([this, lvl] { battery_sensor_->publish_state(lvl); });
-        }
+        this->defer_publish_(battery_sensor_, static_cast<float>(lvl));
       }
       return;
 
@@ -296,9 +298,7 @@ void SiriRemoteHub::on_ble_notify(uint16_t attr_handle, const uint8_t *data,
         last_charging_byte_ = b;
         const char *s = siri_decode_charging_state(b);
         ESP_LOGI(TAG, "charging state=0x%02x => %s", b, s);
-        if (charging_text_sensor_ != nullptr) {
-          this->defer([this, s] { charging_text_sensor_->publish_state(s); });
-        }
+        this->defer_publish_(charging_text_sensor_, std::string(s));
       }
       return;
 

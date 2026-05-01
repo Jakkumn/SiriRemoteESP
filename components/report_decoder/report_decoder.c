@@ -32,30 +32,41 @@ bool siri_decode_touch_frame(const uint8_t *data, size_t len, siri_touch_frame_t
     // Y is a signed 8-bit value. Positive = upward on the touchpad.
     out->y = (int32_t)(int8_t)data[6];
     // Bytes 7-8 go to zero when the finger lifts.
-    out->finger_down    = !(data[7] == 0 && data[8] == 0);
-    out->pressure       = data[9];
-    out->remote_counter = (uint32_t)data[1]
-                        | ((uint32_t)data[2] << 8)
-                        | ((uint32_t)data[3] << 16);
+    out->finger_down = !(data[7] == 0 && data[8] == 0);
+    out->pressure = data[9];
+    out->remote_counter = (uint32_t)data[1] | ((uint32_t)data[2] << 8) | ((uint32_t)data[3] << 16);
     return true;
 }
 
 const char *siri_button_name(siri_button_bit_t bit)
 {
     switch (bit) {
-    case SIRI_BTN_TV:         return "tv";
-    case SIRI_BTN_VOL_UP:     return "volume_up";
-    case SIRI_BTN_VOL_DOWN:   return "volume_down";
-    case SIRI_BTN_SELECT:     return "select";
-    case SIRI_BTN_POWER:      return "power";
-    case SIRI_BTN_MIC:        return "mic";
-    case SIRI_BTN_BACK:       return "back";
-    case SIRI_BTN_MUTE:       return "mute";
-    case SIRI_BTN_PLAY_PAUSE: return "play_pause";
-    case SIRI_BTN_UP:         return "up";
-    case SIRI_BTN_RIGHT:      return "right";
-    case SIRI_BTN_DOWN:       return "down";
-    case SIRI_BTN_LEFT:       return "left";
+    case SIRI_BTN_TV:
+        return "tv";
+    case SIRI_BTN_VOL_UP:
+        return "volume_up";
+    case SIRI_BTN_VOL_DOWN:
+        return "volume_down";
+    case SIRI_BTN_SELECT:
+        return "select";
+    case SIRI_BTN_POWER:
+        return "power";
+    case SIRI_BTN_MIC:
+        return "mic";
+    case SIRI_BTN_BACK:
+        return "back";
+    case SIRI_BTN_MUTE:
+        return "mute";
+    case SIRI_BTN_PLAY_PAUSE:
+        return "play_pause";
+    case SIRI_BTN_UP:
+        return "up";
+    case SIRI_BTN_RIGHT:
+        return "right";
+    case SIRI_BTN_DOWN:
+        return "down";
+    case SIRI_BTN_LEFT:
+        return "left";
     }
     return NULL;
 }
@@ -63,8 +74,10 @@ const char *siri_button_name(siri_button_bit_t bit)
 const char *siri_decode_charging_state(uint8_t state_byte)
 {
     uint8_t discharging = (state_byte >> 2) & 0x03;
-    uint8_t charging    = (state_byte >> 4) & 0x03;
-    if (charging == 3)    return "charging";
-    if (discharging == 3) return "discharging";
+    uint8_t charging = (state_byte >> 4) & 0x03;
+    if (charging == 3)
+        return "charging";
+    if (discharging == 3)
+        return "discharging";
     return "plugged_in";
 }

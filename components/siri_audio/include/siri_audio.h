@@ -31,6 +31,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "siri_audio_validate.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -38,7 +39,7 @@ extern "C" {
 
 // 16 kHz × 20 ms = 320 samples per Opus frame for Siri Remote audio.
 #define SIRI_AUDIO_FRAME_SAMPLES 320
-#define SIRI_AUDIO_SAMPLE_RATE   16000
+#define SIRI_AUDIO_SAMPLE_RATE 16000
 
 // PCM frame callback. `samples` is a buffer of `count` 16-bit signed PCM
 // samples (mono, 16 kHz). Buffer is reused on the next decoded frame —
@@ -52,10 +53,10 @@ typedef void (*siri_audio_pcm_cb_t)(const int16_t *samples, size_t count, void *
 typedef void (*siri_audio_session_cb_t)(void *user);
 
 typedef struct {
-    siri_audio_pcm_cb_t     on_pcm;
+    siri_audio_pcm_cb_t on_pcm;
     siri_audio_session_cb_t on_session_start;  // optional
     siri_audio_session_cb_t on_session_end;    // optional
-    void                   *user;
+    void *user;
 } siri_audio_config_t;
 
 // Allocate decoder + queue + decode task. Call once at boot, after PSRAM

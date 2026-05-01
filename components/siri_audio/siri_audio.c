@@ -14,38 +14,25 @@
 
 static const char *TAG = "siri_audio";
 
-// Gen-3 audio packet: 99 bytes total. First 5 bytes are application header
-// (timestamp + 16-bit LE per-session counter + Opus packet length), then the
-// Opus packet itself starts at byte 5 — the constant 0xB8 first byte is NOT
-// a separator, it's the Opus TOC byte (config 23 = CELT WB 16 kHz 20 ms,
-// mono, code 0), so it MUST be passed to opus_decode() as part of the frame.
-//
-// data[4]                  : total Opus packet length (TOC + payload)
-// data[5]                  : Opus TOC byte (constant 0xB8 for gen-3)
-// data[5..(5+data[4]-1)]   : full Opus packet, fed to opus_decode() verbatim
-// data[(5+data[4])..98]    : padding / leftover bytes from previous packet
-//
-// See memory/project_gen3_protocol.md for the verified layout.
-#define SIRI_AUDIO_PACKET_BYTES   99
-#define SIRI_AUDIO_HEADER_BYTES   5    // application header before the Opus packet
-#define SIRI_AUDIO_OPUS_TOC       0xB8 // gen-3 always: CELT WB 20 ms mono single-frame
-#define SIRI_AUDIO_LEN_OFFSET     4
-#define SIRI_AUDIO_FRAME_OFFSET   5    // Opus packet starts AT the TOC byte
+// Packet layout constants + siri_audio_validate_packet() live in
+// siri_audio.h + siri_audio_validate.c so the host test harness can link
+// the validator without pulling in opus / FreeRTOS / esp-log.
 
 // Queue depth: 2 seconds of 50 Hz audio. Long enough to ride out a brief
 // scheduling stall or Wi-Fi storm; short enough that under sustained
 // overrun we drop frames promptly rather than building unbounded latency.
-#define SIRI_AUDIO_QUEUE_DEPTH    100
+#define SIRI_AUDIO_QUEUE_DEPTH 100
 
 // Decode task pinned to CPU1 (Wi-Fi + BLE controller default to CPU0).
 // Priority 5: above idle (0) and the IDF event loop (~3), well below
 // NimBLE host task (~7) so we never starve BLE.
-#define DECODE_TASK_PRIORITY      5
-#define DECODE_TASK_CORE          1
-#define DECODE_TASK_STACK         8192  // bumped above default 4 KB; Opus
-                                        // VLAs land on the pseudostack
-                                        // (micro-opus), but the task itself
-                                        // does logging + callbacks.
+#define DECODE_TASK_PRIORITY 5
+#define DECODE_TASK_CORE 1
+#define DECODE_TASK_STACK                                                                          \
+    8192  // bumped above default 4 KB; Opus
+          // VLAs land on the pseudostack
+          // (micro-opus), but the task itself
+          // does logging + callbacks.
 
 typedef struct {
     uint8_t bytes[SIRI_AUDIO_PACKET_BYTES];
@@ -53,10 +40,10 @@ typedef struct {
 } audio_packet_t;
 
 static siri_audio_config_t s_cfg;
-static OpusDecoder        *s_decoder;
-static QueueHandle_t       s_queue;
-static TaskHandle_t        s_decode_task;
-static volatile bool       s_session_active;
+static OpusDecoder *s_decoder;
+static QueueHandle_t s_queue;
+static TaskHandle_t s_decode_task;
+static volatile bool s_session_active;
 
 // --- Decoder lifecycle ----------------------------------------------------
 
@@ -81,8 +68,7 @@ static esp_err_t allocate_decoder(void)
         s_decoder = NULL;
         return ESP_FAIL;
     }
-    ESP_LOGI(TAG, "OpusDecoder ready: %d bytes in PSRAM, %d Hz mono",
-             size, SIRI_AUDIO_SAMPLE_RATE);
+    ESP_LOGI(TAG, "OpusDecoder ready: %d bytes in PSRAM, %d Hz mono", size, SIRI_AUDIO_SAMPLE_RATE);
     return ESP_OK;
 }
 
@@ -102,7 +88,8 @@ static uint16_t frame_rms(const int16_t *samples, size_t count)
     // sqrt via Newton's method bounded for uint16 range.
     uint32_t x = 256;
     for (int i = 0; i < 8; i++) {
-        if (x == 0) break;
+        if (x == 0)
+            break;
         x = (x + (uint32_t)(mean / x)) / 2;
     }
     return x > UINT16_MAX ? UINT16_MAX : (uint16_t)x;
@@ -113,49 +100,44 @@ static uint16_t frame_rms(const int16_t *samples, size_t count)
 static void decode_task(void *arg)
 {
     (void)arg;
-    int16_t       pcm[SIRI_AUDIO_FRAME_SAMPLES];
+    int16_t pcm[SIRI_AUDIO_FRAME_SAMPLES];
     audio_packet_t pkt;
-    uint32_t       frame_idx = 0;
-    uint32_t       err_count = 0;
+    uint32_t frame_idx = 0;
+    uint32_t err_count = 0;
 
     while (1) {
         if (xQueueReceive(s_queue, &pkt, portMAX_DELAY) != pdTRUE) {
             continue;
         }
-        if (pkt.len < SIRI_AUDIO_HEADER_BYTES + 1) {
-            continue;  // shouldn't happen — dispatch path validates
-        }
-
-        uint8_t opus_pkt_len = pkt.bytes[SIRI_AUDIO_LEN_OFFSET];
-        if (pkt.bytes[SIRI_AUDIO_FRAME_OFFSET] != SIRI_AUDIO_OPUS_TOC ||
-            opus_pkt_len < 1 ||
-            (size_t)(SIRI_AUDIO_FRAME_OFFSET + opus_pkt_len) > pkt.len) {
-            ESP_LOGW(TAG, "decoder: malformed packet (toc=0x%02x len=%u)",
-                     pkt.bytes[SIRI_AUDIO_FRAME_OFFSET], opus_pkt_len);
+        uint8_t opus_pkt_len = 0;
+        if (!siri_audio_validate_packet(pkt.bytes, pkt.len, &opus_pkt_len)) {
+            // Shouldn't happen — dispatch path already validated. Log
+            // for visibility into a previously-unseen packet shape.
+            ESP_LOGW(TAG, "decoder: malformed packet (len=%u)", pkt.len);
             continue;
         }
         // Opus packet INCLUDES the TOC byte at offset 5. Don't strip it —
         // opus_decode needs it to know the config (sample rate, frame
         // duration, channel layout).
-        const uint8_t *frame   = &pkt.bytes[SIRI_AUDIO_FRAME_OFFSET];
-        int            frame_n = (int)opus_pkt_len;
+        const uint8_t *frame = &pkt.bytes[SIRI_AUDIO_FRAME_OFFSET];
+        int frame_n = (int)opus_pkt_len;
 
-        int samples = opus_decode(s_decoder, frame, frame_n,
-                                  pcm, SIRI_AUDIO_FRAME_SAMPLES, /*decode_fec*/ 0);
+        int samples =
+            opus_decode(s_decoder, frame, frame_n, pcm, SIRI_AUDIO_FRAME_SAMPLES, /*decode_fec*/ 0);
         if (samples < 0) {
             err_count++;
             if (err_count <= 5 || (err_count % 50) == 0) {
-                ESP_LOGW(TAG, "opus_decode err=%d (%s); frame_idx=%lu err_count=%lu",
-                         samples, opus_strerror(samples),
-                         (unsigned long)frame_idx, (unsigned long)err_count);
+                ESP_LOGW(TAG, "opus_decode err=%d (%s); frame_idx=%lu err_count=%lu", samples,
+                         opus_strerror(samples), (unsigned long)frame_idx,
+                         (unsigned long)err_count);
             }
             continue;
         }
 
         // Diagnostic: log RMS energy every ~1 s (every 50 frames at 50 Hz).
         if ((frame_idx % 50) == 0) {
-            ESP_LOGI(TAG, "frame=%lu samples=%d rms=%u",
-                     (unsigned long)frame_idx, samples, frame_rms(pcm, samples));
+            ESP_LOGI(TAG, "frame=%lu samples=%d rms=%u", (unsigned long)frame_idx, samples,
+                     frame_rms(pcm, samples));
         }
 
         if (s_cfg.on_pcm != NULL) {
@@ -190,10 +172,9 @@ esp_err_t siri_audio_start(const siri_audio_config_t *cfg)
         return ESP_ERR_NO_MEM;
     }
 
-    BaseType_t ok = xTaskCreatePinnedToCore(decode_task, "siri_audio_decode",
-                                            DECODE_TASK_STACK, NULL,
-                                            DECODE_TASK_PRIORITY,
-                                            &s_decode_task, DECODE_TASK_CORE);
+    BaseType_t ok =
+        xTaskCreatePinnedToCore(decode_task, "siri_audio_decode", DECODE_TASK_STACK, NULL,
+                                DECODE_TASK_PRIORITY, &s_decode_task, DECODE_TASK_CORE);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "xTaskCreate failed");
         vQueueDelete(s_queue);
@@ -202,14 +183,15 @@ esp_err_t siri_audio_start(const siri_audio_config_t *cfg)
         s_decoder = NULL;
         return ESP_FAIL;
     }
-    ESP_LOGI(TAG, "decode task started (CPU%d, prio %d, stack %d)",
-             DECODE_TASK_CORE, DECODE_TASK_PRIORITY, DECODE_TASK_STACK);
+    ESP_LOGI(TAG, "decode task started (CPU%d, prio %d, stack %d)", DECODE_TASK_CORE,
+             DECODE_TASK_PRIORITY, DECODE_TASK_STACK);
     return ESP_OK;
 }
 
 void siri_audio_session_start(void)
 {
-    if (s_session_active) return;
+    if (s_session_active)
+        return;
     s_session_active = true;
 
     // Reset decoder state for a fresh utterance. opus_decode caches
@@ -227,14 +209,16 @@ void siri_audio_session_start(void)
 
 void siri_audio_session_end(void)
 {
-    if (!s_session_active) return;
+    if (!s_session_active)
+        return;
     s_session_active = false;
 
     // Drain any queued packets — past the end of the session, decoded
     // PCM would arrive late and confuse downstream consumers.
     if (s_queue != NULL) {
         audio_packet_t throwaway;
-        while (xQueueReceive(s_queue, &throwaway, 0) == pdTRUE) { /* drop */ }
+        while (xQueueReceive(s_queue, &throwaway, 0) == pdTRUE) { /* drop */
+        }
     }
     ESP_LOGI(TAG, "session end");
     if (s_cfg.on_session_end != NULL) {
@@ -252,12 +236,10 @@ void siri_audio_dispatch_packet(const uint8_t *data, size_t len)
     if (!s_session_active || s_queue == NULL) {
         return;  // not in a session, or not started — ignore
     }
-    if (data == NULL || len < SIRI_AUDIO_HEADER_BYTES + 1 ||
-        len > SIRI_AUDIO_PACKET_BYTES) {
-        return;  // malformed; skip silently to keep BLE host task fast
-    }
-    if (data[SIRI_AUDIO_FRAME_OFFSET] != SIRI_AUDIO_OPUS_TOC) {
-        return;  // not gen-3 audio (or different config we don't grok)
+    // Validate before copy so a wrong-shape notify (truncated, wrong TOC,
+    // bogus length) is dropped without spending memcpy + queue cycles.
+    if (!siri_audio_validate_packet(data, len, NULL)) {
+        return;
     }
 
     audio_packet_t pkt;

@@ -41,17 +41,37 @@ DEBUG_PCM_TCP_SCHEMA = cv.Schema({
     cv.Optional(CONF_PORT, default=8000): cv.port,
 })
 
-CONFIG_SCHEMA = cv.Schema({
-    cv.GenerateID(): cv.declare_id(SiriRemoteHub),
-    cv.Optional(CONF_VOICE_ENABLED, default=True): cv.boolean,
-    cv.Optional(CONF_IDLE_DISCONNECT_MS, default=0): cv.uint32_t,
-    cv.Optional(CONF_PAIRING_FLUSH_SUPPRESS_MS, default=1500): cv.uint32_t,
-    cv.Optional(CONF_DEBUG_TOUCH_FRAMES, default=False): cv.boolean,
-    cv.Optional(CONF_DEBUG_WAKE_PROBE, default=False): cv.boolean,
-    cv.Optional(CONF_DEBUG_PCM_TCP): DEBUG_PCM_TCP_SCHEMA,
-    cv.Optional(CONF_VOICE_ASSISTANT_ID): cv.use_id(voice_assistant.VoiceAssistant),
-    cv.Optional(CONF_AUTO_FINISH_RESPONSE, default=True): cv.boolean,
-}).extend(cv.COMPONENT_SCHEMA)
+def _validate(config):
+    # auto_finish_response only does anything when voice_assistant_id is
+    # also set (the codegen below is gated on it). Catch the
+    # explicitly-set-without-VA case so the user gets a clear error
+    # rather than silent no-op.
+    if (CONF_AUTO_FINISH_RESPONSE in config
+            and CONF_VOICE_ASSISTANT_ID not in config):
+        raise cv.Invalid(
+            f"{CONF_AUTO_FINISH_RESPONSE} requires {CONF_VOICE_ASSISTANT_ID} "
+            "to also be set"
+        )
+    return config
+
+
+CONFIG_SCHEMA = cv.All(
+    cv.Schema({
+        cv.GenerateID(): cv.declare_id(SiriRemoteHub),
+        cv.Optional(CONF_VOICE_ENABLED, default=True): cv.boolean,
+        cv.Optional(CONF_IDLE_DISCONNECT_MS, default=0): cv.uint32_t,
+        cv.Optional(CONF_PAIRING_FLUSH_SUPPRESS_MS, default=1500): cv.uint32_t,
+        cv.Optional(CONF_DEBUG_TOUCH_FRAMES, default=False): cv.boolean,
+        cv.Optional(CONF_DEBUG_WAKE_PROBE, default=False): cv.boolean,
+        cv.Optional(CONF_DEBUG_PCM_TCP): DEBUG_PCM_TCP_SCHEMA,
+        cv.Optional(CONF_VOICE_ASSISTANT_ID): cv.use_id(voice_assistant.VoiceAssistant),
+        # No default — the codegen treats absence as "user did not opt in".
+        # See _validate above for the auto_finish_response/voice_assistant_id
+        # interlock.
+        cv.Optional(CONF_AUTO_FINISH_RESPONSE): cv.boolean,
+    }).extend(cv.COMPONENT_SCHEMA),
+    _validate,
+)
 
 
 def _pin_sdkconfig():
@@ -138,7 +158,11 @@ async def to_code(config):
     if CONF_VOICE_ASSISTANT_ID in config:
         va = await cg.get_variable(config[CONF_VOICE_ASSISTANT_ID])
         cg.add(var.set_voice_assistant(va))
-        cg.add(var.set_auto_finish_response(config[CONF_AUTO_FINISH_RESPONSE]))
+        # auto_finish_response defaults to True when voice_assistant_id is
+        # set but auto_finish_response is omitted — matches the prior
+        # behavior. The schema validator forbids the inverse.
+        cg.add(var.set_auto_finish_response(
+            config.get(CONF_AUTO_FINISH_RESPONSE, True)))
 
     # The shared siri_ble.c uses #ifdef CONFIG_VOICE_ENABLED to gate the
     # audio CCCD subscribe and #ifdef CONFIG_DEBUG_WAKE_PROBE for probe

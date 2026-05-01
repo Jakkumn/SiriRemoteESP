@@ -24,8 +24,8 @@ typedef enum {
 typedef struct {
     uint32_t double_click_max_ms;        // 0 disables DOUBLE_CLICK; CLICK fires instantly
     uint32_t hold_min_ms;                // 0 disables HOLD_START/HOLD_END
-    int32_t  swipe_min_distance;         // minimum axis delta to count as a swipe
-    int32_t  swipe_y_priority_threshold; // |dy| >= this forces vertical classification; 0 disables
+    int32_t swipe_min_distance;          // minimum axis delta to count as a swipe
+    int32_t swipe_y_priority_threshold;  // |dy| >= this forces vertical classification; 0 disables
 } event_state_config_t;
 
 typedef struct {
@@ -42,8 +42,7 @@ typedef void (*event_state_emit_fn)(const event_state_event_t *evt, void *user);
 
 typedef struct event_state event_state_t;
 
-event_state_t *event_state_create(const event_state_config_t *cfg,
-                                  event_state_emit_fn emit,
+event_state_t *event_state_create(const event_state_config_t *cfg, event_state_emit_fn emit,
                                   void *user);
 void event_state_destroy(event_state_t *es);
 

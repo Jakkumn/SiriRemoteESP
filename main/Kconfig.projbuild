@@ -123,6 +123,21 @@ menu "Siri Bridge Configuration"
             do this kind of thresholding template-side; this knob just lets
             firmware-only setups have a sane low-battery flag.
 
+    config BLE_SLAVE_LATENCY_DEFAULT
+        int "BLE slave-latency default"
+        default 400
+        range 0 500
+        help
+            Initial BLE slave-latency value applied after the post-bond
+            setup chain completes. The remote may deep-sleep between
+            mandatory connection events for up to (latency * conn_itvl);
+            higher values save battery, lower values reduce wake-press
+            latency. Empirically 400 is the sweet spot — see Phase 3A.7
+            notes in memory/project_gen3_protocol.md.
+
+            This is the boot default; the value is also exposed at runtime
+            as the "BLE Slave Latency" Number entity, persisted in NVS.
+
     config IDLE_DISCONNECT_MS
         int "Idle BLE disconnect threshold (ms)"
         default 0

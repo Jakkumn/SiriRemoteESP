@@ -69,7 +69,11 @@ lint: ## Check C/H formatting against .clang-format
 	@command -v clang-format >/dev/null 2>&1 || { \
 	    echo "clang-format not found. Install with: brew install clang-format"; \
 	    exit 1; }
-	@find components/siri_ble components/report_decoder main tests/host \
+	@# peer.c + esp_central.h come from the upstream NimBLE blecent example
+	@# and use a different brace style; keep them out of the lint set so we
+	@# don't drift away from the upstream source we periodically diff against.
+	@find components/siri_ble components/siri_audio components/event_state \
+	    components/report_decoder components/mqtt_entity main tests/host \
 	    \( -name '*.c' -o -name '*.h' \) -not -name 'peer.c' -not -name 'esp_central.h' | \
 	    xargs clang-format --dry-run -Werror
 

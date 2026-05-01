@@ -10,28 +10,31 @@
 
 static const char *TAG = "mqtt_entity";
 
-#define TOPIC_PREFIX     "siri_remote"
+#define TOPIC_PREFIX "siri_remote"
 #define DISCOVERY_PREFIX "homeassistant"
-#define NVS_NAMESPACE    "mqtt_entity"
+#define NVS_NAMESPACE "mqtt_entity"
 
 struct mqtt_entity {
     mqtt_entity_config_t cfg;
-    int32_t              value;
-    char                 cmd_topic[64];
-    char                 state_topic[64];
-    char                 config_topic[80];
-    struct mqtt_entity  *next;
+    int32_t value;
+    char cmd_topic[64];
+    char state_topic[64];
+    char config_topic[80];
+    struct mqtt_entity *next;
 };
 
-static struct mqtt_entity      *s_entities;
+static struct mqtt_entity *s_entities;
 static esp_mqtt_client_handle_t s_client;
 
 static const char *kind_str(mqtt_entity_kind_t k)
 {
     switch (k) {
-    case MQTT_ENTITY_SWITCH: return "switch";
-    case MQTT_ENTITY_NUMBER: return "number";
-    case MQTT_ENTITY_BUTTON: return "button";
+    case MQTT_ENTITY_SWITCH:
+        return "switch";
+    case MQTT_ENTITY_NUMBER:
+        return "number";
+    case MQTT_ENTITY_BUTTON:
+        return "button";
     }
     return "unknown";
 }
@@ -63,6 +66,15 @@ static void load_value(mqtt_entity_t *e)
     }
     int32_t v;
     if (nvs_get_i32(h, e->cfg.nvs_key, &v) == ESP_OK) {
+        // Clamp to current bounds: NVS may carry a value persisted under a
+        // wider min/max range than this build ships, and parse_command's
+        // clamp only fires on inbound commands.
+        if (e->cfg.kind == MQTT_ENTITY_NUMBER) {
+            if (v < e->cfg.min_value)
+                v = e->cfg.min_value;
+            if (v > e->cfg.max_value)
+                v = e->cfg.max_value;
+        }
         e->value = v;
     }
     nvs_close(h);
@@ -74,7 +86,7 @@ static void publish_state(const mqtt_entity_t *e)
         return;
     }
     char buf[16];
-    int  n;
+    int n;
     if (e->cfg.kind == MQTT_ENTITY_SWITCH) {
         n = snprintf(buf, sizeof(buf), "%s", e->value ? "ON" : "OFF");
     } else {
@@ -89,7 +101,7 @@ static void publish_discovery(const mqtt_entity_t *e)
         return;
     }
     char json[512];
-    int  n = 0;
+    int n = 0;
 
     n += snprintf(json + n, sizeof(json) - n,
                   "{\"name\":\"%s\","
@@ -98,27 +110,23 @@ static void publish_discovery(const mqtt_entity_t *e)
                   e->cfg.display_name, e->cfg.unique_id, e->cmd_topic);
 
     if (e->cfg.kind != MQTT_ENTITY_BUTTON) {
-        n += snprintf(json + n, sizeof(json) - n,
-                      ",\"state_topic\":\"%s\"", e->state_topic);
+        n += snprintf(json + n, sizeof(json) - n, ",\"state_topic\":\"%s\"", e->state_topic);
     }
     if (e->cfg.kind == MQTT_ENTITY_NUMBER) {
         n += snprintf(json + n, sizeof(json) - n,
-                      ",\"min\":%" PRId32 ",\"max\":%" PRId32
-                      ",\"step\":%" PRId32 ",\"mode\":\"slider\"",
+                      ",\"min\":%" PRId32 ",\"max\":%" PRId32 ",\"step\":%" PRId32
+                      ",\"mode\":\"slider\"",
                       e->cfg.min_value, e->cfg.max_value, e->cfg.step_value);
         if (e->cfg.unit_of_measurement != NULL) {
-            n += snprintf(json + n, sizeof(json) - n,
-                          ",\"unit_of_measurement\":\"%s\"",
+            n += snprintf(json + n, sizeof(json) - n, ",\"unit_of_measurement\":\"%s\"",
                           e->cfg.unit_of_measurement);
         }
     }
     if (e->cfg.icon != NULL) {
-        n += snprintf(json + n, sizeof(json) - n,
-                      ",\"icon\":\"%s\"", e->cfg.icon);
+        n += snprintf(json + n, sizeof(json) - n, ",\"icon\":\"%s\"", e->cfg.icon);
     }
     if (e->cfg.device_id != NULL) {
-        n += snprintf(json + n, sizeof(json) - n,
-                      ",\"device\":{\"identifiers\":[\"%s\"]}",
+        n += snprintf(json + n, sizeof(json) - n, ",\"device\":{\"identifiers\":[\"%s\"]}",
                       e->cfg.device_id);
     }
     if (e->cfg.availability_topic != NULL) {
@@ -128,12 +136,10 @@ static void publish_discovery(const mqtt_entity_t *e)
                       "\"payload_not_available\":\"offline\"",
                       e->cfg.availability_topic);
     }
-    n += snprintf(json + n, sizeof(json) - n,
-                  ",\"entity_category\":\"config\"}");
+    n += snprintf(json + n, sizeof(json) - n, ",\"entity_category\":\"config\"}");
 
     if (n >= (int)sizeof(json)) {
-        ESP_LOGW(TAG, "%s: discovery JSON truncated (%d bytes)",
-                 e->cfg.unique_id, n);
+        ESP_LOGW(TAG, "%s: discovery JSON truncated (%d bytes)", e->cfg.unique_id, n);
         return;
     }
     esp_mqtt_client_publish(s_client, e->config_topic, json, n, 1, /*retain*/ 1);
@@ -160,12 +166,14 @@ static int parse_command(const mqtt_entity_t *e, const char *data, int len, int3
         memcpy(buf, data, len);
         buf[len] = '\0';
         char *end;
-        long  v = strtol(buf, &end, 10);
+        long v = strtol(buf, &end, 10);
         if (end == buf) {
             return -1;
         }
-        if (v < e->cfg.min_value) v = e->cfg.min_value;
-        if (v > e->cfg.max_value) v = e->cfg.max_value;
+        if (v < e->cfg.min_value)
+            v = e->cfg.min_value;
+        if (v > e->cfg.max_value)
+            v = e->cfg.max_value;
         *out = (int32_t)v;
         return 0;
     }
@@ -183,23 +191,21 @@ mqtt_entity_t *mqtt_entity_create(const mqtt_entity_config_t *cfg)
     if (e == NULL) {
         return NULL;
     }
-    e->cfg   = *cfg;
+    e->cfg = *cfg;
     e->value = cfg->default_value;
 
-    snprintf(e->cmd_topic, sizeof(e->cmd_topic),
-             "%s/cmd/%s", TOPIC_PREFIX, cfg->unique_id);
+    snprintf(e->cmd_topic, sizeof(e->cmd_topic), "%s/cmd/%s", TOPIC_PREFIX, cfg->unique_id);
     if (cfg->kind != MQTT_ENTITY_BUTTON) {
-        snprintf(e->state_topic, sizeof(e->state_topic),
-                 "%s/state/%s", TOPIC_PREFIX, cfg->unique_id);
+        snprintf(e->state_topic, sizeof(e->state_topic), "%s/state/%s", TOPIC_PREFIX,
+                 cfg->unique_id);
     }
-    snprintf(e->config_topic, sizeof(e->config_topic),
-             "%s/%s/%s/config", DISCOVERY_PREFIX, kind_str(cfg->kind),
-             cfg->unique_id);
+    snprintf(e->config_topic, sizeof(e->config_topic), "%s/%s/%s/config", DISCOVERY_PREFIX,
+             kind_str(cfg->kind), cfg->unique_id);
 
     load_value(e);
 
-    e->next     = s_entities;
-    s_entities  = e;
+    e->next = s_entities;
+    s_entities = e;
     return e;
 }
 
@@ -231,17 +237,17 @@ void mqtt_entity_on_mqtt_connected(esp_mqtt_client_handle_t client)
     }
 }
 
-bool mqtt_entity_dispatch_data(const char *topic, int topic_len,
-                                const char *data, int data_len)
+bool mqtt_entity_dispatch_data(const char *topic, int topic_len, const char *data, int data_len)
 {
     for (mqtt_entity_t *e = s_entities; e != NULL; e = e->next) {
-        if (topic_len != (int)strlen(e->cmd_topic)) continue;
-        if (memcmp(topic, e->cmd_topic, topic_len) != 0) continue;
+        if (topic_len != (int)strlen(e->cmd_topic))
+            continue;
+        if (memcmp(topic, e->cmd_topic, topic_len) != 0)
+            continue;
 
         int32_t v;
         if (parse_command(e, data, data_len, &v) != 0) {
-            ESP_LOGW(TAG, "%s: failed to parse command (%d bytes)",
-                     e->cfg.unique_id, data_len);
+            ESP_LOGW(TAG, "%s: failed to parse command (%d bytes)", e->cfg.unique_id, data_len);
             return true;
         }
         if (e->cfg.kind != MQTT_ENTITY_BUTTON) {

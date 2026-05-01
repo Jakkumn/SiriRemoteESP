@@ -1,4 +1,4 @@
-idf_component_register(SRCS "siri_audio.c"
+idf_component_register(SRCS "siri_audio.c" "siri_audio_validate.c"
                        INCLUDE_DIRS "include"
                        REQUIRES esp_common log freertos esp_timer
                        PRIV_REQUIRES nvs_flash)

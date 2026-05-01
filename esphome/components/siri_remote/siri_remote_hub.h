@@ -115,6 +115,16 @@ class SiriRemoteHub : public Component {
   void start_audio_();
   void start_tick_timer_();
 
+  // Schedule entity->publish_state(value) on the ESPHome loop. Safe to
+  // call from the BLE host task (which is where most call sites live).
+  // No-op if the entity pointer is null — callers don't need to gate.
+  template<typename TEntity, typename TValue>
+  void defer_publish_(TEntity *entity, TValue value) {
+    if (entity == nullptr)
+      return;
+    this->defer([entity, value] { entity->publish_state(value); });
+  }
+
   // Config (YAML).
   bool voice_enabled_{true};
   uint32_t idle_disconnect_ms_{0};

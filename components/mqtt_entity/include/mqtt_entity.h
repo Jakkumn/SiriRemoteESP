@@ -44,23 +44,23 @@ typedef struct {
     const char *display_name;  // e.g. "Raw Touch Stream"
 
     // Optional but recommended.
-    const char *icon;             // mdi:... (omitted from discovery if NULL)
-    const char *device_id;        // HA device identifier (NULL = no device grouping)
+    const char *icon;                // mdi:... (omitted from discovery if NULL)
+    const char *device_id;           // HA device identifier (NULL = no device grouping)
     const char *availability_topic;  // bridge LWT topic (NULL = no availability gating)
 
     // Number-only.
-    int32_t     min_value;
-    int32_t     max_value;
-    int32_t     step_value;
+    int32_t min_value;
+    int32_t max_value;
+    int32_t step_value;
     const char *unit_of_measurement;  // e.g. "ms", "%" (NULL = unitless)
 
     // Switch + Number persistence + initial value.
-    const char *nvs_key;        // NULL = don't persist (Button always)
-    int32_t     default_value;  // used if NVS is empty or read fails
+    const char *nvs_key;    // NULL = don't persist (Button always)
+    int32_t default_value;  // used if NVS is empty or read fails
 
     // Inbound command callback.
     mqtt_entity_on_change_fn on_change;
-    void                    *user;
+    void *user;
 } mqtt_entity_config_t;
 
 typedef struct mqtt_entity mqtt_entity_t;
@@ -86,8 +86,7 @@ void mqtt_entity_set_value(mqtt_entity_t *e, int32_t value);
 // the broker, and subscribes to all command topics. `dispatch_data`
 // returns true if an entity claimed the topic.
 void mqtt_entity_on_mqtt_connected(esp_mqtt_client_handle_t client);
-bool mqtt_entity_dispatch_data(const char *topic, int topic_len,
-                               const char *data, int data_len);
+bool mqtt_entity_dispatch_data(const char *topic, int topic_len, const char *data, int data_len);
 
 #ifdef __cplusplus
 }

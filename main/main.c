@@ -46,15 +46,15 @@ static const char *TAG = "main";
 // MQTT topic constants. Switch / Number / Button entities use the
 // mqtt_entity helper, which generates topics from each entity's
 // unique_id — so they don't appear here.
-#define TOPIC_EVENT                  "siri_remote/event"
-#define TOPIC_TOUCH_RAW              "siri_remote/touch_raw"
-#define TOPIC_CONN                   "siri_remote/connection"
-#define TOPIC_REMOTE_STATUS          "siri_remote/remote_status"
-#define TOPIC_BATTERY                "siri_remote/battery"
-#define TOPIC_CHARGING               "siri_remote/charging"
-#define TOPIC_DISCOVERY_EVENT        "homeassistant/event/siri_remote/config"
-#define TOPIC_DISCOVERY_BATTERY      "homeassistant/sensor/siri_remote_battery/config"
-#define TOPIC_DISCOVERY_CHARGING     "homeassistant/sensor/siri_remote_charging/config"
+#define TOPIC_EVENT "siri_remote/event"
+#define TOPIC_TOUCH_RAW "siri_remote/touch_raw"
+#define TOPIC_CONN "siri_remote/connection"
+#define TOPIC_REMOTE_STATUS "siri_remote/remote_status"
+#define TOPIC_BATTERY "siri_remote/battery"
+#define TOPIC_CHARGING "siri_remote/charging"
+#define TOPIC_DISCOVERY_EVENT "homeassistant/event/siri_remote/config"
+#define TOPIC_DISCOVERY_BATTERY "homeassistant/sensor/siri_remote_battery/config"
+#define TOPIC_DISCOVERY_CHARGING "homeassistant/sensor/siri_remote_charging/config"
 
 // HA-side device identifier — every entity attaches to this so they all
 // group as one device in the HA UI.
@@ -64,23 +64,28 @@ static const char *TAG = "main";
 // Set once in mqtt_start() before any concurrent reader exists; the volatile
 // keeps the compiler honest about the cross-task visibility nonetheless.
 static esp_mqtt_client_handle_t volatile s_mqtt;
-static event_state_t           *s_es;
-static SemaphoreHandle_t        s_es_lock;
-static volatile bool            s_mqtt_connected;
-static volatile bool            s_remote_connected;  // tracks BLE-side state
-                                                     // for the MQTT-reconnect
-                                                     // republish of remote_status
-static esp_timer_handle_t       s_tick_timer;
-static mqtt_entity_t           *s_raw_stream_entity;
-static mqtt_entity_t           *s_repair_entity;
+static event_state_t *s_es;
+static SemaphoreHandle_t s_es_lock;
+static volatile bool s_mqtt_connected;
+static volatile bool s_remote_connected;  // tracks BLE-side state
+                                          // for the MQTT-reconnect
+                                          // republish of remote_status
+static esp_timer_handle_t s_tick_timer;
+static mqtt_entity_t *s_raw_stream_entity;
+// Cached copy of s_raw_stream_entity's value, set from the MQTT-task
+// on_change callback and read on the BLE notify hot path (~50 Hz). Avoids
+// chasing the entity list inside on_notify_cb. 32-bit aligned bool on
+// Xtensa is atomic — no lock needed.
+static volatile bool s_raw_stream_enabled;
+static mqtt_entity_t *s_repair_entity;
 // Phase 3B.8 runtime tunables. NVS-persisted via the helper; on_change
 // callbacks push live updates into event_state / siri_ble.
-static mqtt_entity_t           *s_swipe_y_pri_entity;
-static mqtt_entity_t           *s_swipe_dist_entity;
-static mqtt_entity_t           *s_dbl_ms_entity;
-static mqtt_entity_t           *s_hold_ms_entity;
-static mqtt_entity_t           *s_battery_low_entity;
-static mqtt_entity_t           *s_ble_lat_entity;
+static mqtt_entity_t *s_swipe_y_pri_entity;
+static mqtt_entity_t *s_swipe_dist_entity;
+static mqtt_entity_t *s_dbl_ms_entity;
+static mqtt_entity_t *s_hold_ms_entity;
+static mqtt_entity_t *s_battery_low_entity;
+static mqtt_entity_t *s_ble_lat_entity;
 // On first-bond, Apple's HID flushes the press/release notifies that were
 // buffered during the bond window (the TV+VolUp pairing-combo the user
 // just held) right after the button CCCD subscribe lands. Without
@@ -89,16 +94,22 @@ static mqtt_entity_t           *s_ble_lat_entity;
 // is keyed on idle_ms==0, which is unique to siri_ble's DISCOVERING→
 // CONNECTED transition (bonded reconnects always pass a non-zero idle).
 #define PAIRING_FLUSH_SUPPRESS_MS 1500
-static uint32_t                 s_suppress_buttons_until_ms;
+static uint32_t s_suppress_buttons_until_ms;
 // Activity tracking for the optional idle-disconnect path. Compiled out
 // entirely in the default always-connected mode (CONFIG_IDLE_DISCONNECT_MS=0).
 #if CONFIG_IDLE_DISCONNECT_MS > 0
-static volatile uint32_t        s_last_activity_ms;
-#define MARK_ACTIVITY()         do { s_last_activity_ms = now_ms(); } while (0)
-#define MARK_INACTIVE()         do { s_last_activity_ms = 0;        } while (0)
+static volatile uint32_t s_last_activity_ms;
+#define MARK_ACTIVITY()                                                                            \
+    do {                                                                                           \
+        s_last_activity_ms = now_ms();                                                             \
+    } while (0)
+#define MARK_INACTIVE()                                                                            \
+    do {                                                                                           \
+        s_last_activity_ms = 0;                                                                    \
+    } while (0)
 #else
-#define MARK_ACTIVITY()         ((void)0)
-#define MARK_INACTIVE()         ((void)0)
+#define MARK_ACTIVITY() ((void)0)
+#define MARK_INACTIVE() ((void)0)
 #endif
 
 static uint32_t now_ms(void)
@@ -119,39 +130,38 @@ static void mqtt_publish(const char *topic, const char *payload, int len, int qo
 static void publish_ha_discovery_event(void)
 {
     // Single retained config message that tells HA to auto-create an Event entity.
-    static const char PAYLOAD[] =
-        "{"
-        "\"name\":\"Siri Remote\","
-        "\"unique_id\":\"siri_remote_events\","
-        "\"state_topic\":\"" TOPIC_EVENT "\","
-        "\"event_types\":["
-        "\"click\",\"double_click\",\"hold_start\",\"hold_end\","
-        "\"swipe_up\",\"swipe_down\",\"swipe_left\",\"swipe_right\"],"
-        "\"device\":{"
-        "\"identifiers\":[\"siri_remote_bridge\"],"
-        "\"name\":\"Siri Remote Bridge\","
-        "\"manufacturer\":\"Apple\","
-        "\"model\":\"Siri Remote (3rd gen)\""
-        "},"
-        "\"availability_topic\":\"" TOPIC_CONN "\","
-        "\"payload_available\":\"online\","
-        "\"payload_not_available\":\"offline\""
-        "}";
+    static const char PAYLOAD[] = "{"
+                                  "\"name\":\"Siri Remote\","
+                                  "\"unique_id\":\"siri_remote_events\","
+                                  "\"state_topic\":\"" TOPIC_EVENT "\","
+                                  "\"event_types\":["
+                                  "\"click\",\"double_click\",\"hold_start\",\"hold_end\","
+                                  "\"swipe_up\",\"swipe_down\",\"swipe_left\",\"swipe_right\"],"
+                                  "\"device\":{"
+                                  "\"identifiers\":[\"siri_remote_bridge\"],"
+                                  "\"name\":\"Siri Remote Bridge\","
+                                  "\"manufacturer\":\"Apple\","
+                                  "\"model\":\"Siri Remote (3rd gen)\""
+                                  "},"
+                                  "\"availability_topic\":\"" TOPIC_CONN "\","
+                                  "\"payload_available\":\"online\","
+                                  "\"payload_not_available\":\"offline\""
+                                  "}";
     mqtt_publish(TOPIC_DISCOVERY_EVENT, PAYLOAD, sizeof(PAYLOAD) - 1, 1, /*retain*/ true);
 }
 
 // Battery + charging are continuous-state sensors. Their availability tracks
 // BOTH the bridge's MQTT connection and the remote's BLE connection — when the
 // remote sleeps, HA marks them unavailable so a stale value isn't displayed.
-#define AVAILABILITY_BRIDGE_AND_REMOTE \
-    "\"availability\":[" \
-        "{\"topic\":\"" TOPIC_CONN "\"," \
-            "\"payload_available\":\"online\"," \
-            "\"payload_not_available\":\"offline\"}," \
-        "{\"topic\":\"" TOPIC_REMOTE_STATUS "\"," \
-            "\"payload_available\":\"connected\"," \
-            "\"payload_not_available\":\"disconnected\"}" \
-    "]," \
+#define AVAILABILITY_BRIDGE_AND_REMOTE                                                             \
+    "\"availability\":["                                                                           \
+    "{\"topic\":\"" TOPIC_CONN "\","                                                               \
+    "\"payload_available\":\"online\","                                                            \
+    "\"payload_not_available\":\"offline\"},"                                                      \
+    "{\"topic\":\"" TOPIC_REMOTE_STATUS "\","                                                      \
+    "\"payload_available\":\"connected\","                                                         \
+    "\"payload_not_available\":\"disconnected\"}"                                                  \
+    "],"                                                                                           \
     "\"availability_mode\":\"all\""
 
 static void publish_ha_discovery_battery(void)
@@ -164,9 +174,7 @@ static void publish_ha_discovery_battery(void)
         "\"value_template\":\"{{ value_json.level }}\","
         "\"device_class\":\"battery\","
         "\"unit_of_measurement\":\"%\","
-        "\"device\":{\"identifiers\":[\"siri_remote_bridge\"]},"
-        AVAILABILITY_BRIDGE_AND_REMOTE
-        "}";
+        "\"device\":{\"identifiers\":[\"siri_remote_bridge\"]}," AVAILABILITY_BRIDGE_AND_REMOTE "}";
     mqtt_publish(TOPIC_DISCOVERY_BATTERY, PAYLOAD, sizeof(PAYLOAD) - 1, 1, /*retain*/ true);
 }
 
@@ -178,17 +186,14 @@ static void publish_ha_discovery_charging(void)
         "\"unique_id\":\"siri_remote_charging\","
         "\"state_topic\":\"" TOPIC_CHARGING "\","
         "\"icon\":\"mdi:battery-charging\","
-        "\"device\":{\"identifiers\":[\"siri_remote_bridge\"]},"
-        AVAILABILITY_BRIDGE_AND_REMOTE
-        "}";
+        "\"device\":{\"identifiers\":[\"siri_remote_bridge\"]}," AVAILABILITY_BRIDGE_AND_REMOTE "}";
     mqtt_publish(TOPIC_DISCOVERY_CHARGING, PAYLOAD, sizeof(PAYLOAD) - 1, 1, /*retain*/ true);
 }
 
 static void publish_remote_status(bool connected)
 {
-    mqtt_publish(TOPIC_REMOTE_STATUS,
-                 connected ? "connected" : "disconnected",
-                 0, 1, /*retain*/ true);
+    mqtt_publish(TOPIC_REMOTE_STATUS, connected ? "connected" : "disconnected", 0, 1,
+                 /*retain*/ true);
 }
 
 // Latest battery + charging bytes cached so we can re-publish them on MQTT
@@ -207,9 +212,8 @@ static void publish_battery(uint8_t level)
     char buf[64];
     int32_t threshold = mqtt_entity_get_value(s_battery_low_entity);
     bool low = threshold > 0 && level <= threshold;
-    int n = snprintf(buf, sizeof(buf),
-                     "{\"level\":%u,\"low\":%s}",
-                     (unsigned)level, low ? "true" : "false");
+    int n = snprintf(buf, sizeof(buf), "{\"level\":%u,\"low\":%s}", (unsigned)level,
+                     low ? "true" : "false");
     if (n > 0) {
         ESP_LOGI(TAG, "battery=%u%%%s", (unsigned)level, low ? " (LOW)" : "");
         mqtt_publish(TOPIC_BATTERY, buf, n, 1, /*retain*/ true);
@@ -230,8 +234,8 @@ static void publish_touch_raw(const siri_touch_frame_t *f)
     int n;
     if (f->finger_down) {
         n = snprintf(buf, sizeof(buf),
-                     "{\"x\":%" PRId32 ",\"y\":%" PRId32 ",\"p\":%u,\"down\":true}",
-                     f->x, f->y, (unsigned)f->pressure);
+                     "{\"x\":%" PRId32 ",\"y\":%" PRId32 ",\"p\":%u,\"down\":true}", f->x, f->y,
+                     (unsigned)f->pressure);
     } else {
         n = snprintf(buf, sizeof(buf), "{\"down\":false}");
     }
@@ -264,17 +268,15 @@ static void emit_cb(const event_state_event_t *evt, void *user)
     case EVT_DOUBLE_CLICK:
     case EVT_HOLD_START: {
         const char *btn = siri_button_name(evt->button);
-        n = snprintf(buf, sizeof(buf),
-                     "{\"event_type\":\"%s\",\"button\":\"%s\"}",
-                     event_type, btn ? btn : "unknown");
+        n = snprintf(buf, sizeof(buf), "{\"event_type\":\"%s\",\"button\":\"%s\"}", event_type,
+                     btn ? btn : "unknown");
         break;
     }
     case EVT_SWIPE_UP:
     case EVT_SWIPE_DOWN:
     case EVT_SWIPE_LEFT:
     case EVT_SWIPE_RIGHT:
-        n = snprintf(buf, sizeof(buf),
-                     "{\"event_type\":\"%s\",\"distance\":%" PRId32 "}",
+        n = snprintf(buf, sizeof(buf), "{\"event_type\":\"%s\",\"distance\":%" PRId32 "}",
                      event_type, evt->distance);
         break;
     }
@@ -310,7 +312,7 @@ static void pcm_tcp_open_socket(void *user)
     }
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
-        .sin_port   = htons(CONFIG_AUDIO_PCM_TCP_PORT),
+        .sin_port = htons(CONFIG_AUDIO_PCM_TCP_PORT),
     };
     if (inet_aton(CONFIG_AUDIO_PCM_TCP_HOST, &addr.sin_addr) == 0) {
         ESP_LOGW(TAG, "pcm_tcp: inet_aton('%s') failed", CONFIG_AUDIO_PCM_TCP_HOST);
@@ -319,13 +321,13 @@ static void pcm_tcp_open_socket(void *user)
     }
     if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         ESP_LOGW(TAG, "pcm_tcp: connect %s:%d errno=%d (run `nc -l %d` on the host)",
-                 CONFIG_AUDIO_PCM_TCP_HOST, CONFIG_AUDIO_PCM_TCP_PORT,
-                 errno, CONFIG_AUDIO_PCM_TCP_PORT);
+                 CONFIG_AUDIO_PCM_TCP_HOST, CONFIG_AUDIO_PCM_TCP_PORT, errno,
+                 CONFIG_AUDIO_PCM_TCP_PORT);
         close(sock);
         return;
     }
-    ESP_LOGI(TAG, "pcm_tcp: streaming to %s:%d",
-             CONFIG_AUDIO_PCM_TCP_HOST, CONFIG_AUDIO_PCM_TCP_PORT);
+    ESP_LOGI(TAG, "pcm_tcp: streaming to %s:%d", CONFIG_AUDIO_PCM_TCP_HOST,
+             CONFIG_AUDIO_PCM_TCP_PORT);
     s_pcm_socket = sock;
 }
 
@@ -344,7 +346,8 @@ static void pcm_tcp_send_frame(const int16_t *samples, size_t count, void *user)
 {
     (void)user;
     int sock = s_pcm_socket;
-    if (sock < 0) return;
+    if (sock < 0)
+        return;
     ssize_t n = send(sock, samples, count * sizeof(int16_t), 0);
     if (n < 0) {
         ESP_LOGW(TAG, "pcm_tcp: send errno=%d; closing", errno);
@@ -373,7 +376,7 @@ static void on_notify_cb(uint16_t attr_handle, const uint8_t *data, size_t len, 
         // standard button bitmap *is* the session marker.
         static uint16_t s_prev_btns;
         bool mic_was = (s_prev_btns & SIRI_BTN_MIC) != 0;
-        bool mic_now = (btns        & SIRI_BTN_MIC) != 0;
+        bool mic_now = (btns & SIRI_BTN_MIC) != 0;
         if (mic_now && !mic_was) {
             siri_audio_session_start();
         } else if (!mic_now && mic_was) {
@@ -407,15 +410,14 @@ static void on_notify_cb(uint16_t attr_handle, const uint8_t *data, size_t len, 
             ESP_LOGI(TAG,
                      "touch raw=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x"
                      " | x=%" PRId32 " y=%" PRId32 " p=%u down=%d ctr=%" PRIu32,
-                     data[0], data[1], data[2], data[3], data[4], data[5],
-                     data[6], data[7], data[8], data[9], data[10],
-                     frame.x, frame.y, (unsigned)frame.pressure,
+                     data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+                     data[8], data[9], data[10], frame.x, frame.y, (unsigned)frame.pressure,
                      (int)frame.finger_down, frame.remote_counter);
 #endif
             xSemaphoreTake(s_es_lock, portMAX_DELAY);
             event_state_feed_touch(s_es, &frame, now_ms());
             xSemaphoreGive(s_es_lock);
-            if (mqtt_entity_get_value(s_raw_stream_entity)) {
+            if (s_raw_stream_enabled) {
                 publish_touch_raw(&frame);
             }
         }
@@ -454,6 +456,12 @@ static void repair_button_pressed(int32_t value, void *user)
     (void)user;
     ESP_LOGI(TAG, "HA repair button pressed");
     siri_ble_repair();
+}
+
+static void on_raw_stream_changed(int32_t value, void *user)
+{
+    (void)user;
+    s_raw_stream_enabled = (value != 0);
 }
 
 // --- Phase 3B.8 Number-entity on_change callbacks ---
@@ -528,7 +536,8 @@ static void tick_timer_cb(void *arg)
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
-    (void)arg; (void)data;
+    (void)arg;
+    (void)data;
     if (base == WIFI_EVENT) {
         switch (id) {
         case WIFI_EVENT_STA_START:
@@ -539,7 +548,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
             ESP_LOGW(TAG, "wifi: disconnected, retrying");
             esp_wifi_connect();
             break;
-        default: break;
+        default:
+            break;
         }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *ip_evt = (ip_event_got_ip_t *)data;
@@ -556,13 +566,13 @@ static void wifi_start(void)
     wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&init_cfg));
 
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                        &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                                        &wifi_event_handler, NULL, NULL));
 
     wifi_config_t wifi_cfg = {0};
-    strncpy((char *)wifi_cfg.sta.ssid,     CONFIG_WIFI_SSID,     sizeof(wifi_cfg.sta.ssid) - 1);
+    strncpy((char *)wifi_cfg.sta.ssid, CONFIG_WIFI_SSID, sizeof(wifi_cfg.sta.ssid) - 1);
     strncpy((char *)wifi_cfg.sta.password, CONFIG_WIFI_PASSWORD, sizeof(wifi_cfg.sta.password) - 1);
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
@@ -573,7 +583,8 @@ static void wifi_start(void)
 
 static void mqtt_event_handler(void *args, esp_event_base_t base, int32_t id, void *data)
 {
-    (void)args; (void)base;
+    (void)args;
+    (void)base;
     esp_mqtt_event_handle_t evt = (esp_mqtt_event_handle_t)data;
     switch ((esp_mqtt_event_id_t)id) {
     case MQTT_EVENT_CONNECTED:
@@ -614,8 +625,7 @@ static void mqtt_event_handler(void *args, esp_event_base_t base, int32_t id, vo
         ESP_LOGI(TAG, "mqtt: subscribed (msg_id=%d)", evt->msg_id);
         break;
     case MQTT_EVENT_DATA:
-        (void)mqtt_entity_dispatch_data(evt->topic, evt->topic_len,
-                                        evt->data, evt->data_len);
+        (void)mqtt_entity_dispatch_data(evt->topic, evt->topic_len, evt->data, evt->data_len);
         break;
     default:
         break;
@@ -625,18 +635,18 @@ static void mqtt_event_handler(void *args, esp_event_base_t base, int32_t id, vo
 static void mqtt_start(void)
 {
     esp_mqtt_client_config_t cfg = {
-        .broker.address.uri             = CONFIG_MQTT_BROKER_URI,
-        .credentials.username           = CONFIG_MQTT_USERNAME,
+        .broker.address.uri = CONFIG_MQTT_BROKER_URI,
+        .credentials.username = CONFIG_MQTT_USERNAME,
         .credentials.authentication.password = CONFIG_MQTT_PASSWORD,
-        .session.last_will.topic        = TOPIC_CONN,
-        .session.last_will.msg          = "offline",
-        .session.last_will.msg_len      = 7,
-        .session.last_will.qos          = 1,
-        .session.last_will.retain       = 1,
+        .session.last_will.topic = TOPIC_CONN,
+        .session.last_will.msg = "offline",
+        .session.last_will.msg_len = 7,
+        .session.last_will.qos = 1,
+        .session.last_will.retain = 1,
     };
     s_mqtt = esp_mqtt_client_init(&cfg);
-    ESP_ERROR_CHECK(esp_mqtt_client_register_event(
-        s_mqtt, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL));
+    ESP_ERROR_CHECK(
+        esp_mqtt_client_register_event(s_mqtt, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL));
     ESP_ERROR_CHECK(esp_mqtt_client_start(s_mqtt));
 }
 
@@ -663,28 +673,28 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     s_raw_stream_entity = mqtt_entity_create(&(mqtt_entity_config_t){
-        .kind               = MQTT_ENTITY_SWITCH,
-        .unique_id          = "siri_remote_raw_stream",
-        .display_name       = "Raw Touch Stream",
-        .icon               = "mdi:gesture-tap-hold",
-        .device_id          = HA_DEVICE_ID,
+        .kind = MQTT_ENTITY_SWITCH,
+        .unique_id = "siri_remote_raw_stream",
+        .display_name = "Raw Touch Stream",
+        .icon = "mdi:gesture-tap-hold",
+        .device_id = HA_DEVICE_ID,
         .availability_topic = TOPIC_CONN,
-        .nvs_key            = "raw_stream",
-        .default_value      = 0,
-        .on_change          = NULL,  // value already cached via mqtt_entity_get_value
+        .nvs_key = "raw_stream",
+        .default_value = 0,
+        .on_change = on_raw_stream_changed,
     });
     assert(s_raw_stream_entity != NULL);
-    ESP_LOGI(TAG, "raw_stream initial state: %s",
-             mqtt_entity_get_value(s_raw_stream_entity) ? "ON" : "OFF");
+    s_raw_stream_enabled = (mqtt_entity_get_value(s_raw_stream_entity) != 0);
+    ESP_LOGI(TAG, "raw_stream initial state: %s", s_raw_stream_enabled ? "ON" : "OFF");
 
     s_repair_entity = mqtt_entity_create(&(mqtt_entity_config_t){
-        .kind               = MQTT_ENTITY_BUTTON,
-        .unique_id          = "siri_remote_repair",
-        .display_name       = "Re-pair Remote",
-        .icon               = "mdi:bluetooth-refresh",
-        .device_id          = HA_DEVICE_ID,
+        .kind = MQTT_ENTITY_BUTTON,
+        .unique_id = "siri_remote_repair",
+        .display_name = "Re-pair Remote",
+        .icon = "mdi:bluetooth-refresh",
+        .device_id = HA_DEVICE_ID,
         .availability_topic = TOPIC_CONN,
-        .on_change          = repair_button_pressed,
+        .on_change = repair_button_pressed,
     });
     assert(s_repair_entity != NULL);
 
@@ -693,89 +703,101 @@ void app_main(void)
     // (which is the NVS value if persisted, else the Kconfig default
     // supplied as default_value).
     s_swipe_y_pri_entity = mqtt_entity_create(&(mqtt_entity_config_t){
-        .kind               = MQTT_ENTITY_NUMBER,
-        .unique_id          = "siri_remote_swipe_y_priority",
-        .display_name       = "Swipe Y Priority",
-        .icon               = "mdi:gesture-swipe-vertical",
-        .device_id          = HA_DEVICE_ID,
+        .kind = MQTT_ENTITY_NUMBER,
+        .unique_id = "siri_remote_swipe_y_priority",
+        .display_name = "Swipe Y Priority",
+        .icon = "mdi:gesture-swipe-vertical",
+        .device_id = HA_DEVICE_ID,
         .availability_topic = TOPIC_CONN,
-        .min_value          = 0, .max_value = 200, .step_value = 5,
-        .nvs_key            = "swipe_y_pri",
-        .default_value      = CONFIG_EVENT_SWIPE_Y_PRIORITY,
-        .on_change          = on_swipe_y_pri_changed,
+        .min_value = 0,
+        .max_value = 200,
+        .step_value = 5,
+        .nvs_key = "swipe_y_pri",
+        .default_value = CONFIG_EVENT_SWIPE_Y_PRIORITY,
+        .on_change = on_swipe_y_pri_changed,
     });
     assert(s_swipe_y_pri_entity != NULL);
 
     s_swipe_dist_entity = mqtt_entity_create(&(mqtt_entity_config_t){
-        .kind               = MQTT_ENTITY_NUMBER,
-        .unique_id          = "siri_remote_swipe_min_distance",
-        .display_name       = "Swipe Min Distance",
-        .icon               = "mdi:gesture-swipe",
-        .device_id          = HA_DEVICE_ID,
+        .kind = MQTT_ENTITY_NUMBER,
+        .unique_id = "siri_remote_swipe_min_distance",
+        .display_name = "Swipe Min Distance",
+        .icon = "mdi:gesture-swipe",
+        .device_id = HA_DEVICE_ID,
         .availability_topic = TOPIC_CONN,
-        .min_value          = 0, .max_value = 500, .step_value = 10,
-        .nvs_key            = "swipe_dist",
-        .default_value      = CONFIG_EVENT_SWIPE_MIN_DISTANCE,
-        .on_change          = on_swipe_dist_changed,
+        .min_value = 0,
+        .max_value = 500,
+        .step_value = 10,
+        .nvs_key = "swipe_dist",
+        .default_value = CONFIG_EVENT_SWIPE_MIN_DISTANCE,
+        .on_change = on_swipe_dist_changed,
     });
     assert(s_swipe_dist_entity != NULL);
 
     s_dbl_ms_entity = mqtt_entity_create(&(mqtt_entity_config_t){
-        .kind               = MQTT_ENTITY_NUMBER,
-        .unique_id          = "siri_remote_double_window_ms",
-        .display_name       = "Double-Click Window",
-        .icon               = "mdi:cursor-default-click",
-        .device_id          = HA_DEVICE_ID,
+        .kind = MQTT_ENTITY_NUMBER,
+        .unique_id = "siri_remote_double_window_ms",
+        .display_name = "Double-Click Window",
+        .icon = "mdi:cursor-default-click",
+        .device_id = HA_DEVICE_ID,
         .availability_topic = TOPIC_CONN,
-        .min_value          = 0, .max_value = 2000, .step_value = 50,
+        .min_value = 0,
+        .max_value = 2000,
+        .step_value = 50,
         .unit_of_measurement = "ms",
-        .nvs_key            = "dbl_ms",
-        .default_value      = CONFIG_EVENT_DOUBLE_WINDOW_MS,
-        .on_change          = on_dbl_ms_changed,
+        .nvs_key = "dbl_ms",
+        .default_value = CONFIG_EVENT_DOUBLE_WINDOW_MS,
+        .on_change = on_dbl_ms_changed,
     });
     assert(s_dbl_ms_entity != NULL);
 
     s_hold_ms_entity = mqtt_entity_create(&(mqtt_entity_config_t){
-        .kind               = MQTT_ENTITY_NUMBER,
-        .unique_id          = "siri_remote_hold_threshold_ms",
-        .display_name       = "Hold Threshold",
-        .icon               = "mdi:gesture-tap-hold",
-        .device_id          = HA_DEVICE_ID,
+        .kind = MQTT_ENTITY_NUMBER,
+        .unique_id = "siri_remote_hold_threshold_ms",
+        .display_name = "Hold Threshold",
+        .icon = "mdi:gesture-tap-hold",
+        .device_id = HA_DEVICE_ID,
         .availability_topic = TOPIC_CONN,
-        .min_value          = 0, .max_value = 10000, .step_value = 100,
+        .min_value = 0,
+        .max_value = 10000,
+        .step_value = 100,
         .unit_of_measurement = "ms",
-        .nvs_key            = "hold_ms",
-        .default_value      = CONFIG_EVENT_HOLD_THRESHOLD_MS,
-        .on_change          = on_hold_ms_changed,
+        .nvs_key = "hold_ms",
+        .default_value = CONFIG_EVENT_HOLD_THRESHOLD_MS,
+        .on_change = on_hold_ms_changed,
     });
     assert(s_hold_ms_entity != NULL);
 
     s_battery_low_entity = mqtt_entity_create(&(mqtt_entity_config_t){
-        .kind               = MQTT_ENTITY_NUMBER,
-        .unique_id          = "siri_remote_battery_low_pct",
-        .display_name       = "Battery Low Threshold",
-        .icon               = "mdi:battery-alert",
-        .device_id          = HA_DEVICE_ID,
+        .kind = MQTT_ENTITY_NUMBER,
+        .unique_id = "siri_remote_battery_low_pct",
+        .display_name = "Battery Low Threshold",
+        .icon = "mdi:battery-alert",
+        .device_id = HA_DEVICE_ID,
         .availability_topic = TOPIC_CONN,
-        .min_value          = 0, .max_value = 100, .step_value = 5,
+        .min_value = 0,
+        .max_value = 100,
+        .step_value = 5,
         .unit_of_measurement = "%",
-        .nvs_key            = "bat_low",
-        .default_value      = CONFIG_BATTERY_LOW_THRESHOLD_PCT,
-        .on_change          = NULL,  // publish_battery reads via mqtt_entity_get_value
+        .nvs_key = "bat_low",
+        .default_value = CONFIG_BATTERY_LOW_THRESHOLD_PCT,
+        .on_change = NULL,  // publish_battery reads via mqtt_entity_get_value
     });
     assert(s_battery_low_entity != NULL);
 
     s_ble_lat_entity = mqtt_entity_create(&(mqtt_entity_config_t){
-        .kind               = MQTT_ENTITY_NUMBER,
-        .unique_id          = "siri_remote_ble_slave_latency",
-        .display_name       = "BLE Slave Latency",
-        .icon               = "mdi:bluetooth-settings",
-        .device_id          = HA_DEVICE_ID,
+        .kind = MQTT_ENTITY_NUMBER,
+        .unique_id = "siri_remote_ble_slave_latency",
+        .display_name = "BLE Slave Latency",
+        .icon = "mdi:bluetooth-settings",
+        .device_id = HA_DEVICE_ID,
         .availability_topic = TOPIC_CONN,
-        .min_value          = 0, .max_value = 500, .step_value = 20,
-        .nvs_key            = "ble_lat",
-        .default_value      = 400,
-        .on_change          = on_ble_lat_changed,
+        .min_value = 0,
+        .max_value = 500,
+        .step_value = 20,
+        .nvs_key = "ble_lat",
+        .default_value = CONFIG_BLE_SLAVE_LATENCY_DEFAULT,
+        .on_change = on_ble_lat_changed,
     });
     assert(s_ble_lat_entity != NULL);
 
@@ -783,10 +805,10 @@ void app_main(void)
     assert(s_es_lock != NULL);
 
     event_state_config_t es_cfg = {
-        .double_click_max_ms         = (uint32_t)mqtt_entity_get_value(s_dbl_ms_entity),
-        .hold_min_ms                 = (uint32_t)mqtt_entity_get_value(s_hold_ms_entity),
-        .swipe_min_distance          = mqtt_entity_get_value(s_swipe_dist_entity),
-        .swipe_y_priority_threshold  = mqtt_entity_get_value(s_swipe_y_pri_entity),
+        .double_click_max_ms = (uint32_t)mqtt_entity_get_value(s_dbl_ms_entity),
+        .hold_min_ms = (uint32_t)mqtt_entity_get_value(s_hold_ms_entity),
+        .swipe_min_distance = mqtt_entity_get_value(s_swipe_dist_entity),
+        .swipe_y_priority_threshold = mqtt_entity_get_value(s_swipe_y_pri_entity),
     };
     s_es = event_state_create(&es_cfg, emit_cb, NULL);
     assert(s_es != NULL);
@@ -802,22 +824,22 @@ void app_main(void)
     // dispatcher is ready when the first audio packet arrives.
     siri_audio_config_t audio_cfg = {
 #ifdef CONFIG_DEBUG_AUDIO_PCM_TCP
-        .on_pcm           = pcm_tcp_send_frame,
+        .on_pcm = pcm_tcp_send_frame,
         .on_session_start = pcm_tcp_open_socket,
-        .on_session_end   = pcm_tcp_close_socket,
+        .on_session_end = pcm_tcp_close_socket,
 #else
-        .on_pcm           = NULL,  // Phase 5.B will swap this for ESPHome voice_assistant
+        .on_pcm = NULL,  // Phase 5.B will swap this for ESPHome voice_assistant
         .on_session_start = NULL,
-        .on_session_end   = NULL,
+        .on_session_end = NULL,
 #endif
-        .user             = NULL,
+        .user = NULL,
     };
     ESP_ERROR_CHECK(siri_audio_start(&audio_cfg));
 #endif
 
     esp_timer_create_args_t ta = {
         .callback = tick_timer_cb,
-        .name     = "event_state_tick",
+        .name = "event_state_tick",
     };
     ESP_ERROR_CHECK(esp_timer_create(&ta, &s_tick_timer));
     ESP_ERROR_CHECK(esp_timer_start_periodic(s_tick_timer, TICK_PERIOD_MS * 1000));
@@ -829,10 +851,10 @@ void app_main(void)
     ble_store_config_init();
 
     siri_ble_config_t ble_cfg = {
-        .on_notify       = on_notify_cb,
-        .on_connected    = on_connected_cb,
+        .on_notify = on_notify_cb,
+        .on_connected = on_connected_cb,
         .on_disconnected = on_disconnected_cb,
-        .user            = NULL,
+        .user = NULL,
     };
     ESP_ERROR_CHECK(siri_ble_start(&ble_cfg));
     nimble_port_freertos_init(nimble_host_task);

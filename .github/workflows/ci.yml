@@ -6,6 +6,23 @@ on:
   pull_request:
 
 jobs:
+  lint:
+    name: clang-format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Use the pip-distributed clang-format wrapper so dev + CI run the same
+      # version. The native apt clang-format tracks distro releases and
+      # produces different output across Ubuntu versions, which would cause
+      # silent drift between local `make lint` and CI.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install clang-format
+        run: pip install 'clang-format==22.1.4'
+      - name: Run lint
+        run: make lint
+
   host-tests:
     name: Host unit tests
     runs-on: ubuntu-latest

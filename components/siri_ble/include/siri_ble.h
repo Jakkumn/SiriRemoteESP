@@ -14,19 +14,19 @@ extern "C" {
 // to dispatch on `attr_handle` from notify / read callbacks. CCCD handles
 // for these characteristics are siri_ble's internal concern (the bridge
 // subscribes during the setup chain) and stay private to the component.
-#define SIRI_HANDLE_BUTTON      0x0039  // 16-bit button bitmap (notify)
-#define SIRI_HANDLE_TOUCH       0x003D  // 11-byte touch frames (notify, ~50/sec)
-#define SIRI_HANDLE_AUDIO       0x0035  // Opus audio (Phase 5)
-#define SIRI_HANDLE_AUDIO_CCCD  0x0036  // CCCD for SIRI_HANDLE_AUDIO
-#define SIRI_HANDLE_BATTERY     0x002E  // single-byte percentage (read + notify)
-#define SIRI_HANDLE_CHARGING    0x0031  // BLE-standard 0x2A1A power-state byte (read + notify)
+#define SIRI_HANDLE_BUTTON 0x0039      // 16-bit button bitmap (notify)
+#define SIRI_HANDLE_TOUCH 0x003D       // 11-byte touch frames (notify, ~50/sec)
+#define SIRI_HANDLE_AUDIO 0x0035       // Opus audio (Phase 5)
+#define SIRI_HANDLE_AUDIO_CCCD 0x0036  // CCCD for SIRI_HANDLE_AUDIO
+#define SIRI_HANDLE_BATTERY 0x002E     // single-byte percentage (read + notify)
+#define SIRI_HANDLE_CHARGING 0x0031    // BLE-standard 0x2A1A power-state byte (read + notify)
 
 // Raw notification from the remote. `attr_handle` lets the caller
 // distinguish button / touch / audio / battery / charging etc — see the
 // SIRI_HANDLE_* constants above.
 // `data` is owned by NimBLE and valid only for the duration of the call.
-typedef void (*siri_ble_notify_cb_t)(uint16_t attr_handle, const uint8_t *data,
-                                     size_t len, void *user);
+typedef void (*siri_ble_notify_cb_t)(uint16_t attr_handle, const uint8_t *data, size_t len,
+                                     void *user);
 
 // Fired on successful encrypted connection (after the post-secondary
 // ENC_CHANGE fingerprint pass on first-pair, or after a bonded reconnect's
@@ -47,10 +47,10 @@ typedef void (*siri_ble_connected_cb_t)(uint32_t idle_ms_since_disconnect, void 
 typedef void (*siri_ble_disconnected_cb_t)(void *user);
 
 typedef struct {
-    siri_ble_notify_cb_t       on_notify;
-    siri_ble_connected_cb_t    on_connected;     // optional
+    siri_ble_notify_cb_t on_notify;
+    siri_ble_connected_cb_t on_connected;        // optional
     siri_ble_disconnected_cb_t on_disconnected;  // optional
-    void                      *user;
+    void *user;
 } siri_ble_config_t;
 
 // Install callbacks and configure the BLE host. Call after nimble_port_init

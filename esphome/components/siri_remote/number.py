@@ -3,6 +3,8 @@ ESPHome Preferences (NVS). User config is just `type:` + `name:`; min/max/
 step/initial defaults are filled in per-type by codegen, but any of them
 may be overridden in YAML."""
 
+from typing import NamedTuple
+
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.components import number
@@ -30,31 +32,34 @@ SiriRemoteNumber = siri_remote_ns.class_(
 )
 SiriRemoteKnob = siri_remote_ns.enum("SiriRemoteKnob", is_class=True)
 
-# (min, max, step, initial, kind enum, hub-setter method name)
+
+class KnobSpec(NamedTuple):
+    min_value: int
+    max_value: int
+    step: int
+    initial: int
+    kind: object  # SiriRemoteKnob enum value
+    setter: str  # SiriRemoteHub setter method name
+
+
 TYPES = {
-    CONF_SWIPE_Y_PRIORITY: (
-        0, 200, 5, 30,
-        SiriRemoteKnob.SwipeYPriority, "set_swipe_y_pri_number",
+    CONF_SWIPE_Y_PRIORITY: KnobSpec(
+        0, 200, 5, 30, SiriRemoteKnob.SwipeYPriority, "set_swipe_y_pri_number",
     ),
-    CONF_SWIPE_MIN_DISTANCE: (
-        0, 500, 10, 40,
-        SiriRemoteKnob.SwipeMinDistance, "set_swipe_dist_number",
+    CONF_SWIPE_MIN_DISTANCE: KnobSpec(
+        0, 500, 10, 40, SiriRemoteKnob.SwipeMinDistance, "set_swipe_dist_number",
     ),
-    CONF_DOUBLE_CLICK_WINDOW_MS: (
-        0, 2000, 50, 300,
-        SiriRemoteKnob.DoubleWindowMs, "set_dbl_ms_number",
+    CONF_DOUBLE_CLICK_WINDOW_MS: KnobSpec(
+        0, 2000, 50, 300, SiriRemoteKnob.DoubleWindowMs, "set_dbl_ms_number",
     ),
-    CONF_HOLD_THRESHOLD_MS: (
-        0, 10000, 100, 700,
-        SiriRemoteKnob.HoldThresholdMs, "set_hold_ms_number",
+    CONF_HOLD_THRESHOLD_MS: KnobSpec(
+        0, 10000, 100, 700, SiriRemoteKnob.HoldThresholdMs, "set_hold_ms_number",
     ),
-    CONF_BATTERY_LOW_PCT: (
-        0, 100, 5, 20,
-        SiriRemoteKnob.BatteryLowPct, "set_bat_low_number",
+    CONF_BATTERY_LOW_PCT: KnobSpec(
+        0, 100, 5, 20, SiriRemoteKnob.BatteryLowPct, "set_bat_low_number",
     ),
-    CONF_BLE_SLAVE_LATENCY: (
-        0, 500, 20, 400,
-        SiriRemoteKnob.BleSlaveLatency, "set_ble_lat_number",
+    CONF_BLE_SLAVE_LATENCY: KnobSpec(
+        0, 500, 20, 400, SiriRemoteKnob.BleSlaveLatency, "set_ble_lat_number",
     ),
 }
 
@@ -73,13 +78,12 @@ CONFIG_SCHEMA = (
 
 
 async def to_code(config):
-    type_ = config[CONF_TYPE]
-    min_v, max_v, step_v, init_v, kind, setter_name = TYPES[type_]
+    spec = TYPES[config[CONF_TYPE]]
 
-    min_value = config.get(CONF_MIN_VALUE, min_v)
-    max_value = config.get(CONF_MAX_VALUE, max_v)
-    step = config.get(CONF_STEP, step_v)
-    initial = config.get(CONF_INITIAL_VALUE, init_v)
+    min_value = config.get(CONF_MIN_VALUE, spec.min_value)
+    max_value = config.get(CONF_MAX_VALUE, spec.max_value)
+    step = config.get(CONF_STEP, spec.step)
+    initial = config.get(CONF_INITIAL_VALUE, spec.initial)
 
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
@@ -87,10 +91,10 @@ async def to_code(config):
         var, config, min_value=min_value, max_value=max_value, step=step,
     )
 
-    cg.add(var.set_kind(kind))
+    cg.add(var.set_kind(spec.kind))
     cg.add(var.set_initial_value(float(initial)))
     cg.add(var.set_restore_value(config[CONF_RESTORE_VALUE]))
 
     hub = await cg.get_variable(config[CONF_SIRI_REMOTE_ID])
     cg.add(var.set_hub(hub))
-    cg.add(getattr(hub, setter_name)(var))
+    cg.add(getattr(hub, spec.setter)(var))

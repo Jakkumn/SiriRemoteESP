@@ -16,14 +16,17 @@ static void capture_cb(const event_state_event_t *evt, void *user)
     captured[captured_count++] = *evt;
 }
 
-static void reset_capture(void) { captured_count = 0; }
+static void reset_capture(void)
+{
+    captured_count = 0;
+}
 
 static event_state_t *make_es(uint32_t double_ms, uint32_t hold_ms)
 {
     event_state_config_t cfg = {
-        .double_click_max_ms        = double_ms,
-        .hold_min_ms                = hold_ms,
-        .swipe_min_distance         = 40,
+        .double_click_max_ms = double_ms,
+        .hold_min_ms = hold_ms,
+        .swipe_min_distance = 40,
         .swipe_y_priority_threshold = 30,
     };
     event_state_t *es = event_state_create(&cfg, capture_cb, NULL);
@@ -184,7 +187,7 @@ static void test_click_then_hold(void)
     event_state_feed_buttons(es, SIRI_BTN_MUTE, 0);
     event_state_feed_buttons(es, 0, 100);
     event_state_feed_buttons(es, SIRI_BTN_MUTE, 200);  // second press, inside window
-    event_state_tick(es, 900);  // now-200 = 700ms → hold crosses
+    event_state_tick(es, 900);                         // now-200 = 700ms → hold crosses
 
     assert(captured_count == 2);
     assert(captured[0].action == EVT_CLICK);
@@ -241,12 +244,15 @@ static void test_swipe_up(void)
     // Simulate a swipe: finger down at (100, -50), lifts at (110, 50) → dy > 0 = UP
     siri_touch_frame_t f = {.x = 100, .y = -50, .pressure = 50, .finger_down = true};
     event_state_feed_touch(es, &f, 0);
-    f.x = 110; f.y = 0;
+    f.x = 110;
+    f.y = 0;
     event_state_feed_touch(es, &f, 50);
-    f.x = 110; f.y = 50;
+    f.x = 110;
+    f.y = 50;
     event_state_feed_touch(es, &f, 100);
     // Finger lifts
-    f.finger_down = false; f.pressure = 0;
+    f.finger_down = false;
+    f.pressure = 0;
     event_state_feed_touch(es, &f, 150);
 
     assert(captured_count == 1);
@@ -315,7 +321,8 @@ static void test_y_priority_overrides_drifty_x(void)
 
     siri_touch_frame_t f = {.x = 100, .y = 50, .pressure = 50, .finger_down = true};
     event_state_feed_touch(es, &f, 0);
-    f.x = 250; f.y = -10;  // dx=+150, dy=-60 — X dominant by raw magnitude
+    f.x = 250;
+    f.y = -10;  // dx=+150, dy=-60 — X dominant by raw magnitude
     event_state_feed_touch(es, &f, 100);
     f.finger_down = false;
     event_state_feed_touch(es, &f, 150);
@@ -332,9 +339,9 @@ static void test_y_priority_disabled_falls_back(void)
     // With the priority threshold = 0, classification reverts to plain
     // |dy| > |dx|, meaning the same gesture would now misclassify as swipe-left.
     event_state_config_t cfg = {
-        .double_click_max_ms        = 300,
-        .hold_min_ms                = 700,
-        .swipe_min_distance         = 40,
+        .double_click_max_ms = 300,
+        .hold_min_ms = 700,
+        .swipe_min_distance = 40,
         .swipe_y_priority_threshold = 0,  // disabled
     };
     event_state_t *es = event_state_create(&cfg, capture_cb, NULL);
@@ -342,7 +349,8 @@ static void test_y_priority_disabled_falls_back(void)
 
     siri_touch_frame_t f = {.x = 100, .y = 50, .pressure = 50, .finger_down = true};
     event_state_feed_touch(es, &f, 0);
-    f.x = 250; f.y = -10;  // dx=+150, dy=-60
+    f.x = 250;
+    f.y = -10;  // dx=+150, dy=-60
     event_state_feed_touch(es, &f, 100);
     f.finger_down = false;
     event_state_feed_touch(es, &f, 150);
@@ -361,7 +369,8 @@ static void test_micro_touch_below_threshold(void)
     // Tiny travel — below the swipe_min_distance of 40.
     siri_touch_frame_t f = {.x = 100, .y = 0, .pressure = 30, .finger_down = true};
     event_state_feed_touch(es, &f, 0);
-    f.x = 120; f.y = 10;
+    f.x = 120;
+    f.y = 10;
     event_state_feed_touch(es, &f, 50);
     f.finger_down = false;
     event_state_feed_touch(es, &f, 100);
@@ -378,7 +387,8 @@ static void test_diagonal_uses_larger_axis(void)
 
     siri_touch_frame_t f = {.x = 100, .y = 0, .pressure = 50, .finger_down = true};
     event_state_feed_touch(es, &f, 0);
-    f.x = 150; f.y = 120;  // dx = 50, dy = 120
+    f.x = 150;
+    f.y = 120;  // dx = 50, dy = 120
     event_state_feed_touch(es, &f, 100);
     f.finger_down = false;
     event_state_feed_touch(es, &f, 150);
@@ -429,8 +439,8 @@ static void test_set_double_click_max_ms(void)
     // immediately rather than waiting for the double-window.
     event_state_set_double_click_max_ms(es, 0);
 
-    event_state_feed_buttons(es, 0x0001, 0);    // press TV
-    event_state_feed_buttons(es, 0x0000, 50);   // release
+    event_state_feed_buttons(es, 0x0001, 0);   // press TV
+    event_state_feed_buttons(es, 0x0000, 50);  // release
     assert(captured_count == 1);
     assert(captured[0].action == EVT_CLICK);
     event_state_destroy(es);
@@ -463,7 +473,8 @@ static void test_set_swipe_y_priority(void)
 
     siri_touch_frame_t f = {.x = 0, .y = 0, .pressure = 50, .finger_down = true};
     event_state_feed_touch(es, &f, 0);
-    f.x = 50; f.y = 35;
+    f.x = 50;
+    f.y = 35;
     event_state_feed_touch(es, &f, 100);
     f.finger_down = false;
     event_state_feed_touch(es, &f, 150);
