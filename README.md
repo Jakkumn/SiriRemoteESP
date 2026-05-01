@@ -1,4 +1,4 @@
-# siri-remote-ha-bridge
+# SiriRemoteESP
 
 An ESP32 BLE bridge that pairs with an Apple Siri Remote (gen 3) and surfaces
 button + clickpad + voice events to Home Assistant. Two install paths: an
@@ -23,8 +23,8 @@ fill in your secrets, run `esphome run`. No ESP-IDF or `make` knowledge needed.
 
 1. Clone (or pin via the GitHub form below).
    ```bash
-   git clone https://github.com/cmehl/siri-remote-ha-bridge
-   cd siri-remote-ha-bridge
+   git clone https://github.com/Jakkumn/SiriRemoteESP
+   cd SiriRemoteESP
    ```
 2. Create your secrets file from the template:
    ```bash
@@ -46,7 +46,7 @@ To consume the component without cloning, point ESPHome at the GitHub repo:
 
 ```yaml
 external_components:
-  - source: github://cmehl/siri-remote-ha-bridge@v0.4.0
+  - source: github://Jakkumn/SiriRemoteESP@v0.0.1
     path: esphome/components
 ```
 
