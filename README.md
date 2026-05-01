@@ -5,10 +5,11 @@ button + clickpad + voice events to Home Assistant. Two install paths: an
 ESPHome external component for end users, and a standalone ESP-IDF build for
 hacking on the C components.
 
-**Status:** Phase 4 closed. ESPHome wrap is the recommended install path; the
-standalone build remains available for development. Phase 5.A (voice capture
-+ on-device Opus decode) is shipped and verified end-to-end. Phase 5.B will
-swap the dev-only TCP audio sink for ESPHome's `voice_assistant` transport.
+**Status:** Phase 5 shipped. ESPHome wrap is the recommended install path;
+the standalone build remains available for development. The full pipeline
+— button + clickpad + voice capture with on-device Opus decode feeding
+ESPHome's `voice_assistant` — is verified end-to-end. Outstanding work is
+limited to research items (accelerometer / motion telemetry probe).
 
 ## Hardware
 
