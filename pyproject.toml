@@ -1,0 +1,9 @@
+[project]
+name = "apple-siri-tv-g3-esp-ha"
+version = "0.0.1"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "esphome>=2026.4.3",
+]
