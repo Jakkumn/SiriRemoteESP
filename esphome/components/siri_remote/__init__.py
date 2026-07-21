@@ -5,8 +5,6 @@ Shares the C components (siri_ble, siri_audio, report_decoder, event_state)
 with the standalone idf.py build at <repo>/components/ via in-tree
 symlinks; both build paths consume the same source files."""
 
-import os
-
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.components import esp32, voice_assistant
@@ -130,16 +128,13 @@ async def to_code(config):
         ref="~0.3.3",
     )
 
-    # esp_central.h is an internal header used by siri_ble.c + peer.c.
-    # We deliberately don't symlink it into the component dir — otherwise
-    # ESPHome's esphome.h auto-include pulls it into main.cpp where the
-    # NimBLE prereq symbols aren't visible. Inject the parent dir as an
-    # include path so the C sources still find it.
-    component_dir = os.path.dirname(os.path.abspath(__file__))
-    siri_ble_internal = os.path.normpath(
-        os.path.join(component_dir, "..", "..", "..", "components", "siri_ble")
-    )
-    cg.add_build_flag(f"-I{siri_ble_internal}")
+    # esp_central.h is an internal header used by siri_ble.c + peer.c. It is
+    # symlinked into this component dir so it resolves from the component's own
+    # (always-present) include path rather than a -I build flag pointing outside
+    # the copied `src` tree — that flag stopped reaching the ESP-IDF component
+    # compile on the 2026.07 toolchain. The header guards its body behind
+    # `#ifndef __cplusplus`, so ESPHome's esphome.h auto-include into main.cpp
+    # (C++) expands to nothing and the NimBLE-only types stay out of scope there.
 
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)

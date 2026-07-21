@@ -7,6 +7,13 @@
 #ifndef H_ESP_CENTRAL_
 #define H_ESP_CENTRAL_
 
+/* Consumed only by the C sources (siri_ble.c, peer.c). This header is symlinked
+ * into the ESPHome component dir so it resolves from the component's own include
+ * path, but that also makes ESPHome's generated esphome.h pull it into main.cpp.
+ * The NimBLE-only types declared below (os_mbuf, ble_uuid_t, SLIST_*, MYNEWT_VAL)
+ * aren't in scope there, so expand to nothing when compiled as C++. */
+#ifndef __cplusplus
+
 #include "modlog/modlog.h"
 #ifdef __cplusplus
 extern "C" {
@@ -118,5 +125,7 @@ int peer_set_addr(uint16_t conn_handle, uint8_t *peer_addr);
 #ifdef __cplusplus
 }
 #endif
+
+#endif /* !__cplusplus */
 
 #endif

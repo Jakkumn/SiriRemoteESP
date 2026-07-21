@@ -3,7 +3,7 @@ name = "apple-siri-tv-g3-esp-ha"
 version = "0.0.1"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12,<3.15"
 dependencies = [
-    "esphome>=2026.4.3",
+    "esphome>=2026.7.1",
 ]
