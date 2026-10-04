@@ -170,6 +170,26 @@ async def to_code(config):
 
     _pin_sdkconfig()
 
+    # ESPHome 2026.9 started excluding built-in ESP-IDF components by default to
+    # cut build time, and both of these are on that list:
+    #
+    #   "bt",        # re-included by request_bluetooth()
+    #   "esp_coex",  # re-included by esp32_ble_tracker, zigbee
+    #
+    # This component drives NimBLE directly rather than going through ESPHome's
+    # esp32_ble, so nothing else in the build asks for them and ESP-IDF drops
+    # the component entirely. The failure is a confusing one — every siri_ble.c
+    # include of host/ble_hs.h fails with "Maybe one of the components needs to
+    # add the missing header directory", pointing at INCLUDE_DIRS rather than at
+    # a missing component.
+    #
+    # Setting CONFIG_BT_ENABLED in _pin_sdkconfig() is NOT enough: sdkconfig
+    # options don't un-exclude a component. Both helpers exist back to 2026.7.x,
+    # where the exclusion lists didn't yet contain these, so calling them is
+    # correct on old and new ESPHome alike.
+    esp32.request_bluetooth()
+    esp32.request_software_coexistence()
+
     # Opus decoder, sourced via the IDF Component Manager registry
     # (`esphome/micro-opus`). The registry archive bundles the upstream
     # xiph/opus + ogg-demuxer source — no submodule init step needed.

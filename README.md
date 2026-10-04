@@ -55,7 +55,7 @@ To consume the component without cloning, point ESPHome at the GitHub repo:
 
 ```yaml
 external_components:
-  - source: github://Jakkumn/SiriRemoteESP@v0.1.0
+  - source: github://Jakkumn/SiriRemoteESP@v0.1.1
     path: esphome/components
 ```
 

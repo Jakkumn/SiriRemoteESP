@@ -171,8 +171,19 @@ There is no on-device test harness; anything touching `siri_ble.c` or `siri_audi
   byte-identical whether Kconfig or ESPHome codegen supplied them. Preserve that when adding
   new conditional features.
 - `esphome/components/siri_remote/__init__.py::_pin_sdkconfig()` forces NimBLE on, Bluedroid
-  off, PSRAM octal-mode on. ESPHome defaults do not work for this component; changes there
-  must match `sdkconfig.defaults` on the standalone side.
+  off, PSRAM octal-mode on, and raises the ESP-IDF log ceiling. ESPHome defaults do not work
+  for this component; changes there must match `sdkconfig.defaults` on the standalone side.
+- **`to_code()` must call `esp32.request_bluetooth()` and
+  `esp32.request_software_coexistence()`.** ESPHome 2026.9 began excluding built-in IDF
+  components by default, and `bt` / `esp_coex` are on that list. We drive NimBLE directly
+  instead of via ESPHome's `esp32_ble`, so nothing else requests them and ESP-IDF drops the
+  component — every `host/ble_hs.h` include then fails with a message that blames
+  `INCLUDE_DIRS`. Setting `CONFIG_BT_ENABLED` does **not** help: sdkconfig options cannot
+  un-exclude a component.
+- **Build against more than one ESPHome release before tagging.** `uv.lock` pins a single
+  version, and v0.1.0 shipped broken on current ESPHome because every check ran on 2026.7.1
+  while users' Builder add-ons run 2026.9.x. `uvx --from esphome==<ver> esphome compile`
+  gives an isolated check without disturbing the project venv.
 - Comments in this codebase record *why* (empirical findings, Apple firmware behaviour,
   rejected alternatives). Keep that density; don't strip them as noise.
 
