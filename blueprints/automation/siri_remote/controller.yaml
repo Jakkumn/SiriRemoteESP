@@ -164,10 +164,13 @@ blueprint:
       default: []
       selector: { action: {} }
 
-# Each pulse action is a single fast call. If Home Assistant is loaded enough
-# that the previous run hasn't finished, silently dropping one step of a ramp
-# is the correct behaviour — queueing would lag behind the user's finger.
-mode: single
+# Pulses arrive ~10/sec while a button is held. `single` would silently drop
+# every pulse that lands while a previous run is still going, which at this
+# rate is most of them. Parallel runs don't block each other and the actions
+# are idempotent increments, so ordering doesn't matter. max is generous
+# enough that a few seconds of holding can't exhaust it.
+mode: parallel
+max: 25
 max_exceeded: silent
 
 triggers:
@@ -177,16 +180,6 @@ triggers:
 variables:
   bridge_device: !input bridge_device
   typematic_delay_ms: !input typematic_delay_ms
-  # Values cross the ESPHome API as strings — HA compares with == and will not
-  # coerce, so every numeric comparison needs an explicit | int.
-  btn: "{{ trigger.event.data.button }}"
-  rpt: "{{ trigger.event.data.repeat | int }}"
-  held: "{{ trigger.event.data.held_ms | int }}"
-  is_press: "{{ trigger.event.data.repeat | int == 0 }}"
-  is_held: >-
-    {{ trigger.event.data.repeat | int > 0
-       and trigger.event.data.held_ms | int >= (typematic_delay_ms | int) }}
-
 conditions:
   # HA's ESPHome integration injects device_id into every event it fires, so we
   # match on that rather than the payload's human-readable `device` name. It is
@@ -199,67 +192,145 @@ conditions:
 actions:
   - choose:
       # Select (clickpad centre)
-      - conditions: "{{ btn == 'select' and is_press }}"
+      - conditions: >-
+          {{ trigger.event.data.button == 'select'
+             and trigger.event.data.repeat | int == 0 }}
         sequence: !input select_press
-      - conditions: "{{ btn == 'select' and is_held }}"
+      - conditions: >-
+          {{ trigger.event.data.button == 'select'
+             and trigger.event.data.repeat | int > 0
+             and trigger.event.data.held_ms | int
+                 >= (typematic_delay_ms | int) }}
         sequence: !input select_held
       # Up (clickpad)
-      - conditions: "{{ btn == 'up' and is_press }}"
+      - conditions: >-
+          {{ trigger.event.data.button == 'up'
+             and trigger.event.data.repeat | int == 0 }}
         sequence: !input up_press
-      - conditions: "{{ btn == 'up' and is_held }}"
+      - conditions: >-
+          {{ trigger.event.data.button == 'up'
+             and trigger.event.data.repeat | int > 0
+             and trigger.event.data.held_ms | int
+                 >= (typematic_delay_ms | int) }}
         sequence: !input up_held
       # Right (clickpad)
-      - conditions: "{{ btn == 'right' and is_press }}"
+      - conditions: >-
+          {{ trigger.event.data.button == 'right'
+             and trigger.event.data.repeat | int == 0 }}
         sequence: !input right_press
-      - conditions: "{{ btn == 'right' and is_held }}"
+      - conditions: >-
+          {{ trigger.event.data.button == 'right'
+             and trigger.event.data.repeat | int > 0
+             and trigger.event.data.held_ms | int
+                 >= (typematic_delay_ms | int) }}
         sequence: !input right_held
       # Down (clickpad)
-      - conditions: "{{ btn == 'down' and is_press }}"
+      - conditions: >-
+          {{ trigger.event.data.button == 'down'
+             and trigger.event.data.repeat | int == 0 }}
         sequence: !input down_press
-      - conditions: "{{ btn == 'down' and is_held }}"
+      - conditions: >-
+          {{ trigger.event.data.button == 'down'
+             and trigger.event.data.repeat | int > 0
+             and trigger.event.data.held_ms | int
+                 >= (typematic_delay_ms | int) }}
         sequence: !input down_held
       # Left (clickpad)
-      - conditions: "{{ btn == 'left' and is_press }}"
+      - conditions: >-
+          {{ trigger.event.data.button == 'left'
+             and trigger.event.data.repeat | int == 0 }}
         sequence: !input left_press
-      - conditions: "{{ btn == 'left' and is_held }}"
+      - conditions: >-
+          {{ trigger.event.data.button == 'left'
+             and trigger.event.data.repeat | int > 0
+             and trigger.event.data.held_ms | int
+                 >= (typematic_delay_ms | int) }}
         sequence: !input left_held
       # Play / Pause
-      - conditions: "{{ btn == 'play_pause' and is_press }}"
+      - conditions: >-
+          {{ trigger.event.data.button == 'play_pause'
+             and trigger.event.data.repeat | int == 0 }}
         sequence: !input play_pause_press
-      - conditions: "{{ btn == 'play_pause' and is_held }}"
+      - conditions: >-
+          {{ trigger.event.data.button == 'play_pause'
+             and trigger.event.data.repeat | int > 0
+             and trigger.event.data.held_ms | int
+                 >= (typematic_delay_ms | int) }}
         sequence: !input play_pause_held
       # Volume Up
-      - conditions: "{{ btn == 'volume_up' and is_press }}"
+      - conditions: >-
+          {{ trigger.event.data.button == 'volume_up'
+             and trigger.event.data.repeat | int == 0 }}
         sequence: !input volume_up_press
-      - conditions: "{{ btn == 'volume_up' and is_held }}"
+      - conditions: >-
+          {{ trigger.event.data.button == 'volume_up'
+             and trigger.event.data.repeat | int > 0
+             and trigger.event.data.held_ms | int
+                 >= (typematic_delay_ms | int) }}
         sequence: !input volume_up_held
       # Volume Down
-      - conditions: "{{ btn == 'volume_down' and is_press }}"
+      - conditions: >-
+          {{ trigger.event.data.button == 'volume_down'
+             and trigger.event.data.repeat | int == 0 }}
         sequence: !input volume_down_press
-      - conditions: "{{ btn == 'volume_down' and is_held }}"
+      - conditions: >-
+          {{ trigger.event.data.button == 'volume_down'
+             and trigger.event.data.repeat | int > 0
+             and trigger.event.data.held_ms | int
+                 >= (typematic_delay_ms | int) }}
         sequence: !input volume_down_held
       # Mute
-      - conditions: "{{ btn == 'mute' and is_press }}"
+      - conditions: >-
+          {{ trigger.event.data.button == 'mute'
+             and trigger.event.data.repeat | int == 0 }}
         sequence: !input mute_press
-      - conditions: "{{ btn == 'mute' and is_held }}"
+      - conditions: >-
+          {{ trigger.event.data.button == 'mute'
+             and trigger.event.data.repeat | int > 0
+             and trigger.event.data.held_ms | int
+                 >= (typematic_delay_ms | int) }}
         sequence: !input mute_held
       # Back
-      - conditions: "{{ btn == 'back' and is_press }}"
+      - conditions: >-
+          {{ trigger.event.data.button == 'back'
+             and trigger.event.data.repeat | int == 0 }}
         sequence: !input back_press
-      - conditions: "{{ btn == 'back' and is_held }}"
+      - conditions: >-
+          {{ trigger.event.data.button == 'back'
+             and trigger.event.data.repeat | int > 0
+             and trigger.event.data.held_ms | int
+                 >= (typematic_delay_ms | int) }}
         sequence: !input back_held
       # TV
-      - conditions: "{{ btn == 'tv' and is_press }}"
+      - conditions: >-
+          {{ trigger.event.data.button == 'tv'
+             and trigger.event.data.repeat | int == 0 }}
         sequence: !input tv_press
-      - conditions: "{{ btn == 'tv' and is_held }}"
+      - conditions: >-
+          {{ trigger.event.data.button == 'tv'
+             and trigger.event.data.repeat | int > 0
+             and trigger.event.data.held_ms | int
+                 >= (typematic_delay_ms | int) }}
         sequence: !input tv_held
       # Power
-      - conditions: "{{ btn == 'power' and is_press }}"
+      - conditions: >-
+          {{ trigger.event.data.button == 'power'
+             and trigger.event.data.repeat | int == 0 }}
         sequence: !input power_press
-      - conditions: "{{ btn == 'power' and is_held }}"
+      - conditions: >-
+          {{ trigger.event.data.button == 'power'
+             and trigger.event.data.repeat | int > 0
+             and trigger.event.data.held_ms | int
+                 >= (typematic_delay_ms | int) }}
         sequence: !input power_held
       # Mic (Siri)
-      - conditions: "{{ btn == 'mic' and is_press }}"
+      - conditions: >-
+          {{ trigger.event.data.button == 'mic'
+             and trigger.event.data.repeat | int == 0 }}
         sequence: !input mic_press
-      - conditions: "{{ btn == 'mic' and is_held }}"
+      - conditions: >-
+          {{ trigger.event.data.button == 'mic'
+             and trigger.event.data.repeat | int > 0
+             and trigger.event.data.held_ms | int
+                 >= (typematic_delay_ms | int) }}
         sequence: !input mic_held

@@ -29,7 +29,7 @@ external_components:
   - source:
       type: git
       url: https://github.com/Jakkumn/SiriRemoteESP
-      ref: v0.0.1
+      ref: v0.1.0
       path: esphome/components
     components: [siri_remote]
 

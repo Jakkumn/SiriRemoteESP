@@ -104,10 +104,13 @@ blueprint:
       selector:
         action: {}
 
-# Each pulse action is a single fast call. If Home Assistant is loaded enough
-# that the previous run hasn't finished, silently dropping one step of a ramp
-# is the correct behaviour — queueing would lag behind the user's finger.
-mode: single
+# Pulses arrive ~10/sec while a button is held. `single` would silently drop
+# every pulse that lands while a previous run is still going, which at this
+# rate is most of them. Parallel runs don't block each other and the actions
+# are idempotent increments, so ordering doesn't matter. max is generous
+# enough that a few seconds of holding can't exhaust it.
+mode: parallel
+max: 25
 max_exceeded: silent
 
 triggers:
@@ -123,8 +126,6 @@ variables:
   rate_divisor: !input rate_divisor
   # Values cross the ESPHome API as strings — HA compares event_data with ==
   # and will not coerce, so every numeric comparison needs an explicit | int.
-  rpt: "{{ trigger.event.data.repeat | int }}"
-  held: "{{ trigger.event.data.held_ms | int }}"
 
 conditions:
   # HA's ESPHome integration injects device_id into every event it fires, so we
@@ -136,9 +137,10 @@ conditions:
     value_template: "{{ trigger.event.data.device_id == bridge_device }}"
   - condition: template
     value_template: >-
-      {{ rpt == 0 or (repeat_mode == 'repeat'
-                      and held >= (typematic_delay_ms | int)
-                      and rpt % (rate_divisor | int) == 0) }}
+      {{ trigger.event.data.repeat | int == 0
+         or (repeat_mode == 'repeat'
+             and trigger.event.data.held_ms | int >= (typematic_delay_ms | int)
+             and trigger.event.data.repeat | int % (rate_divisor | int) == 0) }}
   - condition: and
     conditions: !input extra_conditions
 
