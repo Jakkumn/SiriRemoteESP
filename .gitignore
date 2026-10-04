@@ -13,3 +13,19 @@ dependencies.lock
 secrets.yaml
 .esphome/
 .esphome-build/
+
+# Local hardware-test config (scratch, not shipped)
+local-test.yaml
+
+# Editor swap files — a swap of secrets.yaml holds its plaintext contents
+*.swp
+*.swo
+
+# Serial-log captures from hardware debugging
+output*.txt
+
+# Local build/tool caches
+.cache/
+
+# Local design scratch, not shipped
+PULSE_REFACTOR_PLAN.md

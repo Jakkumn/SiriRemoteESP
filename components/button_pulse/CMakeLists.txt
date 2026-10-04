@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "event_state.c"
+    SRCS "button_pulse.c"
     INCLUDE_DIRS "include"
     REQUIRES report_decoder
 )

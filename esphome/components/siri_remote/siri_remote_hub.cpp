@@ -7,6 +7,7 @@
 #include "esphome/components/api/api_pb2.h"
 #include "esphome/components/api/api_server.h"
 #include "esphome/components/voice_assistant/voice_assistant.h"
+#include "esphome/core/application.h"
 #include "esphome/core/automation.h"
 #include "esphome/core/helpers.h"
 
@@ -36,19 +37,6 @@ static const char *const TAG = "siri_remote";
 
 static constexpr uint32_t TICK_PERIOD_MS = 50;
 
-// Fallbacks for the case where YAML omits a Number entirely. Match the
-// standalone build's CONFIG_EVENT_* defaults so a wrap missing all six
-// Numbers still behaves like the standalone first-boot.
-static constexpr uint32_t FALLBACK_DOUBLE_CLICK_MAX_MS = 300;
-static constexpr uint32_t FALLBACK_HOLD_MIN_MS = 700;
-static constexpr int32_t FALLBACK_SWIPE_MIN_DISTANCE = 40;
-static constexpr int32_t FALLBACK_SWIPE_Y_PRIORITY = 30;
-static constexpr uint16_t FALLBACK_BLE_SLAVE_LATENCY = 400;
-
-static float knob_value(SiriRemoteNumber *n, float fallback) {
-  return (n != nullptr && n->has_state()) ? n->state : fallback;
-}
-
 static void ble_notify_thunk(uint16_t attr_handle, const uint8_t *data,
                              size_t len, void *user) {
   static_cast<SiriRemoteHub *>(user)->on_ble_notify(attr_handle, data, len);
@@ -62,7 +50,7 @@ static void ble_disconnected_thunk(void *user) {
   static_cast<SiriRemoteHub *>(user)->on_ble_disconnected();
 }
 
-static void emit_thunk(const event_state_event_t *evt, void *user) {
+static void emit_thunk(const button_pulse_event_t *evt, void *user) {
   static_cast<SiriRemoteHub *>(user)->emit_event(evt);
 }
 
@@ -119,18 +107,11 @@ void SiriRemoteHub::setup() {
     return;
   }
 
-  event_state_config_t es_cfg = {};
-  es_cfg.double_click_max_ms = static_cast<uint32_t>(
-      knob_value(dbl_ms_number_, FALLBACK_DOUBLE_CLICK_MAX_MS));
-  es_cfg.hold_min_ms = static_cast<uint32_t>(
-      knob_value(hold_ms_number_, FALLBACK_HOLD_MIN_MS));
-  es_cfg.swipe_min_distance = static_cast<int32_t>(
-      knob_value(swipe_dist_number_, FALLBACK_SWIPE_MIN_DISTANCE));
-  es_cfg.swipe_y_priority_threshold = static_cast<int32_t>(
-      knob_value(swipe_y_pri_number_, FALLBACK_SWIPE_Y_PRIORITY));
-  es_ = event_state_create(&es_cfg, emit_thunk, this);
-  if (es_ == nullptr) {
-    ESP_LOGE(TAG, "event_state_create failed");
+  button_pulse_config_t pulse_cfg = {};
+  pulse_cfg.repeat_interval_ms = repeat_interval_ms_;
+  pulse_ = button_pulse_create(&pulse_cfg, emit_thunk, this);
+  if (pulse_ == nullptr) {
+    ESP_LOGE(TAG, "button_pulse_create failed");
     this->mark_failed();
     return;
   }
@@ -145,8 +126,7 @@ void SiriRemoteHub::setup() {
   // siri_ble_set_slave_latency caches the value internally and applies it
   // on the next CONN_UPDATE (or on the next bonded reconnect if no
   // connection is up yet). Safe to call after siri_ble_start.
-  siri_ble_set_slave_latency(static_cast<uint16_t>(
-      knob_value(ble_lat_number_, FALLBACK_BLE_SLAVE_LATENCY)));
+  siri_ble_set_slave_latency(ble_slave_latency_);
 
   if (voice_assistant_ != nullptr && auto_finish_response_) {
     // Bind a one-shot Action onto voice_assistant's tts_end_trigger so we
@@ -169,6 +149,9 @@ void SiriRemoteHub::dump_config() {
                 idle_disconnect_ms_);
   ESP_LOGCONFIG(TAG, "  Pairing-flush suppress: %" PRIu32 " ms",
                 pairing_flush_suppress_ms_);
+  ESP_LOGCONFIG(TAG, "  Pulse repeat interval: %" PRIu32 " ms (0 = press only)",
+                repeat_interval_ms_);
+  ESP_LOGCONFIG(TAG, "  BLE slave latency: %u", (unsigned) ble_slave_latency_);
   ESP_LOGCONFIG(TAG, "  Debug touch frames: %s", YESNO(debug_touch_frames_));
 #ifdef SIRI_REMOTE_DEBUG_PCM_TCP
   ESP_LOGCONFIG(TAG, "  Debug PCM TCP: %s:%u", pcm_tcp_host_.c_str(),
@@ -214,6 +197,9 @@ void SiriRemoteHub::start_nimble_() {
   ble_cfg.on_connected = ble_connected_thunk;
   ble_cfg.on_disconnected = ble_disconnected_thunk;
   ble_cfg.user = this;
+  // siri_ble owns the post-pairing blackout now — it covers every
+  // notification, not just buttons, and keeps both build paths identical.
+  ble_cfg.pairing_flush_suppress_ms = pairing_flush_suppress_ms_;
   ESP_ERROR_CHECK(siri_ble_start(&ble_cfg));
 
   nimble_port_freertos_init(nimble_host_task);
@@ -222,8 +208,8 @@ void SiriRemoteHub::start_nimble_() {
 void SiriRemoteHub::tick() {
   uint32_t now = now_ms();
   {
-    LockGuard guard(es_lock_);
-    event_state_tick(es_, now);
+    LockGuard guard(pulse_lock_);
+    button_pulse_tick(pulse_, now);
   }
   if (idle_disconnect_ms_ > 0) {
     uint32_t last = last_activity_ms_;
@@ -241,10 +227,6 @@ void SiriRemoteHub::on_ble_notify(uint16_t attr_handle, const uint8_t *data,
 
   switch (attr_handle) {
     case SIRI_HANDLE_BUTTON: {
-      if (now < suppress_buttons_until_ms_) {
-        ESP_LOGI(TAG, "suppressing buffered pairing-combo button notify");
-        return;
-      }
       uint16_t btns = siri_decode_button_bytes(data, len);
 
       bool mic_was = (prev_buttons_ & SIRI_BTN_MIC) != 0;
@@ -270,8 +252,8 @@ void SiriRemoteHub::on_ble_notify(uint16_t attr_handle, const uint8_t *data,
       }
       prev_buttons_ = btns;
 
-      LockGuard guard(es_lock_);
-      event_state_feed_buttons(es_, btns, now);
+      LockGuard guard(pulse_lock_);
+      button_pulse_feed_buttons(pulse_, btns, now);
       return;
     }
 
@@ -303,16 +285,21 @@ void SiriRemoteHub::on_ble_notify(uint16_t attr_handle, const uint8_t *data,
       return;
 
     case SIRI_HANDLE_TOUCH: {
+      // Touch/gesture support is deliberately dropped — swipes are not a
+      // feature of this firmware and nothing downstream consumes a frame.
+      // We stay subscribed to the touch CCCD rather than removing its
+      // SETUP_STEPS[] entry, because altering the setup chain risks the
+      // always-connected wake behaviour for no real gain (~50 frames/sec,
+      // and only while a finger is actually on the pad).
+      if (!debug_touch_frames_) {
+        return;
+      }
       siri_touch_frame_t frame;
       if (siri_decode_touch_frame(data, len, &frame)) {
-        if (debug_touch_frames_ || raw_stream_enabled_) {
-          ESP_LOGI(TAG,
-                   "touch x=%" PRId32 " y=%" PRId32 " p=%u down=%d ctr=%" PRIu32,
-                   frame.x, frame.y, (unsigned) frame.pressure,
-                   (int) frame.finger_down, frame.remote_counter);
-        }
-        LockGuard guard(es_lock_);
-        event_state_feed_touch(es_, &frame, now);
+        ESP_LOGD(TAG,
+                 "touch x=%" PRId32 " y=%" PRId32 " p=%u down=%d ctr=%" PRIu32,
+                 frame.x, frame.y, (unsigned) frame.pressure,
+                 (int) frame.finger_down, frame.remote_counter);
       }
       return;
     }
@@ -323,51 +310,13 @@ void SiriRemoteHub::on_ble_connected(uint32_t idle_ms) {
   const uint32_t now = now_ms();
   ESP_LOGI(TAG, "remote connected (idle %" PRIu32 " ms)", idle_ms);
   last_activity_ms_ = now;
-  if (idle_ms == 0) {
-    // Fresh first-bond — squash the pairing-combo HID flush Apple delivers
-    // right after the button CCCD subscribe lands.
-    suppress_buttons_until_ms_ = now + pairing_flush_suppress_ms_;
-  }
 }
 
 void SiriRemoteHub::on_ble_disconnected() {
   ESP_LOGI(TAG, "remote disconnected");
   last_activity_ms_ = 0;
-  LockGuard guard(es_lock_);
-  event_state_reset(es_, now_ms());
-}
-
-void SiriRemoteHub::apply_knob_change(SiriRemoteKnob kind, float value) {
-  switch (kind) {
-    case SiriRemoteKnob::SwipeYPriority: {
-      LockGuard guard(es_lock_);
-      event_state_set_swipe_y_priority(es_, static_cast<int32_t>(value));
-      return;
-    }
-    case SiriRemoteKnob::SwipeMinDistance: {
-      LockGuard guard(es_lock_);
-      event_state_set_swipe_min_distance(es_, static_cast<int32_t>(value));
-      return;
-    }
-    case SiriRemoteKnob::DoubleWindowMs: {
-      LockGuard guard(es_lock_);
-      event_state_set_double_click_max_ms(es_, static_cast<uint32_t>(value));
-      return;
-    }
-    case SiriRemoteKnob::HoldThresholdMs: {
-      LockGuard guard(es_lock_);
-      event_state_set_hold_min_ms(es_, static_cast<uint32_t>(value));
-      return;
-    }
-    case SiriRemoteKnob::BatteryLowPct:
-      // No setter — bat_low_number_->state is read at publish_battery time
-      // by future low-battery-derivation code. The Number persists for
-      // forward use; runtime adjustment is the persistence side effect.
-      return;
-    case SiriRemoteKnob::BleSlaveLatency:
-      siri_ble_set_slave_latency(static_cast<uint16_t>(value));
-      return;
-  }
+  LockGuard guard(pulse_lock_);
+  button_pulse_reset(pulse_);
 }
 
 void SiriRemoteHub::signal_response_finished() {
@@ -413,82 +362,93 @@ void SiriRemoteHub::on_pcm(const int16_t *samples, size_t count) {
 #endif
 }
 
-// emit_event runs on the BLE host (or esp_timer) task — defer the HA
-// service call to the main loop. evt is invalid after we return, so we
-// snapshot its fields by value into the lambda.
-void SiriRemoteHub::emit_event(const event_state_event_t *evt) {
-  const char *type = event_state_action_name(evt->action);
-  if (type == nullptr) return;
+// emit_event runs on the BLE host (or esp_timer) task — defer the HA event
+// to the main loop. evt is invalid after we return, so we snapshot its
+// fields by value into the lambda.
+//
+// Payload shape is the IR-style pulse: `repeat` indexes the pulse within a
+// hold (0 = the press itself) and `held_ms` measures how long it has been
+// down. Neither is a judgment — HA decides what counts as a click, a hold,
+// or a ramp. There is no release event; the pulses simply stop.
+void SiriRemoteHub::emit_event(const button_pulse_event_t *evt) {
+  const char *btn = siri_button_name(evt->button);
+  if (btn == nullptr) return;
 
-  const bool is_button_event = evt->action == EVT_CLICK
-                            || evt->action == EVT_DOUBLE_CLICK
-                            || evt->action == EVT_HOLD_START
-                            || evt->action == EVT_HOLD_END;
-  // hold_start fires at the threshold-cross with no duration yet; same for
-  // double_click which carries no duration in the standalone payload.
-  const bool has_duration = evt->action == EVT_CLICK || evt->action == EVT_HOLD_END;
+  const std::string button(btn);
+  const uint32_t repeat = evt->repeat;
+  const uint32_t held_ms = evt->held_ms;
 
-  std::string action(type);
-  std::string button;
-  uint32_t duration_ms = evt->duration_ms;
-  int32_t distance = evt->distance;
-
-  if (is_button_event) {
-    const char *btn = siri_button_name(evt->button);
-    button.assign(btn != nullptr ? btn : "unknown");
-    if (has_duration) {
-      ESP_LOGI(TAG, "event=%s button=%s duration=%" PRIu32 "ms",
-               type, button.c_str(), duration_ms);
-    } else {
-      ESP_LOGI(TAG, "event=%s button=%s", type, button.c_str());
-    }
+  // The press is worth seeing at INFO; repeats arrive ~10x/sec and would
+  // drown the log, so they sit at DEBUG.
+  if (repeat == 0) {
+    ESP_LOGI(TAG, "pulse button=%s press", button.c_str());
   } else {
-    ESP_LOGI(TAG, "event=%s distance=%" PRId32, type, distance);
+    ESP_LOGD(TAG, "pulse button=%s repeat=%" PRIu32 " held=%" PRIu32 "ms",
+             button.c_str(), repeat, held_ms);
   }
 
-  this->defer([action, button, duration_ms, distance, is_button_event, has_duration] {
-    if (api::global_api_server == nullptr) return;
+  this->defer([this, button, repeat, held_ms] {
+    // Gate on an actually-connected client. Without this, holding a button
+    // across an HA restart makes APIServer log a dropped-event warning for
+    // every pulse. Note is_connected() means "a client is attached", not
+    // "it has subscribed to actions yet" — upstream warns about that short
+    // window deliberately, and it is bounded, so we let it through.
+    if (api::global_api_server == nullptr ||
+        !api::global_api_server->is_connected()) {
+      if (!this->api_gate_logged_) {
+        this->api_gate_logged_ = true;
+        ESP_LOGW(TAG, "Home Assistant not connected — dropping button pulses");
+      }
+      return;
+    }
+    if (this->api_gate_logged_) {
+      this->api_gate_logged_ = false;
+      ESP_LOGI(TAG, "Home Assistant reconnected — resuming button pulses");
+    }
+
     // String storage must outlive the send call: every StringRef inside
     // resp points back into these locals (the FixedVector entries don't
     // copy). Captures-by-value in this lambda live until the lambda
     // returns, after which send_homeassistant_action has already
     // serialized the message.
-    static const std::string SERVICE = "esphome.siri_remote_event";
-    static const std::string K_ACTION = "action";
+    static const std::string SERVICE = "esphome.siri_remote_button";
+    static const std::string K_DEVICE = "device";
     static const std::string K_BUTTON = "button";
-    static const std::string K_DURATION_MS = "duration_ms";
-    static const std::string K_DISTANCE = "distance";
-    const std::string duration_str = is_button_event && has_duration
-                                       ? std::to_string(duration_ms)
-                                       : std::string();
-    const std::string distance_str = is_button_event ? std::string()
-                                                     : std::to_string(distance);
+    static const std::string K_REPEAT = "repeat";
+    static const std::string K_HELD_MS = "held_ms";
+
+    // Must match what HA shows as the device name so a blueprint can filter
+    // on device_attr(<device>, 'name'). get_friendly_name() is empty when
+    // the user sets only `name:`, and HA falls back to `name` in exactly
+    // that case — so mirror the fallback rather than emitting "".
+    const std::string device = App.get_friendly_name().empty()
+                                 ? App.get_name().str()
+                                 : App.get_friendly_name().str();
+    const std::string repeat_str = std::to_string(repeat);
+    const std::string held_str = std::to_string(held_ms);
 
     api::HomeassistantActionRequest resp;
     resp.service = StringRef(SERVICE);
     resp.is_event = true;
-
-    const size_t n_pairs = is_button_event ? (has_duration ? 3 : 2) : 2;
-    resp.data.init(n_pairs);
+    resp.data.init(4);
 
     auto &kv0 = resp.data.emplace_back();
-    kv0.key = StringRef(K_ACTION);
-    kv0.value = StringRef(action);
+    kv0.key = StringRef(K_DEVICE);
+    kv0.value = StringRef(device);
 
-    if (is_button_event) {
-      auto &kv1 = resp.data.emplace_back();
-      kv1.key = StringRef(K_BUTTON);
-      kv1.value = StringRef(button);
-      if (has_duration) {
-        auto &kv2 = resp.data.emplace_back();
-        kv2.key = StringRef(K_DURATION_MS);
-        kv2.value = StringRef(duration_str);
-      }
-    } else {
-      auto &kv1 = resp.data.emplace_back();
-      kv1.key = StringRef(K_DISTANCE);
-      kv1.value = StringRef(distance_str);
-    }
+    auto &kv1 = resp.data.emplace_back();
+    kv1.key = StringRef(K_BUTTON);
+    kv1.value = StringRef(button);
+
+    // Every value crosses the API as a string — HA compares event_data with
+    // == and will not coerce, so automations must use `| int`.
+    auto &kv2 = resp.data.emplace_back();
+    kv2.key = StringRef(K_REPEAT);
+    kv2.value = StringRef(repeat_str);
+
+    auto &kv3 = resp.data.emplace_back();
+    kv3.key = StringRef(K_HELD_MS);
+    kv3.value = StringRef(held_str);
 
     api::global_api_server->send_homeassistant_action(resp);
   });

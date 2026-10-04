@@ -1,0 +1,145 @@
+blueprint:
+  name: Siri Remote (3rd gen) — single button
+  description: |
+    Bind one Home Assistant action to one button on an Apple Siri Remote
+    (3rd gen) routed through the SiriRemoteESP bridge.
+
+    **How the bridge reports input.** It behaves like an IR remote. Pressing
+    a button fires `esphome.siri_remote_button` with `repeat: 0`; while you
+    keep holding it, the same event repeats every `repeat_interval_ms`
+    (100 ms by default) with `repeat` counting up and `held_ms` measuring how
+    long it has been down. **There is no release event** — the pulses simply
+    stop, exactly like an IR receiver seeing repeat frames end.
+
+    So a hold is not a state with a start and an end. It is a stream of
+    increments. "Turn something on at press and off at release" is not
+    expressible; model it as "do one step per pulse" instead.
+
+    **Two modes:**
+
+    - *Once per press* — fires a single time, however long you hold.
+      Right for toggles, power, and anything that should not repeat.
+    - *Repeat while held* — fires on the press, then again on every pulse
+      once the typematic delay has elapsed. Right for volume, channel,
+      scrolling, and anything incremental.
+
+    Install: drop this file into <HA config>/blueprints/automation/
+    siri_remote/button.yaml, then Settings → Automations → Blueprints.
+
+  domain: automation
+  source_url: https://github.com/Jakkumn/SiriRemoteESP/blob/main/blueprints/automation/siri_remote/button.yaml
+
+  input:
+    bridge_device:
+      name: Bridge
+      description: >-
+        The Siri Remote bridge this automation listens to. Required, so that
+        two bridges in one house don't trigger each other's automations.
+      selector:
+        device:
+          integration: esphome
+
+    button:
+      name: Button
+      description: Which physical button on the remote.
+      selector:
+        select:
+          options:
+            - { label: "Select (clickpad centre)", value: "select" }
+            - { label: "Up (clickpad)",            value: "up" }
+            - { label: "Right (clickpad)",         value: "right" }
+            - { label: "Down (clickpad)",          value: "down" }
+            - { label: "Left (clickpad)",          value: "left" }
+            - { label: "Play / Pause",             value: "play_pause" }
+            - { label: "Volume Up",                value: "volume_up" }
+            - { label: "Volume Down",              value: "volume_down" }
+            - { label: "Mute",                     value: "mute" }
+            - { label: "Back",                     value: "back" }
+            - { label: "TV",                       value: "tv" }
+            - { label: "Power",                    value: "power" }
+            - { label: "Mic (Siri)",               value: "mic" }
+
+    repeat_mode:
+      name: Repeat behaviour
+      description: >-
+        "Once per press" ignores the hold entirely. "Repeat while held" fires
+        again on every pulse after the typematic delay below.
+      default: "once"
+      selector:
+        select:
+          options:
+            - { label: "Once per press", value: "once" }
+            - { label: "Repeat while held", value: "repeat" }
+
+    typematic_delay_ms:
+      name: Typematic delay (ms)
+      description: >-
+        Repeat-while-held only. How long the button must be down before
+        repeating starts — the same idea as a keyboard's delay-before-repeat.
+        The press itself always fires immediately regardless of this value.
+      default: 400
+      selector:
+        number: { min: 0, max: 5000, step: 50, unit_of_measurement: ms, mode: box }
+
+    rate_divisor:
+      name: Repeat rate divisor
+      description: >-
+        Repeat-while-held only. 1 fires on every pulse (~10/sec). 3 fires on
+        every third, and so on. Raise it for expensive actions like changing
+        channels, where a full-rate ramp would queue up work.
+      default: 1
+      selector:
+        number: { min: 1, max: 20, step: 1, mode: box }
+
+    extra_conditions:
+      name: Additional conditions
+      description: Optional extra conditions, e.g. only after sunset.
+      default: []
+      selector:
+        condition: {}
+
+    action:
+      name: Action
+      description: What to run. For "repeat while held" this runs once per pulse.
+      selector:
+        action: {}
+
+# Each pulse action is a single fast call. If Home Assistant is loaded enough
+# that the previous run hasn't finished, silently dropping one step of a ramp
+# is the correct behaviour — queueing would lag behind the user's finger.
+mode: single
+max_exceeded: silent
+
+triggers:
+  - trigger: event
+    event_type: esphome.siri_remote_button
+    event_data:
+      button: !input button
+
+variables:
+  bridge_device: !input bridge_device
+  repeat_mode: !input repeat_mode
+  typematic_delay_ms: !input typematic_delay_ms
+  rate_divisor: !input rate_divisor
+  # Values cross the ESPHome API as strings — HA compares event_data with ==
+  # and will not coerce, so every numeric comparison needs an explicit | int.
+  rpt: "{{ trigger.event.data.repeat | int }}"
+  held: "{{ trigger.event.data.held_ms | int }}"
+
+conditions:
+  # HA's ESPHome integration injects device_id into every event it fires, so we
+  # match on that rather than the payload's human-readable `device` name. It is
+  # exact, it is literally what the device selector above returns, and it
+  # survives the user renaming the device in the UI — a name comparison would
+  # silently stop matching and give no error anywhere.
+  - condition: template
+    value_template: "{{ trigger.event.data.device_id == bridge_device }}"
+  - condition: template
+    value_template: >-
+      {{ rpt == 0 or (repeat_mode == 'repeat'
+                      and held >= (typematic_delay_ms | int)
+                      and rpt % (rate_divisor | int) == 0) }}
+  - condition: and
+    conditions: !input extra_conditions
+
+actions: !input action

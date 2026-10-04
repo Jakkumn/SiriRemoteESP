@@ -1,0 +1,85 @@
+# Drop-in config for ESPHome Device Builder (the Home Assistant add-on).
+#
+#   1. Create siri-bridge.yaml in Builder, paste this in.
+#   2. In Builder's "Secrets" editor, add wifi_ssid, wifi_password, api_key,
+#      and ota_password.
+#   3. Compile. First flash must be over USB (Builder OTA needs an existing
+#      firmware to upgrade); use https://web.esphome.io with the .factory.bin
+#      Builder produces.
+#   4. After "siri_remote setup complete" appears in the log, hold
+#      Back + Vol Up on the remote ~5 s to pair.
+#
+# Bump the @v… tag when a new release is cut. With a fixed tag and no
+# refresh: clause Builder caches the fetched source until the tag changes.
+
+esphome:
+  name: siri-bridge
+  friendly_name: Siri Remote Bridge
+
+esp32:
+  board: seeed_xiao_esp32s3
+  flash_size: 8MB
+  framework:
+    type: esp-idf
+
+external_components:
+  # `path:` lives inside `source:` when using the explicit git form. The
+  # github:// shorthand only works for repos with components/<name>/ at
+  # the root; ours are at esphome/components/siri_remote/.
+  - source:
+      type: git
+      url: https://github.com/Jakkumn/SiriRemoteESP
+      ref: v0.0.1
+      path: esphome/components
+    components: [siri_remote]
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+siri_remote:
+  # repeat_interval_ms: 100
+  # ble_slave_latency: 400
+  voice_assistant_id: siri_voice_assistant
+
+binary_sensor:
+  - platform: siri_remote
+    type: voice_active
+    name: "Siri Remote Voice Active"
+    device_class: running
+
+microphone:
+  - platform: siri_remote
+    id: siri_remote_mic
+
+voice_assistant:
+  id: siri_voice_assistant
+  microphone:
+    microphone: siri_remote_mic
+  use_wake_word: false
+
+sensor:
+  - platform: siri_remote
+    type: battery
+    name: "Siri Remote Battery"
+
+text_sensor:
+  - platform: siri_remote
+    type: charging
+    name: "Siri Remote Charging"
+
+button:
+  - platform: siri_remote
+    type: repair
+    name: "Siri Remote Re-pair"

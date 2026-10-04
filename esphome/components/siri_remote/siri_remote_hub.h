@@ -12,11 +12,10 @@
 
 #include "esp_timer.h"
 
-#include "event_state.h"
+#include "button_pulse.h"
 #include "report_decoder.h"
 #include "siri_audio.h"
 #include "siri_ble.h"
-#include "siri_remote_number.h"
 
 namespace esphome {
 
@@ -42,6 +41,8 @@ class SiriRemoteHub : public Component {
   void set_idle_disconnect_ms(uint32_t ms) { idle_disconnect_ms_ = ms; }
   void set_pairing_flush_suppress_ms(uint32_t ms) { pairing_flush_suppress_ms_ = ms; }
   void set_debug_touch_frames(bool v) { debug_touch_frames_ = v; }
+  void set_repeat_interval_ms(uint32_t ms) { repeat_interval_ms_ = ms; }
+  void set_ble_slave_latency(uint16_t latency) { ble_slave_latency_ = latency; }
   void set_debug_pcm_tcp(const std::string &host, uint16_t port) {
     pcm_tcp_host_ = host;
     pcm_tcp_port_ = port;
@@ -54,8 +55,6 @@ class SiriRemoteHub : public Component {
   void set_charging_text_sensor(text_sensor::TextSensor *s) {
     charging_text_sensor_ = s;
   }
-  void set_raw_stream_enabled(bool enabled) { raw_stream_enabled_ = enabled; }
-
   void set_microphone(SiriRemoteMicrophone *m) { microphone_ = m; }
 
   void set_voice_assistant(voice_assistant::VoiceAssistant *va) { voice_assistant_ = va; }
@@ -69,25 +68,12 @@ class SiriRemoteHub : public Component {
   // or has no active API client.
   void signal_response_finished();
 
-  void set_swipe_y_pri_number(SiriRemoteNumber *n) { swipe_y_pri_number_ = n; }
-  void set_swipe_dist_number(SiriRemoteNumber *n) { swipe_dist_number_ = n; }
-  void set_dbl_ms_number(SiriRemoteNumber *n) { dbl_ms_number_ = n; }
-  void set_hold_ms_number(SiriRemoteNumber *n) { hold_ms_number_ = n; }
-  void set_bat_low_number(SiriRemoteNumber *n) { bat_low_number_ = n; }
-  void set_ble_lat_number(SiriRemoteNumber *n) { ble_lat_number_ = n; }
-
-  // Dispatch from SiriRemoteNumber::control (loop task) into the right
-  // event_state setter or siri_ble API. Mirrors the standalone main.c
-  // mutex semantics: event_state setters take es_lock_; siri_ble owns
-  // its own locking; battery threshold has no setter (read at publish).
-  void apply_knob_change(SiriRemoteKnob kind, float value);
-
   // siri_ble callbacks (registered as C function pointers; user = this).
   void on_ble_notify(uint16_t attr_handle, const uint8_t *data, size_t len);
   void on_ble_connected(uint32_t idle_ms);
   void on_ble_disconnected();
 
-  void emit_event(const event_state_event_t *evt);
+  void emit_event(const button_pulse_event_t *evt);
 
   // Public so the esp_timer C trampoline can invoke it without a friend
   // declaration.
@@ -130,14 +116,15 @@ class SiriRemoteHub : public Component {
   uint32_t idle_disconnect_ms_{0};
   uint32_t pairing_flush_suppress_ms_{1500};
   bool debug_touch_frames_{false};
+  uint32_t repeat_interval_ms_{100};
+  uint16_t ble_slave_latency_{400};
   std::string pcm_tcp_host_;
   uint16_t pcm_tcp_port_{0};
 
   // Runtime state.
-  event_state_t *es_{nullptr};
-  Mutex es_lock_;
+  button_pulse_t *pulse_{nullptr};
+  Mutex pulse_lock_;
   esp_timer_handle_t tick_timer_{nullptr};
-  uint32_t suppress_buttons_until_ms_{0};
   // Read by the tick timer task, written by the NimBLE host task — the
   // tick tolerates one stale read so a torn 32-bit access is fine, but
   // mark volatile to keep the compiler honest about the cross-task
@@ -154,11 +141,6 @@ class SiriRemoteHub : public Component {
   uint8_t last_battery_pct_{0xFF};
   uint8_t last_charging_byte_{0xFF};
 
-  // Written by the loop task (Switch::write_state callback), read by the
-  // NimBLE host task in the touch handler. Single 32-bit word, atomic on
-  // Xtensa; volatile documents the cross-task intent.
-  volatile bool raw_stream_enabled_{false};
-
   // Decoded-PCM consumer. Populated by microphone.py if the user adds the
   // siri_remote microphone platform; null otherwise. Read from the
   // siri_audio decode task in start_audio_'s on_pcm thunk.
@@ -172,16 +154,10 @@ class SiriRemoteHub : public Component {
   voice_assistant::VoiceAssistant *voice_assistant_{nullptr};
   bool auto_finish_response_{true};
 
-  // Six runtime-tunable Numbers. Pointers populated by number.py to_code
-  // before our setup() runs; we read each one's `state` field after
-  // restore (the Numbers' own DATA-priority setup() has already fired by
-  // the time our LATE setup() runs).
-  SiriRemoteNumber *swipe_y_pri_number_{nullptr};
-  SiriRemoteNumber *swipe_dist_number_{nullptr};
-  SiriRemoteNumber *dbl_ms_number_{nullptr};
-  SiriRemoteNumber *hold_ms_number_{nullptr};
-  SiriRemoteNumber *bat_low_number_{nullptr};
-  SiriRemoteNumber *ble_lat_number_{nullptr};
+  // Latched so the "HA is gone" warning prints once per outage rather than
+  // once per pulse. Touched only from the loop task inside emit_event's
+  // deferred lambda, so it needs no synchronisation.
+  bool api_gate_logged_{false};
 
 #ifdef SIRI_REMOTE_DEBUG_PCM_TCP
   int pcm_socket_{-1};

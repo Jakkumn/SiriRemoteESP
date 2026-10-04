@@ -8,6 +8,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "nvs.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/portmacro.h"
@@ -35,11 +36,24 @@ static const char *TAG = "siri_ble";
 // the fingerprint check, but bonded reconnects use these constants directly.
 // Phase 3B.7 plans a runtime "discovery mode" Switch for cross-gen units
 // where the layout differs.
-#define BUTTON_CCCD_HANDLE 0x003A
-#define TOUCH_CCCD_HANDLE 0x003E
-#define BATTERY_CCCD_HANDLE 0x002F   // svc 0x180F, char 0x2A19 (battery level)
-#define CHARGING_CCCD_HANDLE 0x0032  // svc 0x180F, char 0x2A1A (battery power state)
-#define MAGIC_HANDLE 0x004D
+// The remote's discovered GATT layout. Declared here because resolve_handle()
+// (below, with the setup-step table) reads it before the derivation helpers
+// are defined. Invalid until a fingerprint pass or a successful NVS load.
+static siri_handle_map_t s_map;
+static bool s_map_valid;
+
+// Post-pairing notification blackout — see pairing_flush_suppress_ms in
+// siri_ble.h. Armed when a fresh bond's setup chain finishes, because that is
+// the moment Apple flushes the buffered pairing-combo presses.
+static uint32_t s_suppress_until_ms;
+static uint32_t s_setup_idle_ms;
+
+// Reference-unit handles, retained as documentation only — nothing reads them.
+// The second gen-3 remote tested carried the same structure shifted by +1
+// (button 0x003A, touch 0x003E, battery 0x002F, charging 0x0032, magic 0x004E),
+// which is why these are discovered per-remote now rather than compiled in:
+//   button CCCD 0x003A / touch CCCD 0x003E / battery CCCD 0x002F
+//   charging CCCD 0x0032 / magic 0x004D
 static const uint8_t MAGIC_VALUE[2] = {0xF0, 0x00};
 static const uint8_t ENABLE_NOTIFY[2] = {0x01, 0x00};
 
@@ -116,7 +130,6 @@ static esp_timer_handle_t s_discovery_window_timer;
 // HID service + Report char UUIDs (16-bit) for adv filter + fingerprint walk.
 #define HID_SVC_UUID16 0x1812
 #define HID_REPORT_UUID16 0x2A4D
-#define HID_REPORT_BUTTON_VAL 0x0039     // gen-3 button bitmap value handle
 #define APPLE_FINGERPRINT_MIN_REPORTS 3  // gen-3 has 9; require ≥3 for fingerprint pass
 
 // Apple custom service UUID `8341f2b4-c013-4f04-8197-c4cdb42e26dc` (LE byte
@@ -158,8 +171,10 @@ static esp_timer_handle_t s_setup_fallback_timer;
 // (15 s) gives ~25 % margin, the cost being that a runaway remote takes
 // ~15 s to register as gone.
 //
-// Phase 3B.8 exposes slave_latency as a runtime MQTT Number entity so users
-// can trade battery-life vs. disconnect-detection latency without reflashing.
+// slave_latency is compile-time on both build paths (CONFIG_BLE_SLAVE_LATENCY_DEFAULT
+// standalone, the `ble_slave_latency:` YAML key under ESPHome). It was briefly a
+// runtime Number entity; the pulse refactor removed the whole Number platform, so
+// trading battery-life against disconnect-detection latency now needs a reflash.
 // `siri_ble_set_slave_latency` mutates this struct + auto-recomputes
 // supervision_timeout to satisfy the BLE spec rule with ~25 % margin.
 static struct ble_gap_upd_params s_low_power_conn_params = {
@@ -375,69 +390,275 @@ typedef enum {
     SETUP_KIND_READ,
 } setup_kind_t;
 
+// Which handle a step targets. Resolved from the discovered map when the step
+// is issued, not when the table is written — the table is static but the
+// layout is per-remote. H_LIT means "use the literal `handle` field", which
+// only the reference-unit debug probes still do.
+typedef enum {
+    H_LIT = 0,
+    H_BUTTON_CCCD,
+    H_TOUCH_CCCD,
+    H_BATTERY_CCCD,
+    H_CHARGING_CCCD,
+    H_AUDIO_CCCD,
+    H_MAGIC,
+    H_BATTERY_VAL,
+    H_CHARGING_VAL,
+} handle_sel_t;
+
 typedef struct {
     setup_kind_t kind;
-    uint16_t handle;
+    handle_sel_t sel;
+    uint16_t handle;       // H_LIT only
     const uint8_t *value;  // SETUP_KIND_WRITE only
     size_t len;            // SETUP_KIND_WRITE only
     const char *label;
 } setup_step_t;
 
+static uint16_t resolve_handle(const setup_step_t *step)
+{
+    switch (step->sel) {
+    case H_LIT:
+        return step->handle;
+    case H_BUTTON_CCCD:
+        return s_map.button_cccd;
+    case H_TOUCH_CCCD:
+        return s_map.touch_cccd;
+    case H_BATTERY_CCCD:
+        return s_map.battery_cccd;
+    case H_CHARGING_CCCD:
+        return s_map.charging_cccd;
+    case H_AUDIO_CCCD:
+        return s_map.audio_cccd;
+    case H_MAGIC:
+        return s_map.magic;
+    case H_BATTERY_VAL:
+        return s_map.battery_val;
+    case H_CHARGING_VAL:
+        return s_map.charging_val;
+    }
+    return 0;
+}
+
+// --- Discovered handle map -------------------------------------------------
+//
+// Replaces the former hardcoded constants. See siri_ble.h for why.
+
+#define MAP_NVS_NAMESPACE "siri_ble"
+#define MAP_NVS_KEY "hmapv1"
+
+const siri_handle_map_t *siri_ble_handle_map(void)
+{
+    return s_map_valid ? &s_map : NULL;
+}
+
+// A characteristic's CCCD is its own 0x2902 descriptor. Falls back to val+1,
+// which is the usual layout, but only as a last resort — guessing is exactly
+// what broke before.
+static uint16_t find_cccd(const struct peer_chr *chr)
+{
+    const ble_uuid16_t cccd_uuid = BLE_UUID16_INIT(0x2902);
+    const struct peer_dsc *dsc;
+    SLIST_FOREACH(dsc, &chr->dscs, next)
+    {
+        if (ble_uuid_cmp(&dsc->dsc.uuid.u, &cccd_uuid.u) == 0) {
+            return dsc->dsc.handle;
+        }
+    }
+    return chr->chr.val_handle + 1;
+}
+
+// Build the map from a fully discovered GATT tree. Returns a failure reason,
+// or NULL on success.
+static const char *derive_handle_map(const struct peer *peer, siri_handle_map_t *out)
+{
+    const ble_uuid16_t batt_svc = BLE_UUID16_INIT(0x180F);
+    const ble_uuid16_t batt_lvl = BLE_UUID16_INIT(0x2A19);
+    const ble_uuid16_t batt_pwr = BLE_UUID16_INIT(0x2A1A);
+    const ble_uuid16_t hid_svc = BLE_UUID16_INIT(HID_SVC_UUID16);
+    const ble_uuid16_t hid_report = BLE_UUID16_INIT(HID_REPORT_UUID16);
+
+    memset(out, 0, sizeof(*out));
+
+    const struct peer_chr *c = peer_chr_find_uuid(peer, &batt_svc.u, &batt_lvl.u);
+    if (c == NULL) {
+        return "battery level 0x2A19 not found";
+    }
+    out->battery_val = c->chr.val_handle;
+    out->battery_cccd = find_cccd(c);
+
+    c = peer_chr_find_uuid(peer, &batt_svc.u, &batt_pwr.u);
+    if (c == NULL) {
+        return "battery power state 0x2A1A not found";
+    }
+    out->charging_val = c->chr.val_handle;
+    out->charging_cccd = find_cccd(c);
+
+    const struct peer_svc *hid = peer_svc_find_uuid(peer, &hid_svc.u);
+    if (hid == NULL) {
+        return "HID service 0x1812 not found";
+    }
+
+    // Reports arrive in handle order from peer_disc_all. The first three
+    // notify-capable ones are audio/button/touch; the first non-notify one is
+    // the vendor unlock. Ordinal rather than absolute, so a uniform shift in
+    // the attribute table doesn't matter.
+    const struct peer_chr *notify_reports[3] = {NULL, NULL, NULL};
+    int n_notify = 0;
+    const struct peer_chr *magic_chr = NULL;
+    SLIST_FOREACH(c, &hid->chrs, next)
+    {
+        if (ble_uuid_cmp(&c->chr.uuid.u, &hid_report.u) != 0) {
+            continue;
+        }
+        if (c->chr.properties & BLE_GATT_CHR_PROP_NOTIFY) {
+            if (n_notify < 3) {
+                notify_reports[n_notify] = c;
+            }
+            n_notify++;
+        } else if (magic_chr == NULL) {
+            magic_chr = c;
+        }
+    }
+    if (n_notify < 3) {
+        return "fewer than 3 notify-capable HID Reports";
+    }
+    if (magic_chr == NULL) {
+        return "no non-notify HID Report for the vendor unlock";
+    }
+
+    out->audio_val = notify_reports[0]->chr.val_handle;
+    out->audio_cccd = find_cccd(notify_reports[0]);
+    out->button_val = notify_reports[1]->chr.val_handle;
+    out->button_cccd = find_cccd(notify_reports[1]);
+    out->touch_val = notify_reports[2]->chr.val_handle;
+    out->touch_cccd = find_cccd(notify_reports[2]);
+    out->magic = magic_chr->chr.val_handle;
+    return NULL;
+}
+
+static void log_handle_map(const siri_handle_map_t *m)
+{
+    ESP_LOGI(TAG, "handle map: button=0x%04x/%04x touch=0x%04x/%04x audio=0x%04x/%04x",
+             m->button_val, m->button_cccd, m->touch_val, m->touch_cccd, m->audio_val,
+             m->audio_cccd);
+    ESP_LOGI(TAG, "            battery=0x%04x/%04x charging=0x%04x/%04x magic=0x%04x",
+             m->battery_val, m->battery_cccd, m->charging_val, m->charging_cccd, m->magic);
+}
+
+static void map_save(const siri_handle_map_t *m)
+{
+    nvs_handle_t h;
+    if (nvs_open(MAP_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGW(TAG, "handle map: nvs_open failed; will re-discover next boot");
+        return;
+    }
+    if (nvs_set_blob(h, MAP_NVS_KEY, m, sizeof(*m)) == ESP_OK) {
+        (void)nvs_commit(h);
+        ESP_LOGI(TAG, "handle map cached to NVS");
+    }
+    nvs_close(h);
+}
+
+static bool map_load(siri_handle_map_t *m)
+{
+    nvs_handle_t h;
+    if (nvs_open(MAP_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        return false;
+    }
+    size_t len = sizeof(*m);
+    bool ok = (nvs_get_blob(h, MAP_NVS_KEY, m, &len) == ESP_OK) && (len == sizeof(*m));
+    nvs_close(h);
+    return ok && m->button_val != 0 && m->magic != 0;
+}
+
+static void map_erase(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(MAP_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+        return;
+    }
+    (void)nvs_erase_key(h, MAP_NVS_KEY);
+    (void)nvs_commit(h);
+    nvs_close(h);
+    s_map_valid = false;
+}
+
+// Physical handle -> logical SIRI_HANDLE_* so callers never see the layout.
+static uint16_t canon_handle(uint16_t actual)
+{
+    if (!s_map_valid) {
+        return actual;
+    }
+    if (actual == s_map.button_val)
+        return SIRI_HANDLE_BUTTON;
+    if (actual == s_map.touch_val)
+        return SIRI_HANDLE_TOUCH;
+    if (actual == s_map.audio_val)
+        return SIRI_HANDLE_AUDIO;
+    if (actual == s_map.battery_val)
+        return SIRI_HANDLE_BATTERY;
+    if (actual == s_map.charging_val)
+        return SIRI_HANDLE_CHARGING;
+    return actual;
+}
+
 static const setup_step_t SETUP_STEPS[] = {
-    {SETUP_KIND_WRITE, BUTTON_CCCD_HANDLE, ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "button CCCD"},
-    {SETUP_KIND_WRITE, TOUCH_CCCD_HANDLE, ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "touch CCCD"},
-    {SETUP_KIND_WRITE, BATTERY_CCCD_HANDLE, ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "battery CCCD"},
-    {SETUP_KIND_WRITE, CHARGING_CCCD_HANDLE, ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "charging CCCD"},
-    {SETUP_KIND_WRITE, MAGIC_HANDLE, MAGIC_VALUE, sizeof(MAGIC_VALUE), "magic unlock"},
-    {SETUP_KIND_READ, 0x002E, NULL, 0, "battery initial read"},
-    {SETUP_KIND_READ, 0x0031, NULL, 0, "charging initial read"},
+    {SETUP_KIND_WRITE, H_BUTTON_CCCD, 0, ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "button CCCD"},
+    {SETUP_KIND_WRITE, H_TOUCH_CCCD, 0, ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "touch CCCD"},
+    {SETUP_KIND_WRITE, H_BATTERY_CCCD, 0, ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "battery CCCD"},
+    {SETUP_KIND_WRITE, H_CHARGING_CCCD, 0, ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "charging CCCD"},
+    {SETUP_KIND_WRITE, H_MAGIC, 0, MAGIC_VALUE, sizeof(MAGIC_VALUE), "magic unlock"},
+    {SETUP_KIND_READ, H_BATTERY_VAL, 0, NULL, 0, "battery initial read"},
+    {SETUP_KIND_READ, H_CHARGING_VAL, 0, NULL, 0, "charging initial read"},
 #ifdef CONFIG_VOICE_ENABLED
     // Audio characteristic CCCD (val handle 0x0035, CCCD 0x0036). Subscribes
     // the bridge to the Opus-encoded voice stream that the remote emits
     // while the Mic button is held. siri_audio component decodes the frames
     // and dispatches PCM downstream.
-    {SETUP_KIND_WRITE, 0x0036, ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "audio CCCD"},
+    {SETUP_KIND_WRITE, H_AUDIO_CCCD, 0, ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "audio CCCD"},
 #endif
 #ifdef CONFIG_DEBUG_WAKE_PROBE
     // CCCD probes for the three remaining notify-capable HID Reports on
     // gen-3 (0x0041/0x0045/0x0049). Confirmed real CCCDs via peer_disc_all.
     // 0x0051 used to be in this list but is Report Reference, not a CCCD.
-    {SETUP_KIND_WRITE, 0x0042, ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "probe CCCD 0x0042"},
-    {SETUP_KIND_WRITE, 0x0046, ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "probe CCCD 0x0046"},
-    {SETUP_KIND_WRITE, 0x004A, ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "probe CCCD 0x004A"},
+    {SETUP_KIND_WRITE, H_LIT, 0x0042, ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "probe CCCD 0x0042"},
+    {SETUP_KIND_WRITE, H_LIT, 0x0046, ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "probe CCCD 0x0046"},
+    {SETUP_KIND_WRITE, H_LIT, 0x004A, ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "probe CCCD 0x004A"},
     // Audio HID Report CCCD (val=0x0035) — only remaining notify-capable
     // handle on the device that we don't normally subscribe to. The "wake-
     // info on the audio channel" hypothesis: Apple may multiplex a wake-
     // packet onto the Opus channel when the wake-press is suppressed from
     // the regular button path on cold-boot first-bond reconnect.
-    {SETUP_KIND_WRITE, 0x0036, ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY), "probe CCCD 0x0036 (audio)"},
+    {SETUP_KIND_WRITE, H_LIT, 0x0036, ENABLE_NOTIFY, sizeof(ENABLE_NOTIFY),
+     "probe CCCD 0x0036 (audio)"},
     // 0x0025 (Apple-svc CCCD) is now subscribed in the EARLY block above.
     // GAP service reads — Apple's claim handshake might check these.
-    {SETUP_KIND_READ, 0x0003, NULL, 0, "probe read GAP name 0x0003"},
-    {SETUP_KIND_READ, 0x0005, NULL, 0, "probe read GAP appearance 0x0005"},
-    {SETUP_KIND_READ, 0x0007, NULL, 0, "probe read GAP ppcp 0x0007"},
-    {SETUP_KIND_READ, 0x0009, NULL, 0, "probe read GAP car 0x0009"},
+    {SETUP_KIND_READ, H_LIT, 0x0003, NULL, 0, "probe read GAP name 0x0003"},
+    {SETUP_KIND_READ, H_LIT, 0x0005, NULL, 0, "probe read GAP appearance 0x0005"},
+    {SETUP_KIND_READ, H_LIT, 0x0007, NULL, 0, "probe read GAP ppcp 0x0007"},
+    {SETUP_KIND_READ, H_LIT, 0x0009, NULL, 0, "probe read GAP car 0x0009"},
     // Device Info Service reads — Apple's accessory framework on iOS hosts
     // reads these as part of standard claim. Strings (mfg/model/serial/
     // hw_rev/fw_rev) print as ASCII via the read-bytes log; PnP ID is a
     // 7-byte struct.
-    {SETUP_KIND_READ, 0x000d, NULL, 0, "probe read mfg 0x000d"},
-    {SETUP_KIND_READ, 0x000f, NULL, 0, "probe read model 0x000f"},
-    {SETUP_KIND_READ, 0x0011, NULL, 0, "probe read serial 0x0011"},
-    {SETUP_KIND_READ, 0x0013, NULL, 0, "probe read hw_rev 0x0013"},
-    {SETUP_KIND_READ, 0x0015, NULL, 0, "probe read fw_rev 0x0015"},
-    {SETUP_KIND_READ, 0x0017, NULL, 0, "probe read PnP 0x0017"},
+    {SETUP_KIND_READ, H_LIT, 0x000d, NULL, 0, "probe read mfg 0x000d"},
+    {SETUP_KIND_READ, H_LIT, 0x000f, NULL, 0, "probe read model 0x000f"},
+    {SETUP_KIND_READ, H_LIT, 0x0011, NULL, 0, "probe read serial 0x0011"},
+    {SETUP_KIND_READ, H_LIT, 0x0013, NULL, 0, "probe read hw_rev 0x0013"},
+    {SETUP_KIND_READ, H_LIT, 0x0015, NULL, 0, "probe read fw_rev 0x0015"},
+    {SETUP_KIND_READ, H_LIT, 0x0017, NULL, 0, "probe read PnP 0x0017"},
     // Apple custom service reads — six read-only characteristics whose
     // contents Phase 1 never inspected. Reading them may also be part of
     // Apple's claim handshake.
-    {SETUP_KIND_READ, 0x001a, NULL, 0, "probe read Apple 0x001a"},
-    {SETUP_KIND_READ, 0x001c, NULL, 0, "probe read Apple 0x001c"},
-    {SETUP_KIND_READ, 0x001e, NULL, 0, "probe read Apple 0x001e"},
-    {SETUP_KIND_READ, 0x0020, NULL, 0, "probe read Apple 0x0020"},
-    {SETUP_KIND_READ, 0x0022, NULL, 0, "probe read Apple 0x0022"},
-    {SETUP_KIND_READ, 0x0024, NULL, 0, "probe read Apple 0x0024"},
+    {SETUP_KIND_READ, H_LIT, 0x001a, NULL, 0, "probe read Apple 0x001a"},
+    {SETUP_KIND_READ, H_LIT, 0x001c, NULL, 0, "probe read Apple 0x001c"},
+    {SETUP_KIND_READ, H_LIT, 0x001e, NULL, 0, "probe read Apple 0x001e"},
+    {SETUP_KIND_READ, H_LIT, 0x0020, NULL, 0, "probe read Apple 0x0020"},
+    {SETUP_KIND_READ, H_LIT, 0x0022, NULL, 0, "probe read Apple 0x0022"},
+    {SETUP_KIND_READ, H_LIT, 0x0024, NULL, 0, "probe read Apple 0x0024"},
     // Bond Management feature read.
-    {SETUP_KIND_READ, 0x0028, NULL, 0, "probe read BondMgmt feat 0x0028"},
+    {SETUP_KIND_READ, H_LIT, 0x0028, NULL, 0, "probe read BondMgmt feat 0x0028"},
 #endif
 };
 #define SETUP_STEP_COUNT (sizeof(SETUP_STEPS) / sizeof(SETUP_STEPS[0]))
@@ -451,6 +672,15 @@ static int on_setup_step_done(uint16_t conn_handle, const struct ble_gatt_error 
 static void issue_setup_step(size_t idx)
 {
     if (idx >= SETUP_STEP_COUNT) {
+        // Fresh bond (idle==0) means the user just held the pairing combo, and
+        // Apple has now flushed those buffered presses to us. Blackout from
+        // here rather than from connect: the flush lands once the button CCCD
+        // subscribe completes, which is inside this chain.
+        if (s_setup_idle_ms == 0 && s_cfg.pairing_flush_suppress_ms > 0) {
+            s_suppress_until_ms = now_ms() + s_cfg.pairing_flush_suppress_ms;
+            ESP_LOGI(TAG, "post-pairing notify blackout for %u ms",
+                     (unsigned)s_cfg.pairing_flush_suppress_ms);
+        }
         // Setup chain complete — switch to the remote's preferred low-power
         // conn params so it can deep-sleep between events. Lets us keep the
         // link alive forever (which avoids the wake-press loss) without
@@ -468,12 +698,21 @@ static void issue_setup_step(size_t idx)
         return;
     }
     const setup_step_t *step = &SETUP_STEPS[idx];
+    uint16_t handle = resolve_handle(step);
     int rc;
+    if (handle == 0) {
+        // No discovered handle for this step on this remote — skip rather
+        // than writing to handle 0 and getting a confusing ATT error.
+        ESP_LOGW(TAG, "%s: no handle in discovered map, skipping", step->label);
+        s_setup_step_idx++;
+        issue_setup_step(s_setup_step_idx);
+        return;
+    }
     if (step->kind == SETUP_KIND_WRITE) {
-        rc = ble_gattc_write_flat(s_setup_step_conn, step->handle, step->value, step->len,
+        rc = ble_gattc_write_flat(s_setup_step_conn, handle, step->value, step->len,
                                   on_setup_step_done, (void *)step);
     } else {
-        rc = ble_gattc_read(s_setup_step_conn, step->handle, on_setup_step_done, (void *)step);
+        rc = ble_gattc_read(s_setup_step_conn, handle, on_setup_step_done, (void *)step);
     }
     if (rc != 0) {
         ESP_LOGE(TAG, "%s: queue failed: rc=%d", step->label, rc);
@@ -513,7 +752,7 @@ static int on_setup_step_done(uint16_t conn_handle, const struct ble_gatt_error 
                      (unsigned)copied);
 #endif
             if (s_cfg.on_notify != NULL) {
-                s_cfg.on_notify(attr->handle, buf, copied, s_cfg.user);
+                s_cfg.on_notify(canon_handle(attr->handle), buf, copied, s_cfg.user);
             }
         }
     } else {
@@ -550,6 +789,7 @@ static void apply_remote_setup(uint16_t conn_handle)
 static void complete_setup_chain(uint16_t conn_handle, uint32_t idle_ms)
 {
     s_mode = MODE_CONNECTED;
+    s_setup_idle_ms = idle_ms;
     if (s_cfg.on_connected != NULL) {
         s_cfg.on_connected(idle_ms, s_cfg.user);
     }
@@ -564,6 +804,32 @@ static void complete_setup_chain(uint16_t conn_handle, uint32_t idle_ms)
 // button value handle 0x0039 specifically present, and the Apple custom
 // service present. Bonded reconnects skip this — we trust prior bonds.
 
+// Diagnostic dump of everything we discovered on a candidate. Only called on
+// fingerprint rejection — the hardcoded handle map means "not a Siri Remote"
+// and "a Siri Remote whose handles moved" produce the identical verdict, and
+// this is the only way to tell them apart from a log.
+static void dump_gatt_tree(const struct peer *peer)
+{
+    const struct peer_svc *svc;
+    ESP_LOGI(TAG, "  --- discovered GATT tree ---");
+    SLIST_FOREACH(svc, &peer->svcs, next)
+    {
+        char uuid_buf[BLE_UUID_STR_LEN];
+        ESP_LOGI(TAG, "  svc %s  handles %u..%u", ble_uuid_to_str(&svc->svc.uuid.u, uuid_buf),
+                 (unsigned)svc->svc.start_handle, (unsigned)svc->svc.end_handle);
+        const struct peer_chr *chr;
+        SLIST_FOREACH(chr, &svc->chrs, next)
+        {
+            char cbuf[BLE_UUID_STR_LEN];
+            ESP_LOGI(TAG, "    chr %s  val_handle=0x%04x props=0x%02x%s",
+                     ble_uuid_to_str(&chr->chr.uuid.u, cbuf), (unsigned)chr->chr.val_handle,
+                     (unsigned)chr->chr.properties,
+                     (chr->chr.properties & BLE_GATT_CHR_PROP_NOTIFY) ? " [notify]" : "");
+        }
+    }
+    ESP_LOGI(TAG, "  --- end GATT tree ---");
+}
+
 // Returns NULL on pass; otherwise a static string describing the failed check.
 static const char *fingerprint_check(const struct peer *peer)
 {
@@ -576,7 +842,6 @@ static const char *fingerprint_check(const struct peer *peer)
     }
 
     int report_notify_count = 0;
-    bool button_handle_present = false;
     const struct peer_chr *chr;
     SLIST_FOREACH(chr, &hid->chrs, next)
     {
@@ -586,16 +851,16 @@ static const char *fingerprint_check(const struct peer *peer)
         if (chr->chr.properties & BLE_GATT_CHR_PROP_NOTIFY) {
             report_notify_count++;
         }
-        if (chr->chr.val_handle == HID_REPORT_BUTTON_VAL) {
-            button_handle_present = true;
-        }
     }
     if (report_notify_count < APPLE_FINGERPRINT_MIN_REPORTS) {
         return "fewer than 3 notify-capable HID Report chars";
     }
-    if (!button_handle_present) {
-        return "HID button value handle 0x0039 missing";
-    }
+    // Deliberately no check for a Report at a specific handle. That used to be
+    // here (0x0039) and it rejected every gen-3 unit whose attribute table is
+    // shifted — which is what sent first-time pairing into an endless reject
+    // loop while bonded reconnects, which skip this check, worked fine.
+    // Identity is now structural: HID service, three notify Reports, the Apple
+    // custom service, and a derivable handle map (checked by the caller).
     if (peer_svc_find_uuid(peer, &APPLE_CUSTOM_SVC_UUID.u) == NULL) {
         return "Apple custom service 8341f2b4-... missing";
     }
@@ -612,13 +877,28 @@ static void on_fingerprint_disc_complete(const struct peer *peer, int status, vo
         goto reject;
     }
 
+    dump_gatt_tree(peer);
     const char *reason = fingerprint_check(peer);
     if (reason != NULL) {
         ESP_LOGI(TAG, "fingerprint FAIL: %s — rejecting candidate", reason);
         goto reject;
     }
 
+    // Derivation is part of the verdict, not a later step: a remote we cannot
+    // build a handle map for is one we cannot talk to, and failing here keeps
+    // it in the reject/blacklist flow instead of bonding to something that
+    // then silently never notifies.
+    siri_handle_map_t derived;
+    const char *derr = derive_handle_map(peer, &derived);
+    if (derr != NULL) {
+        ESP_LOGI(TAG, "fingerprint FAIL: handle map underivable (%s) — rejecting candidate", derr);
+        goto reject;
+    }
+    s_map = derived;
+    s_map_valid = true;
     ESP_LOGI(TAG, "fingerprint PASS — gen-3 Siri Remote confirmed, proceeding with setup");
+    log_handle_map(&s_map);
+    map_save(&s_map);
     if (s_pending_candidate_set) {
         s_bonded_peer = s_pending_candidate;
         s_have_bonded_peer = true;
@@ -646,11 +926,51 @@ reject:
     // discovery window.
 }
 
+static void on_bonded_disc_complete(const struct peer *peer, int status, void *arg)
+{
+    (void)arg;
+    uint16_t conn = peer->conn_handle;
+    if (status != 0) {
+        ESP_LOGE(TAG, "bonded rediscovery failed status=%d — terminating", status);
+        (void)ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
+        return;
+    }
+    siri_handle_map_t derived;
+    const char *derr = derive_handle_map(peer, &derived);
+    if (derr != NULL) {
+        ESP_LOGE(TAG, "bonded rediscovery: handle map underivable (%s) — terminating", derr);
+        (void)ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
+        return;
+    }
+    s_map = derived;
+    s_map_valid = true;
+    ESP_LOGI(TAG, "handle map rediscovered for bonded remote");
+    log_handle_map(&s_map);
+    map_save(&s_map);
+    complete_setup_chain(conn, s_pending_setup_idle_ms);
+}
+
+// Bonded path: run the setup chain, but rediscover first if we have no map.
+static void setup_bonded(uint16_t conn, uint32_t idle)
+{
+    if (s_map_valid) {
+        complete_setup_chain(conn, idle);
+        return;
+    }
+    ESP_LOGI(TAG, "bonded remote but no cached handle map — rediscovering once");
+    s_pending_setup_idle_ms = idle;
+    int rc = peer_disc_all(conn, on_bonded_disc_complete, NULL);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "bonded rediscovery kickoff failed rc=%d — terminating", rc);
+        (void)ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
+    }
+}
+
 // Fired from esp_timer task if the second ENC_CHANGE never arrives. Runs
 // setup with the stashed idle so we don't end up wedged forever in pending
 // state. ble_gattc_* and the on_connected callback are safe from this
 // context (the former posts to the NimBLE host task, the latter just
-// touches main.c state guarded by event_state's own lock).
+// touches main.c state guarded by the caller's own pulse lock).
 static void setup_fallback_cb(void *arg)
 {
     (void)arg;
@@ -671,7 +991,7 @@ static void setup_fallback_cb(void *arg)
             (void)ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
         }
     } else {
-        complete_setup_chain(conn, idle);
+        setup_bonded(conn, idle);
     }
 }
 
@@ -963,12 +1283,21 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
                 (void)ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
             }
         } else {
-            complete_setup_chain(conn, idle);
+            setup_bonded(conn, idle);
         }
         return 0;
     }
 
     case BLE_GAP_EVENT_NOTIFY_RX: {
+        if (s_suppress_until_ms != 0) {
+            if ((int32_t)(now_ms() - s_suppress_until_ms) < 0) {
+                // Wrap-safe compare. Silent by design: the flush can be dozens
+                // of packets and logging each would bury the pairing output.
+                return 0;
+            }
+            s_suppress_until_ms = 0;
+            ESP_LOGI(TAG, "post-pairing notify blackout over");
+        }
         uint16_t len = OS_MBUF_PKTLEN(event->notify_rx.om);
         uint8_t buf[128];
         if (len > sizeof(buf)) {
@@ -996,7 +1325,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         }
 #endif
         if (s_cfg.on_notify != NULL) {
-            s_cfg.on_notify(event->notify_rx.attr_handle, buf, copied, s_cfg.user);
+            s_cfg.on_notify(canon_handle(event->notify_rx.attr_handle), buf, copied, s_cfg.user);
         }
         return 0;
     }
@@ -1029,6 +1358,8 @@ void siri_ble_idle_disconnect(void)
 
 void siri_ble_repair(void)
 {
+    // The map belongs to the old remote; a different unit will have its own.
+    map_erase();
     ESP_LOGI(TAG, "repair: clearing bond store and re-entering discovery");
     int rc = ble_store_clear();
     if (rc != 0) {
@@ -1138,6 +1469,16 @@ static void on_sync(void)
 
 esp_err_t siri_ble_start(const siri_ble_config_t *cfg)
 {
+    // Restore the remote's discovered GATT layout, if we have one. Absent on
+    // first boot and after a repair; the bonded path rediscovers in that case.
+    if (map_load(&s_map)) {
+        s_map_valid = true;
+        ESP_LOGI(TAG, "handle map restored from NVS");
+        log_handle_map(&s_map);
+    } else {
+        ESP_LOGI(TAG, "no cached handle map — will discover on first bond");
+    }
+
     if (cfg == NULL) {
         return ESP_ERR_INVALID_ARG;
     }

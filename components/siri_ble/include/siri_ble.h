@@ -9,21 +9,52 @@
 extern "C" {
 #endif
 
-// Gen-3 Siri Remote GATT *value* handles. Empirically verified in Phase 1
-// and reproducible across reconnects on the same unit; main.c uses these
-// to dispatch on `attr_handle` from notify / read callbacks. CCCD handles
-// for these characteristics are siri_ble's internal concern (the bridge
-// subscribes during the setup chain) and stay private to the component.
-#define SIRI_HANDLE_BUTTON 0x0039      // 16-bit button bitmap (notify)
-#define SIRI_HANDLE_TOUCH 0x003D       // 11-byte touch frames (notify, ~50/sec)
-#define SIRI_HANDLE_AUDIO 0x0035       // Opus audio (Phase 5)
-#define SIRI_HANDLE_AUDIO_CCCD 0x0036  // CCCD for SIRI_HANDLE_AUDIO
-#define SIRI_HANDLE_BATTERY 0x002E     // single-byte percentage (read + notify)
-#define SIRI_HANDLE_CHARGING 0x0031    // BLE-standard 0x2A1A power-state byte (read + notify)
+// Logical stream identifiers — NOT literal GATT handles.
+//
+// They started life as hardcoded handles for one gen-3 unit, and that was
+// wrong: a second gen-3 remote with different firmware carries the identical
+// attribute *structure* shifted by one handle, so every hardcoded number
+// pointed at its neighbour. The symptoms were silent (a CCCD write landing on
+// a Report value handle "succeeds" and simply never notifies), which made it
+// expensive to diagnose.
+//
+// Handles are now discovered once per bond and cached in NVS (see
+// siri_handle_map_t). siri_ble translates every real handle to one of these
+// IDs before invoking on_notify, so callers dispatch on a stable value and
+// never see the physical layout. The numbers are the reference unit's handles,
+// kept only so existing switch statements keep compiling.
+#define SIRI_HANDLE_BUTTON 0x0039
+#define SIRI_HANDLE_TOUCH 0x003D
+#define SIRI_HANDLE_AUDIO 0x0035
+#define SIRI_HANDLE_AUDIO_CCCD 0x0036
+#define SIRI_HANDLE_BATTERY 0x002E
+#define SIRI_HANDLE_CHARGING 0x0031
 
-// Raw notification from the remote. `attr_handle` lets the caller
-// distinguish button / touch / audio / battery / charging etc — see the
-// SIRI_HANDLE_* constants above.
+// The physical layout discovered from a specific remote. Derived from the
+// GATT tree at first bond, cached in NVS, reloaded on reconnect so the
+// discovery cost (~3.7 s) is paid once rather than every connect.
+//
+// Derivation rules, all structural rather than positional:
+//   battery/charging — by UUID (0x2A19 / 0x2A1A) inside service 0x180F
+//   audio/button/touch — the first three notify-capable Report (0x2A4D)
+//     characteristics inside the HID service 0x1812, in handle order
+//   magic — the first Report characteristic *without* notify
+//   every CCCD — that characteristic's own 0x2902 descriptor
+typedef struct {
+    uint16_t button_val, button_cccd;
+    uint16_t touch_val, touch_cccd;
+    uint16_t audio_val, audio_cccd;
+    uint16_t battery_val, battery_cccd;
+    uint16_t charging_val, charging_cccd;
+    uint16_t magic;
+} siri_handle_map_t;
+
+// The active map, or NULL if no remote has been bonded yet. Diagnostic.
+const siri_handle_map_t *siri_ble_handle_map(void);
+
+// Raw notification from the remote. `attr_handle` is a *logical* SIRI_HANDLE_*
+// ID, already translated from the remote's physical handle — callers must not
+// assume it matches any particular unit's GATT layout.
 // `data` is owned by NimBLE and valid only for the duration of the call.
 typedef void (*siri_ble_notify_cb_t)(uint16_t attr_handle, const uint8_t *data, size_t len,
                                      void *user);
@@ -51,6 +82,23 @@ typedef struct {
     siri_ble_connected_cb_t on_connected;        // optional
     siri_ble_disconnected_cb_t on_disconnected;  // optional
     void *user;
+
+    // After a *fresh* bond's setup chain completes, drop every incoming
+    // notification for this many milliseconds. 0 disables.
+    //
+    // This does not stop the remote entering pairing mode — that is its own
+    // firmware and none of our business. It discards the echo: the remote
+    // buffers the Back+VolUp presses you physically made during pairing and
+    // Apple flushes them the instant the button CCCD subscribe lands, so they
+    // arrive as ordinary button notifications the user never meant as
+    // commands. Under the pulse model those would fire whatever automation is
+    // bound to those buttons, so pairing the remote could change your TV
+    // volume. Everything is dropped rather than just buttons, because the
+    // flush is not guaranteed to be buttons-only.
+    //
+    // Setup-chain reads (battery/charging) are issued by us and are delivered
+    // regardless — they are not part of the flush.
+    uint32_t pairing_flush_suppress_ms;
 } siri_ble_config_t;
 
 // Install callbacks and configure the BLE host. Call after nimble_port_init

@@ -1,15 +1,23 @@
 # SiriRemoteESP
 
 An ESP32 BLE bridge that pairs with an Apple Siri Remote (gen 3) and surfaces
-button + clickpad + voice events to Home Assistant. Two install paths: an
-ESPHome external component for end users, and a standalone ESP-IDF build for
-hacking on the C components.
+its buttons and voice to Home Assistant. Two install paths: an ESPHome
+external component for end users, and a standalone ESP-IDF build for hacking
+on the C components.
 
-**Status:** Phase 5 shipped. ESPHome wrap is the recommended install path;
-the standalone build remains available for development. The full pipeline
-— button + clickpad + voice capture with on-device Opus decode feeding
-ESPHome's `voice_assistant` — is verified end-to-end. Outstanding work is
-limited to research items (accelerometer / motion telemetry probe).
+The bridge reports input the way an **infrared remote** does: a press, the
+same event repeating while you hold, and silence when you let go. It makes no
+judgment about what counts as a click, a double-click, or a hold — Home
+Assistant is the hub and decides. The firmware's job is to report facts.
+
+**Status:** voice capture with on-device Opus decode feeding ESPHome's
+`voice_assistant` is verified end-to-end. The ESPHome wrap is the recommended
+install path; the standalone build remains available for development.
+
+Touch/clickpad **gestures are not supported** — the clickpad's five clicks
+behave like any other button, but swipes are not reported. If you are coming
+from 0.0.x, read [Upgrading from 0.0.x](#upgrading-from-00x) first: this is a
+breaking change.
 
 ## Hardware
 
@@ -56,21 +64,28 @@ won't break your install on the next `esphome run`.
 
 ### What you get in Home Assistant
 
-The wrap registers seven entity types under one device:
+The wrap registers four entities under one device:
 
 - `binary_sensor.siri_remote_voice_active` — `on` while Mic is held.
 - `sensor.siri_remote_battery` — battery level (%).
 - `text_sensor.siri_remote_charging` — `charging` / `discharging` / `plugged_in`.
-- `switch.siri_remote_raw_touch_stream` — toggles UART logging of the touchpad
-  packets (diagnostic; off by default).
 - `button.siri_remote_re_pair` — wipes the BLE bond and re-enters discovery.
-- Six `number.siri_remote_*` sliders for runtime-tunable thresholds (swipe
-  sensitivity, double-click window, hold threshold, battery-low %, BLE slave
-  latency). All persist across reboot via ESPHome Preferences.
 
-Discrete remote events (clicks, double-clicks, holds, swipes) fire as a Home
-Assistant event called `esphome.siri_remote_event` with full payload — see
-[Home Assistant automation patterns](#home-assistant-automation-patterns).
+That is deliberately a short list. These four are genuine *state* — things the
+remote reports about itself. Button input is not state, so it does not become
+an entity: it fires as a Home Assistant event, `esphome.siri_remote_button`,
+carrying `{device, button, repeat, held_ms}`.
+
+The bridge reports input the way an infrared remote does — a press, then the
+same event repeating while you hold, and silence when you let go. It makes no
+judgment about what counts as a click or a hold; Home Assistant decides. See
+[Home Assistant automation patterns](#home-assistant-automation-patterns),
+and [Upgrading from 0.0.x](#upgrading-from-00x) if you used an earlier
+release.
+
+**Swipes and the clickpad surface are not supported.** The clickpad's five
+*clicks* (centre plus four directions) work like any other button; finger
+gestures across the pad are not reported at all.
 
 ### Voice in HA Assist (optional)
 
@@ -235,14 +250,16 @@ Run `make` with no arguments to see all targets.
 | Siri Bridge Configuration | `WIFI_SSID` / `WIFI_PASSWORD` | empty | Wi-Fi credentials |
 | Siri Bridge Configuration | `MQTT_BROKER_URI` | `mqtt://homeassistant.local:1883` | MQTT broker |
 | Siri Bridge Configuration | `MQTT_USERNAME` / `MQTT_PASSWORD` | empty | MQTT auth |
-| Event state machine | `EVENT_DOUBLE_WINDOW_MS` | 300 | Double-click window |
-| Event state machine | `EVENT_HOLD_THRESHOLD_MS` | 700 | Hold detection |
-| Event state machine | `EVENT_SWIPE_MIN_DISTANCE` | 40 | Swipe threshold |
+| Siri Bridge Configuration | `PULSE_REPEAT_INTERVAL_MS` | 100 | How often a held button re-emits (a rate, not a hold threshold) |
+| Siri Bridge Configuration | `BLE_SLAVE_LATENCY_DEFAULT` | 400 | See "Always-connected mode" below |
+| Siri Bridge Configuration | `BATTERY_LOW_THRESHOLD_PCT` | 20 | Sets `"low": true` in the battery payload |
 | Siri Bridge Configuration | `IDLE_DISCONNECT_MS` | **0** (always-connected) | See "Always-connected mode" below |
 
-`= 0` on the timing fields disables that feature (clean kill-switch). The
-ESPHome path exposes the same knobs as runtime Number entities; the table
-above only applies to the standalone build.
+`PULSE_REPEAT_INTERVAL_MS = 0` disables repeats entirely, leaving only the
+initial press. The ESPHome path exposes the same two knobs as the YAML keys
+`repeat_interval_ms:` and `ble_slave_latency:` on the `siri_remote:` block.
+Neither path exposes them as runtime entities any more — see
+[Upgrading from 0.0.x](#upgrading-from-00x).
 
 ### Standalone-only MQTT topics
 
@@ -252,10 +269,11 @@ running the standalone firmware.
 
 | Topic | Retained | Purpose |
 |---|---|---|
-| `siri_remote/event` | no | Discrete events (click/double_click/hold_start/hold_end/swipe_*) |
-| `siri_remote/touch_raw` | no | Raw touch frames at ~50/sec — only when the HA Switch is on |
+| `siri_remote/event` | no | Button pulses — `{event_type, device, button, repeat, held_ms}` |
 | `siri_remote/connection` | yes (LWT) | `online` / `offline` |
-| `siri_remote/state/raw_stream` | yes | Current Switch state, mirrored from NVS |
+| `siri_remote/remote_status` | yes | `connected` / `disconnected` (BLE link to the remote) |
+| `siri_remote/battery` | yes | `{"level": 87, "low": false}` |
+| `siri_remote/charging` | yes | `charging` / `discharging` / `plugged_in` |
 
 ## Pairing your remote
 
@@ -314,7 +332,7 @@ The bridge keeps a permanent BLE link with the remote and pushes the connection 
 
 The reason we stay connected: Apple's BLE accessory firmware has an undocumented server-side timer that drops the *wake-press* (the press that wakes the remote from sleep) if the bridge has been disconnected for more than ~30 s. We tested every reasonable workaround at the GATT layer — different chain orders, claim writes to the Apple custom service, conn-param tuning, peer_disc_all priming — and none of them recovered the press once Apple discarded it. Implementing the full MagicPairing accessory-authentication protocol (which doesn't even gate HID delivery, per the [WiSec '20 paper](https://arxiv.org/pdf/2005.07255)) is not feasible without a hardware BLE sniffer and access to Apple's per-device LTK material. So we accept the trade-off: keep the link alive, button identity is always preserved.
 
-**Battery cost:** ~5–10 µA average draw on the remote in connected-low-power mode at latency 400, vs. ~1 µA disconnected. CR2032 (≈ 225 mAh) lifetime drops from ~18–24 months to ~14–18 months. Roughly 1.2× drain for 100 % wake-press reliability — the ESPHome path exposes `number.siri_remote_ble_slave_latency` as a live slider so you can trade battery vs. disconnect-detection latency without reflashing.
+**Battery cost:** ~5–10 µA average draw on the remote in connected-low-power mode at latency 400, vs. ~1 µA disconnected. CR2032 (≈ 225 mAh) lifetime drops from ~18–24 months to ~14–18 months. Roughly 1.2× drain for 100 % wake-press reliability. Slave latency is tunable via `ble_slave_latency:` (ESPHome) or `CONFIG_BLE_SLAVE_LATENCY_DEFAULT` (standalone), but it is **compile-time** — it was briefly a live `number.*` slider, and the pulse refactor removed the Number platform, so changing it now needs a reflash.
 
 **Opting out:**
 
@@ -326,69 +344,175 @@ The bridge will proactively terminate the link after that many milliseconds of i
 
 ## Home Assistant automation patterns
 
+### How the bridge reports input
+
+The bridge behaves like an **infrared remote**. Pressing a button fires an
+event with `repeat: 0`; while you keep holding it, the same event repeats
+every `repeat_interval_ms` (100 ms by default), with `repeat` counting up and
+`held_ms` measuring how long the button has been down.
+
+**There is no release event.** The pulses simply stop — exactly like an IR
+receiver seeing repeat frames end. That is deliberate, and it shapes how you
+write automations:
+
+- A hold is not a state with a start and an end. It is a **stream of
+  increments**. "Hold to dim" is not "start dimming, stop dimming"; it is
+  "dim one step per pulse", and it ends because the pulses do.
+- "Turn something on at press and off at release" is not expressible. Model
+  it as increments instead.
+- The firmware makes no judgment about what a click or a hold *is*. It reports
+  `repeat` and `held_ms`; you decide. A 400 ms threshold for one automation
+  and 1 s for another is fine — they are just different conditions on the
+  same stream.
+
+| Function | Rule |
+|---|---|
+| Volume | every pulse → one step |
+| Channel | `repeat % 3 == 0` → one step (slower ramp) |
+| Power, digits, toggles | `repeat == 0` only |
+| Menu arrows | `repeat == 0 or held_ms >= 400`, step `1 if held_ms < 1000 else 5` |
+
+### Quick start — the blueprints
+
+Two are shipped under `blueprints/automation/siri_remote/`. Drop either into
+your HA config under the same path, then create an automation from it via
+**Settings → Automations & Scenes → Blueprints**.
+
+- [`button.yaml`](blueprints/automation/siri_remote/button.yaml) — one button,
+  one action. Choose *once per press* or *repeat while held*, with a typematic
+  delay and an optional rate divisor. Start here.
+- [`controller.yaml`](blueprints/automation/siri_remote/controller.yaml) — all
+  13 buttons in one automation, each with a *press* and a *while held* slot.
+
+Both ask you to pick the bridge device, so two bridges in one house don't
+trigger each other's automations.
+
+The rest of this section documents the underlying event, for when the
+blueprints don't fit.
+
 ### ESPHome path
 
-Discrete remote events fire as a Home Assistant event `esphome.siri_remote_event`
-with the following `event_data` shape:
+Button input fires a Home Assistant event `esphome.siri_remote_button` with
+this `event_data`:
 
-| Field | Type | Present on |
+| Field | Type | Meaning |
 |---|---|---|
-| `action` | string | always — one of `click`, `double_click`, `hold_start`, `hold_end`, `swipe_up`, `swipe_down`, `swipe_left`, `swipe_right` |
-| `button` | string | button events only — `select`, `tv`, `mic`, `volume_up`, `volume_down`, `back`, `play_pause`, etc. |
-| `duration_ms` | integer | `click` and `hold_end` only |
-| `distance` | integer | swipe events only |
+| `device` | string | The bridge's device name, for telling two bridges apart |
+| `button` | string | `select`, `up`, `right`, `down`, `left`, `play_pause`, `volume_up`, `volume_down`, `mute`, `back`, `tv`, `power`, `mic` |
+| `repeat` | integer | `0` is the press itself; increments once per `repeat_interval_ms` while held |
+| `held_ms` | integer | `0` on the press; measured milliseconds held on each repeat |
 
-**Toggle a light on a click:**
+> **Everything arrives as a string.** The ESPHome API carries event data as
+> `map<string,string>`, and HA matches `event_data` with `==` without
+> coercing. So `repeat: 0` written unquoted in a trigger **silently never
+> fires** — no error, no log line. Quote it (`repeat: "0"`) in `event_data`,
+> or use `| int` in a template. The blueprints handle this for you; this is
+> the single most common way to get stuck writing automations by hand.
+
+**Toggle a light on press** (ignores however long you hold it):
 
 ```yaml
 trigger:
   platform: event
-  event_type: esphome.siri_remote_event
+  event_type: esphome.siri_remote_button
   event_data:
-    action: click
     button: volume_up
+    repeat: "0"          # quoted — values arrive as strings
 action:
   service: light.toggle
   target:
     entity_id: light.living_room
 ```
 
-**Dim while holding** (start a loop on `hold_start`, stop on `hold_end`):
+**Ramp volume while held**, after a 400 ms typematic delay. No timers, no
+helper entities — each pulse is one step, and it stops when the pulses do:
 
 ```yaml
-- alias: "Vol Down hold dims"
+- alias: "Volume Up ramps the media player"
   trigger:
     platform: event
-    event_type: esphome.siri_remote_event
+    event_type: esphome.siri_remote_button
     event_data:
-      action: hold_start
-      button: volume_down
+      button: volume_up
+  condition:
+    - "{{ trigger.event.data.repeat | int == 0
+          or trigger.event.data.held_ms | int >= 400 }}"
   action:
-    repeat:
-      until:
-        - platform: event
-          event_type: esphome.siri_remote_event
-          event_data:
-            action: hold_end
-            button: volume_down
-      sequence:
-        - service: light.turn_on
-          data:
-            entity_id: light.living_room
-            brightness_step_pct: -5
-        - delay: "00:00:00.1"
+    service: media_player.volume_up
+    target:
+      entity_id: media_player.living_room
+  mode: single
+  max_exceeded: silent
 ```
 
-**Magnitude-aware swipe** (HA template trigger — swipe_up only fires when
-distance > 100):
+**Accelerating ramp** — the longer you hold, the bigger each step, the way
+tvOS scrolls:
+
+```yaml
+  action:
+    repeat:
+      count: "{{ 1 if trigger.event.data.held_ms | int < 1000 else 5 }}"
+      sequence:
+        - service: light.turn_on
+          target: { entity_id: light.living_room }
+          data: { brightness_step_pct: -5 }
+```
+
+**Tap vs. hold on the same button.** Because `repeat: 0` fires at *press*,
+an automation bound to the press also runs at the start of a hold. If you
+need them mutually exclusive, you have to wait out the delay to learn it was
+a tap:
+
+```yaml
+- alias: "Select: tap plays, hold opens scene"
+  trigger:
+    platform: event
+    event_type: esphome.siri_remote_button
+    event_data:
+      button: select
+      repeat: "0"
+  action:
+    - wait_for_trigger:
+        - platform: event
+          event_type: esphome.siri_remote_button
+          event_data:
+            button: select
+      timeout: "00:00:00.4"
+      continue_on_timeout: true
+    - choose:
+        - conditions: "{{ wait.trigger is none }}"
+          sequence:                      # timed out → it was a tap
+            - service: media_player.media_play_pause
+              target: { entity_id: media_player.living_room }
+      default:                           # more pulses arrived → a hold
+        - service: scene.turn_on
+          target: { entity_id: scene.movie_night }
+  mode: restart
+```
+
+The tap action is necessarily delayed by the timeout — you cannot know a tap
+was a tap until it has failed to become a hold.
+
+### Standalone path (MQTT)
+
+The same payload lands on `siri_remote/event` as real JSON (no string
+coercion), with an extra `event_type` field carrying the button name so HA
+creates one device trigger per button:
+
+```json
+{"event_type":"volume_up","device":"Siri Remote Bridge","button":"volume_up","repeat":0,"held_ms":0}
+```
+
+An Event entity is auto-discovered, so you can bind to it directly rather
+than to the raw topic:
 
 ```yaml
 trigger:
-  platform: event
-  event_type: esphome.siri_remote_event
-  event_data:
-    action: swipe_up
-condition: "{{ trigger.event.data.distance | int > 100 }}"
+  platform: state
+  entity_id: event.siri_remote
+condition: >
+  {{ trigger.to_state.attributes.event_type == 'volume_up'
+     and trigger.to_state.attributes.repeat | int == 0 }}
 ```
 
 **Pause media while voice is active:**
@@ -404,26 +528,58 @@ action:
     entity_id: media_player.living_room
 ```
 
-### Standalone path
-
-The MQTT-only build publishes events on `siri_remote/event` and an Event
-entity is auto-discovered with the same `event_type` values as above. Bind
-to the entity directly:
-
-```yaml
-trigger:
-  platform: state
-  entity_id: event.siri_remote
-condition: >
-  {{ trigger.to_state.attributes.event_type == 'click'
-     and trigger.to_state.attributes.button == 'volume_up' }}
-```
-
 For "bridge came back online" automations (Wi-Fi outage recovery, bridge
 reboot, etc.), bind to the bridge LWT availability topic
 `siri_remote/connection` and watch for an `offline → online` transition. The
 ESPHome path uses the ESPHome API's native availability signal instead and
 does not need a separate topic subscription.
+
+## Upgrading from 0.0.x
+
+The pulse refactor is a **breaking change**. Nothing from an earlier release
+carries over untouched.
+
+**1. Delete `number:` and `switch:` blocks from your YAML.** Both platforms
+are gone. Leaving them in place fails validation outright on the next
+`esphome run` ("Platform not found"). If you started from `example.yaml` or
+`builder.yaml`, copy the current versions.
+
+**2. Every existing automation stops firing.** `esphome.siri_remote_event` no
+longer exists, nor do `click`, `double_click`, `hold_start`, `hold_end`, or
+`swipe_*`. Rewrite against `esphome.siri_remote_button` — the shipped
+blueprints are the fastest route.
+
+**3. Swipes have no replacement.** Gesture support was removed, not renamed.
+Clickpad *clicks* are unaffected.
+
+**4. Two knobs became compile-time.** `repeat_interval_ms:` and
+`ble_slave_latency:` are now YAML keys on the `siri_remote:` block
+(`CONFIG_*` on the standalone path). Changing them needs a reflash. The other
+four sliders — swipe sensitivity, double-click window, hold threshold,
+battery-low % — are gone entirely; the first three were thresholds that now
+live in your automations, and HA can template the fourth.
+
+**5. Clearing stale MQTT entities (standalone only).** HA discovery is
+retained, so the broker keeps serving configs for entities that no longer
+exist, leaving them permanently unavailable in HA. Clear them by hand:
+
+```bash
+for t in swipe_y_priority swipe_min_distance double_window_ms \
+         hold_threshold_ms battery_low_pct ble_slave_latency; do
+  mosquitto_pub -h <broker> -r -n -t "homeassistant/number/siri_remote_$t/config"
+  mosquitto_pub -h <broker> -r -n -t "siri_remote/state/siri_remote_$t"
+done
+mosquitto_pub -h <broker> -r -n -t "homeassistant/switch/siri_remote_raw_stream/config"
+mosquitto_pub -h <broker> -r -n -t "siri_remote/state/siri_remote_raw_stream"
+mosquitto_pub -h <broker> -r -n -t "siri_remote/touch_raw"
+```
+
+The bridge republishes its own discovery on every MQTT connect, so the
+surviving entities reappear on the next boot.
+
+NVS keys from the old Number entities stay in flash and are simply never
+read again. They cost a few hundred bytes; `make erase` clears them, at the
+price of also wiping the BLE bond and forcing a re-pair.
 
 ## Project layout
 
@@ -432,19 +588,22 @@ components/                       # standalone-only IDF C
   siri_ble/                       # BLE central — scan, pair, discover, magic unlock, notify dispatch
   siri_audio/                     # Opus decode pipeline (gen-3 audio packet parser + decoder task)
   report_decoder/                 # Pure-C parsers (button bitmap, touch frame, charging-state, name lookup)
-  event_state/                    # Pure-C state machine — derives semantic events from raw input
-  mqtt_entity/                    # MQTT helper for Switch / Number / Button HA-discovery (standalone-only)
+  button_pulse/                   # Pure-C IR-style pulse emitter — repeat index + held_ms, no interpretation
+  mqtt_entity/                    # MQTT helper for Button HA-discovery (standalone-only)
 main/
   main.c                          # standalone build — Wi-Fi, MQTT, NVS, HA auto-discovery, glue
   Kconfig.projbuild               # standalone Wi-Fi + MQTT credential config
 esphome/components/siri_remote/   # ESPHome external component
   __init__.py                     # parent component schema, sdkconfig pinning
-  binary_sensor.py / sensor.py / text_sensor.py / switch.py / button.py / number.py / microphone.py
+  binary_sensor.py / sensor.py / text_sensor.py / button.py / microphone.py
   siri_remote_hub.{h,cpp}         # Component subclass — orchestrates BLE + audio + entity bridging
-  siri_remote_{switch,button,number,microphone}.{h,cpp}  # entity subclasses
+  siri_remote_{button,microphone}.{h,cpp}  # entity subclasses
   *.c, *.h                        # symlinks to ../../components/*/ — both build paths share C
 example.yaml                      # working ESPHome config (the recommended user starting point)
 secrets.yaml.example              # template for the secrets ESPHome reads
+blueprints/automation/siri_remote/
+  button.yaml                     # one button, one action — the common case
+  controller.yaml                 # all 13 buttons in one automation
 tests/host/                       # Host unit tests (no hardware required) — ASan + UBSan enabled
   fixtures/                       # Captured per-button + per-swipe byte sequences from real hardware
 ```

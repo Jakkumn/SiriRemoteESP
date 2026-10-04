@@ -1,7 +1,7 @@
 """siri_remote — ESPHome external component bridging an Apple Siri Remote
 (gen 3) to Home Assistant.
 
-Shares the C components (siri_ble, siri_audio, report_decoder, event_state)
+Shares the C components (siri_ble, siri_audio, report_decoder, button_pulse)
 with the standalone idf.py build at <repo>/components/ via in-tree
 symlinks; both build paths consume the same source files."""
 
@@ -28,6 +28,8 @@ CONF_VOICE_ENABLED = "voice_enabled"
 CONF_IDLE_DISCONNECT_MS = "idle_disconnect_ms"
 CONF_PAIRING_FLUSH_SUPPRESS_MS = "pairing_flush_suppress_ms"
 CONF_DEBUG_TOUCH_FRAMES = "debug_touch_frames"
+CONF_REPEAT_INTERVAL_MS = "repeat_interval_ms"
+CONF_BLE_SLAVE_LATENCY = "ble_slave_latency"
 CONF_DEBUG_WAKE_PROBE = "debug_wake_probe"
 CONF_DEBUG_PCM_TCP = "debug_pcm_tcp"
 CONF_HOST = "host"
@@ -59,6 +61,18 @@ CONFIG_SCHEMA = cv.All(
         cv.Optional(CONF_VOICE_ENABLED, default=True): cv.boolean,
         cv.Optional(CONF_IDLE_DISCONNECT_MS, default=0): cv.uint32_t,
         cv.Optional(CONF_PAIRING_FLUSH_SUPPRESS_MS, default=1500): cv.uint32_t,
+        # How often a held button re-emits. A rate, not a policy — HA decides
+        # what a hold means from the `held_ms` each pulse carries. Floored at
+        # the 50 ms tick period, since a shorter interval cannot be honoured.
+        # 0 disables repeats entirely (press-only).
+        cv.Optional(CONF_REPEAT_INTERVAL_MS, default=100): cv.Any(
+            cv.int_range(min=0, max=0), cv.int_range(min=50, max=60000)
+        ),
+        # Was a runtime Number entity; now compile-time. Load-bearing for
+        # always-connected wake behaviour — see README before changing.
+        cv.Optional(CONF_BLE_SLAVE_LATENCY, default=400): cv.int_range(
+            min=0, max=500
+        ),
         cv.Optional(CONF_DEBUG_TOUCH_FRAMES, default=False): cv.boolean,
         cv.Optional(CONF_DEBUG_WAKE_PROBE, default=False): cv.boolean,
         cv.Optional(CONF_DEBUG_PCM_TCP): DEBUG_PCM_TCP_SCHEMA,
@@ -94,7 +108,19 @@ def _pin_sdkconfig():
 
     so("CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU", 247)
     so("CONFIG_BT_NIMBLE_SM_SC", True)
-    so("CONFIG_BT_NIMBLE_MAX_BONDS", 1)
+    # NOT 1, despite the bridge only ever bonding one remote. NimBLE sizes
+    # ble_store_config_rpa_recs[] by MAX_BONDS, so 1 leaves a single
+    # RPA-record slot. Every Apple device advertises with a rotating private
+    # address, so in an RF-dense room the first candidate we connect to
+    # consumes that slot; from then on every subsequent candidate's RPA write
+    # fails with BLE_HS_ESTORE_CAP (27) and NimBLE terminates the link ~17 ms
+    # after encryption — before peer_disc_all runs, so fingerprint_check never
+    # gets to identify the real remote. The slot is only freed in the
+    # fingerprint-reject path, which is unreachable in that state: a deadlock
+    # that presents as an endless connect/disconnect loop with no explanation.
+    # Headroom for discovery churn; siri_ble still tracks exactly one
+    # s_bonded_peer. Keep in sync with sdkconfig.defaults.
+    so("CONFIG_BT_NIMBLE_MAX_BONDS", 8)
     so("CONFIG_BT_NIMBLE_MAX_CONNECTIONS", 1)
     so("CONFIG_BT_NIMBLE_NVS_PERSIST", True)
 
@@ -108,6 +134,31 @@ def _pin_sdkconfig():
     so("CONFIG_SPIRAM_SPEED_80M", True)
 
     so("CONFIG_ESP_COEX_SW_COEXIST_ENABLE", True)
+
+    # Raise ESP-IDF's log ceiling so our pure-C components stay diagnosable.
+    #
+    # esphome/core/log.h does `#undef ESP_LOGI` and redirects it to ESPHome's
+    # own logger — but only for translation units that include it, i.e. the C++
+    # glue. siri_ble.c, siri_audio.c and mqtt_entity.c are pure C and get the
+    # real ESP-IDF macros, which are compiled out entirely when
+    # CONFIG_LOG_MAXIMUM_LEVEL is below the call's level.
+    #
+    # ESPHome defaults that ceiling to ERROR(1), which silently deletes every
+    # ESP_LOGI in siri_ble.c — including the whole pairing/discovery
+    # narrative ("disconnected, reason=0x…", "candidate failed pre-fingerprint
+    # — hold Back+VolUp…"). The standalone build sets DEBUG(4) and so has full
+    # BLE diagnostics; without this the two paths differ precisely when you
+    # most need the logs. Match standalone's sdkconfig.defaults.
+    #
+    # MAXIMUM is the compile-time ceiling; DEFAULT is the runtime level. Both
+    # choice symbols and their ints must be written, and the ERROR choice
+    # cleared, or kconfiglib keeps the old selection.
+    so("CONFIG_LOG_MAXIMUM_LEVEL_ERROR", False)
+    so("CONFIG_LOG_MAXIMUM_LEVEL_DEBUG", True)
+    so("CONFIG_LOG_MAXIMUM_LEVEL", 4)
+    so("CONFIG_LOG_DEFAULT_LEVEL_ERROR", False)
+    so("CONFIG_LOG_DEFAULT_LEVEL_INFO", True)
+    so("CONFIG_LOG_DEFAULT_LEVEL", 3)
 
 
 async def to_code(config):
@@ -144,6 +195,8 @@ async def to_code(config):
     cg.add(var.set_pairing_flush_suppress_ms(
         config[CONF_PAIRING_FLUSH_SUPPRESS_MS]))
     cg.add(var.set_debug_touch_frames(config[CONF_DEBUG_TOUCH_FRAMES]))
+    cg.add(var.set_repeat_interval_ms(config[CONF_REPEAT_INTERVAL_MS]))
+    cg.add(var.set_ble_slave_latency(config[CONF_BLE_SLAVE_LATENCY]))
 
     if CONF_DEBUG_PCM_TCP in config:
         pcm = config[CONF_DEBUG_PCM_TCP]

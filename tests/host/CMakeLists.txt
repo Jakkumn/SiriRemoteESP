@@ -25,12 +25,12 @@ add_library(report_decoder STATIC
 )
 target_include_directories(report_decoder PUBLIC ${DECODER_DIR}/include)
 
-set(EVENT_STATE_DIR "${CMAKE_CURRENT_LIST_DIR}/../../components/event_state")
-add_library(event_state STATIC
-    ${EVENT_STATE_DIR}/event_state.c
+set(BUTTON_PULSE_DIR "${CMAKE_CURRENT_LIST_DIR}/../../components/button_pulse")
+add_library(button_pulse STATIC
+    ${BUTTON_PULSE_DIR}/button_pulse.c
 )
-target_include_directories(event_state PUBLIC ${EVENT_STATE_DIR}/include)
-target_link_libraries(event_state PUBLIC report_decoder)
+target_include_directories(button_pulse PUBLIC ${BUTTON_PULSE_DIR}/include)
+target_link_libraries(button_pulse PUBLIC report_decoder)
 
 # Just the pure validator from siri_audio. The full siri_audio.c pulls in
 # opus + FreeRTOS + esp-log, which we deliberately avoid in the host
@@ -53,8 +53,8 @@ endfunction()
 add_host_test(test_report_decoder)
 target_link_libraries(test_report_decoder PRIVATE report_decoder)
 
-add_host_test(test_event_state)
-target_link_libraries(test_event_state PRIVATE event_state)
+add_host_test(test_button_pulse)
+target_link_libraries(test_button_pulse PRIVATE button_pulse)
 
 add_host_test(test_siri_audio)
 target_link_libraries(test_siri_audio PRIVATE siri_audio_validate)

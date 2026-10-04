@@ -72,7 +72,7 @@ lint: ## Check C/H formatting against .clang-format
 	@# peer.c + esp_central.h come from the upstream NimBLE blecent example
 	@# and use a different brace style; keep them out of the lint set so we
 	@# don't drift away from the upstream source we periodically diff against.
-	@find components/siri_ble components/siri_audio components/event_state \
+	@find components/siri_ble components/siri_audio components/button_pulse \
 	    components/report_decoder components/mqtt_entity main tests/host \
 	    \( -name '*.c' -o -name '*.h' \) -not -name 'peer.c' -not -name 'esp_central.h' | \
 	    xargs clang-format --dry-run -Werror

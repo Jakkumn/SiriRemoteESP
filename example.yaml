@@ -12,6 +12,11 @@
 
 esphome:
   name: siri-bridge
+  # The pulse payload's `device` field carries this, so a blueprint can match
+  # it against device_attr(<device>, 'name'). With only `name:` set,
+  # get_friendly_name() is empty and HA falls back to `name` — the firmware
+  # mirrors that fallback, but setting it explicitly keeps the two in step.
+  friendly_name: Siri Remote Bridge
 
 esp32:
   board: seeed_xiao_esp32s3
@@ -40,6 +45,13 @@ ota:
     password: !secret ota_password
 
 siri_remote:
+  # How often a held button re-emits. A rate, not a policy: each pulse carries
+  # `repeat` and `held_ms`, and HA decides what a click or a hold is. Floored
+  # at the 50 ms tick period; 0 disables repeats (press-only).
+  # repeat_interval_ms: 100
+  # Was a runtime slider; now compile-time. Load-bearing for always-connected
+  # wake behaviour — read the README before changing it.
+  # ble_slave_latency: 400
   # Hand the firmware a pointer to voice_assistant. Two behaviors come
   # along with this:
   #  1. Mic press fires voice_assistant.start directly from the BLE
@@ -90,13 +102,6 @@ text_sensor:
     type: charging
     name: "Siri Remote Charging"
 
-switch:
-  - platform: siri_remote
-    type: raw_stream
-    name: "Siri Remote Raw Touch Stream"
-
-# Pressing this wipes the BLE bond — the user must hold Back+VolUp on the
-# remote within ~5 minutes to re-pair.
 button:
   - platform: siri_remote
     type: repair
@@ -105,45 +110,49 @@ button:
 # Runtime-tunable thresholds. All NVS-persisted via ESPHome Preferences.
 # Defaults match the standalone Kconfig defaults; override min/max/step in
 # YAML if you want a different slider range.
-number:
-  - platform: siri_remote
-    type: swipe_y_priority
-    name: "Siri Remote Swipe Y Priority"
-  - platform: siri_remote
-    type: swipe_min_distance
-    name: "Siri Remote Swipe Min Distance"
-  - platform: siri_remote
-    type: double_click_window_ms
-    name: "Siri Remote Double-Click Window"
-    unit_of_measurement: "ms"
-  - platform: siri_remote
-    type: hold_threshold_ms
-    name: "Siri Remote Hold Threshold"
-    unit_of_measurement: "ms"
-  - platform: siri_remote
-    type: battery_low_pct
-    name: "Siri Remote Battery Low Threshold"
-    unit_of_measurement: "%"
-  - platform: siri_remote
-    type: ble_slave_latency
-    name: "Siri Remote BLE Slave Latency"
-
 # -----------------------------------------------------------------------------
 # Home Assistant automation example (paste into HA's automations.yaml).
-# Discrete remote events fire as `esphome.siri_remote_event` with payload
-# {action, button, duration_ms, distance}. See README.md for the full field
-# table + more examples (hold-to-dim, magnitude-aware swipes, voice_active).
+#
+# Button input arrives as `esphome.siri_remote_button` with payload
+# {device, button, repeat, held_ms}. While a button is held it repeats every
+# repeat_interval_ms; repeat 0 is the press. There is NO release event —
+# the pulses just stop, exactly like an IR remote's repeat frames.
+#
+# NOTE: every value crosses the API as a *string*. HA compares event_data with
+# == and will not coerce, so `repeat: 0` unquoted silently never matches.
+# Quote it in event_data, or use `| int` in a template. The shipped blueprints
+# handle this for you.
+#
+# Fire once per press:
 #
 # automation:
-#   - alias: "Volume Up click toggles living-room light"
+#   - alias: "Volume Up press toggles living-room light"
 #     trigger:
 #       platform: event
-#       event_type: esphome.siri_remote_event
+#       event_type: esphome.siri_remote_button
 #       event_data:
-#         action: click
 #         button: volume_up
+#         repeat: "0"          # <- quoted; values arrive as strings
 #     action:
 #       service: light.toggle
 #       target:
 #         entity_id: light.living_room
+#
+# Ramp while held (every pulse steps once), after a 400 ms typematic delay:
+#
+#   - alias: "Volume Up ramps the media player"
+#     trigger:
+#       platform: event
+#       event_type: esphome.siri_remote_button
+#       event_data:
+#         button: volume_up
+#     condition:
+#       - "{{ trigger.event.data.repeat | int == 0
+#             or trigger.event.data.held_ms | int >= 400 }}"
+#     action:
+#       service: media_player.volume_up
+#       target:
+#         entity_id: media_player.living_room
+#     mode: single
+#     max_exceeded: silent
 # -----------------------------------------------------------------------------
