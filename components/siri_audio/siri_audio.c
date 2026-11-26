@@ -44,6 +44,11 @@ static OpusDecoder *s_decoder;
 static QueueHandle_t s_queue;
 static TaskHandle_t s_decode_task;
 static volatile bool s_session_active;
+// Set by siri_audio_session_start() (NimBLE host task), consumed by the decode
+// task. The decoder is only ever touched from the decode task: resetting it
+// from the caller could land while opus_decode() is mid-frame on the previous
+// session's last packet and corrupt its state.
+static volatile bool s_reset_pending;
 
 // --- Decoder lifecycle ----------------------------------------------------
 
@@ -108,6 +113,15 @@ static void decode_task(void *arg)
     while (1) {
         if (xQueueReceive(s_queue, &pkt, portMAX_DELAY) != pdTRUE) {
             continue;
+        }
+        if (s_reset_pending) {
+            // Fresh utterance: opus_decode caches last-frame state for FEC and
+            // packet-loss concealment, and carrying it over from the previous
+            // session would inject garbage at the start of this one. Done here,
+            // before the new session's first packet, because this task owns the
+            // decoder. Cleared first so a start that races this reset re-arms it.
+            s_reset_pending = false;
+            opus_decoder_ctl(s_decoder, OPUS_RESET_STATE);
         }
         uint8_t opus_pkt_len = 0;
         if (!siri_audio_validate_packet(pkt.bytes, pkt.len, &opus_pkt_len)) {
@@ -192,15 +206,10 @@ void siri_audio_session_start(void)
 {
     if (s_session_active)
         return;
+    // Before s_session_active, so no packet of this session can be queued
+    // ahead of the reset request.
+    s_reset_pending = true;
     s_session_active = true;
-
-    // Reset decoder state for a fresh utterance. opus_decode caches
-    // last-frame state for FEC and packet-loss recovery; carrying state
-    // from a previous session would inject garbage at the start of the
-    // new one.
-    if (s_decoder != NULL) {
-        opus_decoder_ctl(s_decoder, OPUS_RESET_STATE);
-    }
     ESP_LOGI(TAG, "session start");
     if (s_cfg.on_session_start != NULL) {
         s_cfg.on_session_start(s_cfg.user);

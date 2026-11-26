@@ -204,6 +204,25 @@ static uint32_t s_enc_fail_streak;
 static struct ble_npl_callout s_idle_co;
 static uint32_t s_last_activity_ms;
 
+// Stale-map detection. A map restored from NVS can outlive the layout it
+// describes (a remote firmware update can shift handles, exactly as two units
+// on different firmware differ). That brings back the original silent failure,
+// so a setup step that fails with a "wrong handle" ATT error on a cached map
+// erases it and reconnects to rediscover. Only for a cached map — a freshly
+// derived one failing would fail again — and once per boot, so a remote that
+// rejects some step for any other reason cannot loop.
+static bool s_map_from_nvs;
+static bool s_map_invalidated;
+
+// Backoff for a bonded remote whose handle-map rediscovery keeps failing.
+// Without it the bridge reconnects, spends ~3.7 s rediscovering, fails,
+// disconnects and repeats indefinitely. Doubles from 5 s, capped at 5 min;
+// reset by a successful rediscovery or by Repair.
+#define REDISCOVERY_BACKOFF_BASE_MS 5000
+#define REDISCOVERY_BACKOFF_MAX_MS (5 * 60 * 1000)
+static struct ble_npl_callout s_reconnect_co;
+static uint32_t s_rediscover_fail_streak;
+
 // Worst-case wait between the two ENC_CHANGE events before we run setup
 // anyway. Across captured gen-3 connects the gap is reliably 750-1200 ms;
 // 2500 ms gives generous headroom while still bounding worst-case latency.
@@ -384,6 +403,37 @@ static void start_bonded_reconnect(void)
         s_have_bonded_peer = false;
         start_discovery();
     }
+}
+
+// Disconnect-path entry to BONDED_RECONNECT: immediate normally, delayed while
+// rediscovery is failing (see REDISCOVERY_BACKOFF_*).
+static void schedule_bonded_reconnect(void)
+{
+    if (s_rediscover_fail_streak == 0) {
+        start_bonded_reconnect();
+        return;
+    }
+    uint32_t shift = s_rediscover_fail_streak - 1;
+    uint32_t delay = REDISCOVERY_BACKOFF_MAX_MS;
+    if (shift < 7 && (REDISCOVERY_BACKOFF_BASE_MS << shift) < REDISCOVERY_BACKOFF_MAX_MS) {
+        delay = REDISCOVERY_BACKOFF_BASE_MS << shift;
+    }
+    s_mode = MODE_BONDED_RECONNECT;
+    ESP_LOGW(TAG,
+             "handle-map rediscovery failed %lu time(s) in a row — retrying the bonded "
+             "connect in %lu s (press Repair to re-pair instead)",
+             (unsigned long)s_rediscover_fail_streak, (unsigned long)(delay / 1000));
+    (void)ble_npl_callout_reset(&s_reconnect_co, ble_npl_time_ms_to_ticks32(delay));
+}
+
+static void reconnect_cb(struct ble_npl_event *ev)
+{
+    (void)ev;
+    // Repair (or anything else) may have moved on while we waited.
+    if (s_mode != MODE_BONDED_RECONNECT || s_active_conn != 0xFFFF) {
+        return;
+    }
+    start_bonded_reconnect();
 }
 
 // Inspect an incoming adv. If it advertises HID and clears the RSSI / blacklist
@@ -743,6 +793,44 @@ static size_t s_setup_step_idx;
 static int on_setup_step_done(uint16_t conn_handle, const struct ble_gatt_error *error,
                               struct ble_gatt_attr *attr, void *arg);
 
+static bool is_wrong_handle_error(int status)
+{
+    return status == BLE_HS_ATT_ERR(BLE_ATT_ERR_INVALID_HANDLE) ||
+           status == BLE_HS_ATT_ERR(BLE_ATT_ERR_ATTR_NOT_FOUND) ||
+           status == BLE_HS_ATT_ERR(BLE_ATT_ERR_READ_NOT_PERMITTED) ||
+           status == BLE_HS_ATT_ERR(BLE_ATT_ERR_WRITE_NOT_PERMITTED);
+}
+
+// A step failed (status from the ATT callback or the queueing call). Returns
+// true if the chain must stop here rather than skip to the next step.
+static bool setup_step_failed(const setup_step_t *step, int status)
+{
+    if (status == BLE_HS_ENOTCONN || status == BLE_HS_ETIMEOUT) {
+        // The link is gone (NimBLE fails in-flight procedures with ENOTCONN
+        // before raising DISCONNECT; an ATT timeout ends the bearer). Every
+        // later step would fail the same way, and the terminator would arm the
+        // blackout and request conn params on a dead handle.
+        ESP_LOGW(TAG, "%s: link lost (status=%d) — abandoning setup chain", step->label, status);
+        return true;
+    }
+    if (step->sel != H_LIT && s_map_from_nvs && !s_map_invalidated &&
+        is_wrong_handle_error(status)) {
+        s_map_invalidated = true;
+        ESP_LOGW(TAG,
+                 "%s: ATT error 0x%02x on a cached handle — the remote's GATT layout has "
+                 "likely changed (firmware update?); erasing the handle map and reconnecting "
+                 "to rediscover",
+                 step->label, (unsigned)(status - BLE_HS_ERR_ATT_BASE));
+        map_erase();
+        int rc = ble_gap_terminate(s_setup_step_conn, BLE_ERR_REM_USER_CONN_TERM);
+        if (rc != 0 && rc != BLE_HS_ENOTCONN) {
+            ESP_LOGW(TAG, "ble_gap_terminate (stale map) rc=%d", rc);
+        }
+        return true;
+    }
+    return false;
+}
+
 static void issue_setup_step(size_t idx)
 {
     if (idx >= SETUP_STEP_COUNT) {
@@ -790,6 +878,9 @@ static void issue_setup_step(size_t idx)
     }
     if (rc != 0) {
         ESP_LOGE(TAG, "%s: queue failed: rc=%d", step->label, rc);
+        if (setup_step_failed(step, rc)) {
+            return;
+        }
         // Skip this step rather than stalling the chain.
         s_setup_step_idx++;
         issue_setup_step(s_setup_step_idx);
@@ -804,6 +895,9 @@ static int on_setup_step_done(uint16_t conn_handle, const struct ble_gatt_error 
     if (error->status != 0) {
         ESP_LOGE(TAG, "%s failed: status=0x%x att_handle=0x%04x", step->label, error->status,
                  error->att_handle);
+        if (setup_step_failed(step, error->status)) {
+            return 0;
+        }
     } else if (step->kind == SETUP_KIND_READ && attr != NULL && attr->om != NULL) {
         uint16_t len = OS_MBUF_PKTLEN(attr->om);
         uint8_t buf[64];
@@ -997,6 +1091,7 @@ static void on_fingerprint_disc_complete(const struct peer *peer, int status, vo
     }
     s_map = derived;
     s_map_valid = true;
+    s_map_from_nvs = false;
     ESP_LOGI(TAG, "fingerprint PASS — gen-3 Siri Remote confirmed, proceeding with setup");
     log_handle_map(&s_map);
     map_save(&s_map);
@@ -1040,6 +1135,7 @@ static void on_bonded_disc_complete(const struct peer *peer, int status, void *a
     uint16_t conn = peer->conn_handle;
     if (status != 0) {
         ESP_LOGE(TAG, "bonded rediscovery failed status=%d — terminating", status);
+        s_rediscover_fail_streak++;
         (void)ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
         return;
     }
@@ -1047,11 +1143,14 @@ static void on_bonded_disc_complete(const struct peer *peer, int status, void *a
     const char *derr = derive_handle_map(peer, &derived);
     if (derr != NULL) {
         ESP_LOGE(TAG, "bonded rediscovery: handle map underivable (%s) — terminating", derr);
+        s_rediscover_fail_streak++;
         (void)ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
         return;
     }
+    s_rediscover_fail_streak = 0;
     s_map = derived;
     s_map_valid = true;
+    s_map_from_nvs = false;
     ESP_LOGI(TAG, "handle map rediscovered for bonded remote");
     log_handle_map(&s_map);
     map_save(&s_map);
@@ -1070,6 +1169,7 @@ static void setup_bonded(uint16_t conn, uint32_t idle)
     int rc = peer_disc_all(conn, on_bonded_disc_complete, NULL);
     if (rc != 0) {
         ESP_LOGE(TAG, "bonded rediscovery kickoff failed rc=%d — terminating", rc);
+        s_rediscover_fail_streak++;
         (void)ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
     }
 }
@@ -1359,10 +1459,10 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         if (s_mode == MODE_DISCOVERING) {
             start_discovery();
         } else if (s_mode == MODE_BONDED_RECONNECT) {
-            start_bonded_reconnect();
+            schedule_bonded_reconnect();
         } else if (s_mode == MODE_CONNECTED) {
             if (s_have_bonded_peer) {
-                start_bonded_reconnect();
+                schedule_bonded_reconnect();
             } else {
                 start_discovery();
             }
@@ -1549,6 +1649,8 @@ static void repair_ev_cb(struct ble_npl_event *ev)
     s_have_bonded_peer = false;
     s_pending_candidate_set = false;
     blacklist_clear();
+    s_rediscover_fail_streak = 0;
+    ble_npl_callout_stop(&s_reconnect_co);
 
     if (s_active_conn != 0xFFFF) {
         // Disconnect handler will see s_have_bonded_peer=false and route
@@ -1699,6 +1801,7 @@ esp_err_t siri_ble_start(const siri_ble_config_t *cfg)
     // first boot and after a repair; the bonded path rediscovers in that case.
     if (map_load(&s_map)) {
         s_map_valid = true;
+        s_map_from_nvs = true;
         ESP_LOGI(TAG, "handle map restored from NVS");
         log_handle_map(&s_map);
     } else {
@@ -1738,7 +1841,8 @@ esp_err_t siri_ble_start(const siri_ble_config_t *cfg)
     if (ble_npl_callout_init(&s_setup_fallback_co, evq, setup_fallback_cb, NULL) != 0 ||
         ble_npl_callout_init(&s_discovery_window_co, evq, discovery_window_expired_cb, NULL) != 0 ||
         ble_npl_callout_init(&s_enc_watchdog_co, evq, enc_watchdog_cb, NULL) != 0 ||
-        ble_npl_callout_init(&s_idle_co, evq, idle_cb, NULL) != 0) {
+        ble_npl_callout_init(&s_idle_co, evq, idle_cb, NULL) != 0 ||
+        ble_npl_callout_init(&s_reconnect_co, evq, reconnect_cb, NULL) != 0) {
         ESP_LOGE(TAG, "ble_npl_callout_init failed");
         return ESP_FAIL;
     }
