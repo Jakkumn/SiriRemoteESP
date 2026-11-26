@@ -23,7 +23,7 @@ _LOGGER = logging.getLogger(__name__)
 # appended at codegen time because it is always available, whereas the tag
 # usually is not: ESPHome's git source is a shallow fetch of the ref, so
 # `git describe --tags` can't see it.
-COMPONENT_VERSION = "0.1.2-rc.9"
+COMPONENT_VERSION = "0.1.2"
 
 
 def _git_revision() -> str | None:

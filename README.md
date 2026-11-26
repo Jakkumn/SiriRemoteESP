@@ -55,9 +55,17 @@ To consume the component without cloning, point ESPHome at the GitHub repo:
 
 ```yaml
 external_components:
-  - source: github://Jakkumn/SiriRemoteESP@v0.1.1
-    path: esphome/components
+  - source:
+      type: git
+      url: https://github.com/Jakkumn/SiriRemoteESP
+      ref: v0.1.2
+      path: esphome/components
+    components: [siri_remote]
 ```
+
+Use the explicit `type: git` form: the `github://owner/repo@ref` shorthand
+cannot take a `path:`, and this component lives under `esphome/components/`
+rather than at the repository root, so ESPHome rejects it.
 
 Pinning to a tag (rather than `@main`) is recommended so a downstream change
 won't break your install on the next `esphome run`.
