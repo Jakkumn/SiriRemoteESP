@@ -241,9 +241,17 @@ static void publish_ha_discovery_charging(void)
     mqtt_publish_now(TOPIC_DISCOVERY_CHARGING, PAYLOAD, sizeof(PAYLOAD) - 1, 1, /*retain*/ true);
 }
 
+// Retained state topics (remote_status, battery, charging) go out at QoS 0.
+// esp-mqtt keeps QoS 1 messages in its outbox across a reconnect and resends
+// them after it, so a "disconnected" queued just before a Wi-Fi blip could
+// land *after* the fresh state MQTT_EVENT_CONNECTED republishes and stay
+// retained for days, holding battery/charging unavailable. QoS 1 bought
+// nothing here: every connect republishes all three from current state.
+#define STATE_QOS 0
+
 static void publish_remote_status(bool connected)
 {
-    mqtt_publish(TOPIC_REMOTE_STATUS, connected ? "connected" : "disconnected", 0, 1,
+    mqtt_publish(TOPIC_REMOTE_STATUS, connected ? "connected" : "disconnected", 0, STATE_QOS,
                  /*retain*/ true);
 }
 
@@ -270,7 +278,7 @@ static void publish_battery(uint8_t level)
                      low ? "true" : "false");
     if (n > 0) {
         ESP_LOGI(TAG, "battery=%u%%%s", (unsigned)level, low ? " (LOW)" : "");
-        mqtt_publish(TOPIC_BATTERY, buf, n, 1, /*retain*/ true);
+        mqtt_publish(TOPIC_BATTERY, buf, n, STATE_QOS, /*retain*/ true);
     }
 }
 
@@ -279,7 +287,7 @@ static void publish_charging(uint8_t state_byte)
     s_last_charging_byte = state_byte;
     const char *s = siri_decode_charging_state(state_byte);
     ESP_LOGI(TAG, "charging state=0x%02x => %s", state_byte, s);
-    mqtt_publish(TOPIC_CHARGING, s, 0, 1, /*retain*/ true);
+    mqtt_publish(TOPIC_CHARGING, s, 0, STATE_QOS, /*retain*/ true);
 }
 
 // --- button_pulse emit callback ---
@@ -365,6 +373,12 @@ static void pcm_tcp_send_cb(const int16_t *samples, size_t count, void *user)
 
 // --- siri_ble callbacks ---
 
+#ifdef CONFIG_VOICE_ENABLED
+// Last button bitmap, for Mic edge detection. NimBLE host task only (notify
+// and disconnect callbacks).
+static uint16_t s_prev_btns;
+#endif
+
 static void on_notify_cb(uint16_t attr_handle, const uint8_t *data, size_t len, void *user)
 {
     (void)user;
@@ -375,7 +389,6 @@ static void on_notify_cb(uint16_t attr_handle, const uint8_t *data, size_t len, 
         // Detect Mic-button transitions to drive audio session lifecycle.
         // gen-3 doesn't use the gen-1 sentinels — the Mic bit on the
         // standard button bitmap *is* the session marker.
-        static uint16_t s_prev_btns;
         bool mic_was = (s_prev_btns & SIRI_BTN_MIC) != 0;
         bool mic_now = (btns & SIRI_BTN_MIC) != 0;
         if (mic_now && !mic_was) {
@@ -386,8 +399,8 @@ static void on_notify_cb(uint16_t attr_handle, const uint8_t *data, size_t len, 
         s_prev_btns = btns;
 #endif
 
-        uint32_t now = now_ms();
         xSemaphoreTake(s_pulse_lock, portMAX_DELAY);
+        uint32_t now = now_ms();  // under the lock: a tick can't slip in between
         button_pulse_feed_buttons(s_bp, btns, now);
         rearm_tick_locked(now);
         xSemaphoreGive(s_pulse_lock);
@@ -438,6 +451,15 @@ static void on_connected_cb(uint32_t idle_ms, void *user)
 static void on_disconnected_cb(void *user)
 {
     (void)user;
+#ifdef CONFIG_VOICE_ENABLED
+    // No release report will arrive for a Mic held when the link dropped: end
+    // the session it would have ended, and forget the bitmap so a Mic held at
+    // reconnect is seen as a fresh press rather than matching the stale bit.
+    if ((s_prev_btns & SIRI_BTN_MIC) != 0) {
+        siri_audio_session_end();
+    }
+    s_prev_btns = 0;
+#endif
     s_remote_connected = false;
     publish_remote_status(false);
     xSemaphoreTake(s_pulse_lock, portMAX_DELAY);
@@ -467,8 +489,8 @@ static void repair_button_pressed(int32_t value, void *user)
 static void tick_timer_cb(void *arg)
 {
     (void)arg;
-    uint32_t now = now_ms();
     xSemaphoreTake(s_pulse_lock, portMAX_DELAY);
+    uint32_t now = now_ms();  // under the lock, so no feed lands in between
     button_pulse_tick(s_bp, now);
     rearm_tick_locked(now);
     xSemaphoreGive(s_pulse_lock);

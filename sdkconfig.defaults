@@ -1,3 +1,8 @@
+# Target chip. Without this a fresh clone (sdkconfig is gitignored) builds for
+# the plain ESP32 — the octal-PSRAM settings below are then ignored and the
+# image won't flash to the XIAO ESP32-S3. `idf.py set-target` still overrides.
+CONFIG_IDF_TARGET="esp32s3"
+
 # Use NimBLE instead of Bluedroid. Smaller, better central-role support,
 # and matches the ESP-IDF blecent reference we're building from.
 CONFIG_BT_ENABLED=y

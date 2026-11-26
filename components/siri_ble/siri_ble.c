@@ -180,6 +180,20 @@ static const ble_uuid128_t APPLE_CUSTOM_SVC_UUID = BLE_UUID128_INIT(
 // to wake the remote is delivered cleanly once our CCCD subscribes land.
 static uint16_t s_pending_setup_conn = 0xFFFF;
 static uint32_t s_pending_setup_idle_ms;
+// Set the moment setup is dispatched for a connection (secondary ENC_CHANGE or
+// the fallback), cleared on DISCONNECT. s_setup_done_conn is only set once the
+// GATT walk has finished and the chain starts — ~3.7 s later on a fingerprint
+// or rediscovery. Without this marker, an ENC_CHANGE in that gap (Apple
+// re-keys, or a late secondary after the fallback ran) looked like a *first*
+// ENC_CHANGE, re-armed the fallback, and the fallback then called
+// peer_disc_all again: that frees the in-flight walk's service list under it
+// (peer.c), a use-after-free / assert and a reboot.
+static uint16_t s_setup_dispatched_conn = 0xFFFF;
+
+static bool setup_started(uint16_t conn)
+{
+    return conn == s_setup_dispatched_conn || conn == s_setup_done_conn;
+}
 static struct ble_npl_callout s_setup_fallback_co;
 
 // Encryption watchdog. Nothing else bounds the time between CONNECT and the
@@ -263,7 +277,7 @@ static struct ble_gap_upd_params s_low_power_conn_params = {
 };
 
 static int gap_event_cb(struct ble_gap_event *event, void *arg);
-static void start_discovery(void);
+static void start_discovery(bool restart_window);
 static void start_bonded_reconnect(void);
 static void complete_setup_chain(uint16_t conn_handle, uint32_t idle_ms);
 #ifdef CONFIG_DEBUG_WAKE_PROBE
@@ -346,8 +360,21 @@ static bool adv_advertises_hid(const struct ble_hs_adv_fields *f)
 
 // --- Scan / connect entry points -------------------------------------------
 
-static void start_discovery(void)
+// restart_window: true when entering discovery afresh (boot with no bond,
+// Repair, a bond that turned out unusable), false for the rescan after a
+// rejected or failed candidate. The 5-minute window bounds the whole attempt;
+// restarting it on every rescan meant any nearby HID device that kept failing
+// (a keyboard, or the remote outside pairing mode) kept the bridge scanning
+// at full duty forever.
+static void start_discovery(bool restart_window)
 {
+    if (!ble_hs_synced()) {
+        // Mid host reset: anything issued now is lost when sync resets the
+        // controller, while NimBLE's own bookkeeping keeps it "pending" — a
+        // phantom that blocks every later scan/connect. on_sync re-dispatches.
+        ESP_LOGW(TAG, "host not synced; discovery resumes on sync");
+        return;
+    }
     s_mode = MODE_DISCOVERING;
     s_pending_candidate_set = false;
 
@@ -375,8 +402,10 @@ static void start_discovery(void)
         return;
     }
 
-    (void)ble_npl_callout_reset(&s_discovery_window_co,
-                                ble_npl_time_ms_to_ticks32(DISCOVERY_WINDOW_MS));
+    if (restart_window || !ble_npl_callout_is_active(&s_discovery_window_co)) {
+        (void)ble_npl_callout_reset(&s_discovery_window_co,
+                                    ble_npl_time_ms_to_ticks32(DISCOVERY_WINDOW_MS));
+    }
     ESP_LOGI(TAG,
              "DISCOVERING — for a NEW bridge, hold Back+VolUp on the remote ~5s to "
              "enter pairing mode; for a previously-paired remote, any button press "
@@ -386,10 +415,14 @@ static void start_discovery(void)
 
 static void start_bonded_reconnect(void)
 {
+    if (!ble_hs_synced()) {
+        ESP_LOGW(TAG, "host not synced; bonded reconnect resumes on sync");  // see start_discovery
+        return;
+    }
     if (!s_have_bonded_peer) {
         ESP_LOGW(TAG,
                  "start_bonded_reconnect called with no stored peer; falling back to discovery");
-        start_discovery();
+        start_discovery(true);
         return;
     }
     s_mode = MODE_BONDED_RECONNECT;
@@ -398,10 +431,17 @@ static void start_bonded_reconnect(void)
     log_addr("BONDED_RECONNECT to", s_bonded_peer.val);
     int rc =
         ble_gap_connect(s_own_addr_type, &s_bonded_peer, BLE_HS_FOREVER, NULL, gap_event_cb, NULL);
-    if (rc != 0 && rc != BLE_HS_EALREADY && rc != BLE_HS_EBUSY) {
+    if (rc == BLE_HS_EBUSY) {
+        // A scan is running, so nothing is pending — treating this as success
+        // would leave no connect issued at all. Stop the scan and retry once.
+        (void)ble_gap_disc_cancel();
+        rc = ble_gap_connect(s_own_addr_type, &s_bonded_peer, BLE_HS_FOREVER, NULL, gap_event_cb,
+                             NULL);
+    }
+    if (rc != 0 && rc != BLE_HS_EALREADY) {
         ESP_LOGE(TAG, "ble_gap_connect (bonded) failed rc=%d; entering discovery", rc);
         s_have_bonded_peer = false;
-        start_discovery();
+        start_discovery(true);
     }
 }
 
@@ -467,7 +507,7 @@ static void try_connect_candidate(const struct ble_gap_disc_desc *disc,
     if (rc != 0) {
         ESP_LOGE(TAG, "ble_gap_connect failed: rc=%d", rc);
         s_pending_candidate_set = false;
-        start_discovery();
+        start_discovery(false);
     }
 }
 
@@ -1098,6 +1138,7 @@ static void on_fingerprint_disc_complete(const struct peer *peer, int status, vo
         s_pending_candidate_set = false;
     }
     ble_npl_callout_stop(&s_discovery_window_co);
+    s_rediscover_fail_streak = 0;  // a new bond starts with a clean slate
     // Use idle=0 here: this is a brand-new bond, there's no meaningful
     // time-since-disconnect to publish. idle == 0 is also what arms the
     // post-pairing notify blackout at the end of the setup chain (Apple
@@ -1115,7 +1156,9 @@ reject:
         (void)ble_store_util_delete_peer(candidate_bond_addr());
         s_pending_candidate_set = false;
     }
-    (void)ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
+    if (status != BLE_HS_ENOTCONN) {  // already gone: DISCONNECT is on its way
+        (void)ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
+    }
     // Disconnect handler will resume scanning while still inside the
     // discovery window.
 }
@@ -1125,6 +1168,15 @@ static void on_bonded_disc_complete(const struct peer *peer, int status, void *a
     (void)arg;
     uint16_t conn = peer->conn_handle;
     if (status != 0) {
+        if (status == BLE_HS_ENOTCONN || status == BLE_HS_ETIMEOUT) {
+            // The link went away (out of range, Repair) — says nothing about
+            // whether rediscovery works, so it must not feed the backoff.
+            ESP_LOGW(TAG, "bonded rediscovery interrupted by link loss (status=%d)", status);
+            if (status == BLE_HS_ETIMEOUT) {
+                (void)ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
+            }
+            return;
+        }
         ESP_LOGE(TAG, "bonded rediscovery failed status=%d — terminating", status);
         s_rediscover_fail_streak++;
         (void)ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
@@ -1180,6 +1232,7 @@ static void setup_fallback_cb(struct ble_npl_event *ev)
     uint16_t conn = s_pending_setup_conn;
     uint32_t idle = s_pending_setup_idle_ms;
     s_pending_setup_conn = 0xFFFF;
+    s_setup_dispatched_conn = conn;
     if (s_mode == MODE_DISCOVERING) {
         // Fallback during discovery: kick fingerprint manually, since the
         // secondary ENC_CHANGE that would have triggered it never arrived.
@@ -1369,7 +1422,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
                 // Re-issue direct connect — peer will eventually advertise.
                 start_bonded_reconnect();
             } else if (s_mode == MODE_DISCOVERING) {
-                start_discovery();
+                start_discovery(false);
             }
             return 0;
         }
@@ -1378,7 +1431,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         // On bonded reconnect ENC_CHANGE can precede CONNECT (see the
         // ENC_CHANGE handler); arm only if encryption hasn't already landed.
         if (s_pending_setup_conn != event->connect.conn_handle &&
-            s_setup_done_conn != event->connect.conn_handle) {
+            !setup_started(event->connect.conn_handle)) {
             s_enc_watchdog_conn = event->connect.conn_handle;
             (void)ble_npl_callout_reset(&s_enc_watchdog_co,
                                         ble_npl_time_ms_to_ticks32(ENC_WATCHDOG_MS));
@@ -1401,9 +1454,20 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         // before our explicit call lands. The call returns BLE_HS_EALREADY (2)
         // and the automatic path completes encryption successfully. Treat that
         // as success — only log other failure modes.
-        int sec_rc = ble_gap_security_initiate(event->connect.conn_handle);
-        if (sec_rc != 0 && sec_rc != BLE_HS_EALREADY) {
-            ESP_LOGE(TAG, "security_initiate failed: rc=%d", sec_rc);
+        //
+        // But if encryption already *completed* before CONNECT was dispatched
+        // (NimBLE holds a central's CONNECT until Read Remote Version is done),
+        // no procedure is pending and the call starts a fresh re-encryption.
+        // Its ENC_CHANGE would then be taken for Apple's secondary and run
+        // setup early — inside the window that loses the wake-press.
+        struct ble_gap_conn_desc cdesc;
+        bool already_encrypted =
+            ble_gap_conn_find(event->connect.conn_handle, &cdesc) == 0 && cdesc.sec_state.encrypted;
+        if (!already_encrypted && s_pending_setup_conn != event->connect.conn_handle) {
+            int sec_rc = ble_gap_security_initiate(event->connect.conn_handle);
+            if (sec_rc != 0 && sec_rc != BLE_HS_EALREADY) {
+                ESP_LOGE(TAG, "security_initiate failed: rc=%d", sec_rc);
+            }
         }
         return 0;
 
@@ -1426,6 +1490,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         s_last_disconnect_ms = now_ms();
         s_has_disconnected = true;
         s_setup_done_conn = 0xFFFF;
+        s_setup_dispatched_conn = 0xFFFF;
         s_active_conn = 0xFFFF;
         if (s_pending_setup_conn != 0xFFFF) {
             ble_npl_callout_stop(&s_setup_fallback_co);
@@ -1460,14 +1525,14 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         //     so enter discovery.
         //   - IDLE: shouldn't happen (no active conn), but just stay idle.
         if (s_mode == MODE_DISCOVERING) {
-            start_discovery();
+            start_discovery(false);
         } else if (s_mode == MODE_BONDED_RECONNECT) {
             schedule_bonded_reconnect();
         } else if (s_mode == MODE_CONNECTED) {
             if (s_have_bonded_peer) {
                 schedule_bonded_reconnect();
             } else {
-                start_discovery();
+                start_discovery(true);
             }
         }
         return 0;
@@ -1485,19 +1550,25 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         // conn_handle, stamp s_connect_ms here so the t=Xms delta on this
         // print — and on every probe log that follows — is relative to the
         // earliest observed event of the new connection cycle.
-        if (s_setup_done_conn != event->enc_change.conn_handle &&
+        if (!setup_started(event->enc_change.conn_handle) &&
             s_pending_setup_conn != event->enc_change.conn_handle) {
             s_connect_ms = now_ms();
         }
 #endif
         ESP_LOGI(TAG, "encryption changed, status=%d", event->enc_change.status);
         WAKE_PROBE_LOG("ENC_CHANGE status=%d %s", event->enc_change.status,
-                       s_setup_done_conn == event->enc_change.conn_handle      ? "(post-setup)"
+                       setup_started(event->enc_change.conn_handle)            ? "(post-setup)"
                        : s_pending_setup_conn == event->enc_change.conn_handle ? "(secondary)"
                                                                                : "(initial)");
         if (event->enc_change.status != 0) {
-            if (s_setup_done_conn == event->enc_change.conn_handle) {
+            if (setup_started(event->enc_change.conn_handle)) {
                 return 0;  // failed mid-session re-key; the controller handles the link
+            }
+            if (event->enc_change.status == BLE_HS_ENOTCONN) {
+                // The link dropped mid-procedure (ble_sm_connection_broken
+                // raises this before DISCONNECT). Not a key problem, and there
+                // is nothing left to terminate.
+                return 0;
             }
             // Pre-setup failure: the link can never carry HID (the remote's
             // reports need encryption), so don't wait out the watchdog. Most
@@ -1517,10 +1588,11 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
             }
             return 0;
         }
-        if (s_setup_done_conn == event->enc_change.conn_handle) {
-            // Setup already ran for this connection. Further ENC_CHANGEs are
-            // mid-session re-keys (Apple's accessory framework periodically
-            // refreshes encryption); ignore.
+        if (setup_started(event->enc_change.conn_handle)) {
+            // Setup already dispatched for this connection. Further
+            // ENC_CHANGEs are mid-session re-keys (Apple's accessory framework
+            // periodically refreshes encryption), or a secondary that arrived
+            // after the fallback already ran; ignore.
             return 0;
         }
         uint16_t conn = event->enc_change.conn_handle;
@@ -1566,6 +1638,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         ble_npl_callout_stop(&s_setup_fallback_co);
         uint32_t idle = s_pending_setup_idle_ms;
         s_pending_setup_conn = 0xFFFF;
+        s_setup_dispatched_conn = conn;
         if (s_mode == MODE_DISCOVERING) {
             int rc = peer_disc_all(conn, on_fingerprint_disc_complete, NULL);
             if (rc != 0) {
@@ -1654,6 +1727,10 @@ static void repair_ev_cb(struct ble_npl_event *ev)
     blacklist_clear();
     s_rediscover_fail_streak = 0;
     ble_npl_callout_stop(&s_reconnect_co);
+    // Repair always gets a full window. Stopping it here makes whichever path
+    // starts the scan (directly below, or the cancelled-connect / disconnect
+    // handler) arm it fresh, since start_discovery re-arms an inactive window.
+    ble_npl_callout_stop(&s_discovery_window_co);
 
     if (s_active_conn != 0xFFFF) {
         // Disconnect handler will see s_have_bonded_peer=false and route
@@ -1681,7 +1758,7 @@ static void repair_ev_cb(struct ble_npl_event *ev)
     // Nothing pending (BLE_HS_EALREADY). Stop any scan in progress, then
     // restart the window from scratch.
     (void)ble_gap_disc_cancel();
-    start_discovery();
+    start_discovery(true);
 }
 
 void siri_ble_repair(void)
@@ -1727,6 +1804,9 @@ static void set_slave_latency(uint16_t latency)
              (unsigned long)timeout * 10);
 }
 
+// While the host is resetting, start_discovery / start_bonded_reconnect refuse
+// to issue anything (ble_hs_synced() is false); on_sync re-dispatches from the
+// bond store once the controller is back.
 static void on_reset(int reason)
 {
     ESP_LOGW(TAG, "host reset, reason=%d", reason);
@@ -1769,7 +1849,7 @@ static void on_sync(void)
         start_bonded_reconnect();
     } else {
         s_have_bonded_peer = false;
-        start_discovery();
+        start_discovery(true);
     }
 }
 

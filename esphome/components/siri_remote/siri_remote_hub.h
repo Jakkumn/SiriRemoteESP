@@ -145,6 +145,14 @@ class SiriRemoteHub : public Component {
   std::atomic<uint32_t> ring_head_{0};  // next write; producer-owned
   std::atomic<uint32_t> ring_tail_{0};  // next read; loop-owned
   std::atomic<uint32_t> ring_dropped_{0};
+
+  // Consecutive post-release silence frames the microphone didn't deliver.
+  // 50 frames = 1 s of grace for voice_assistant to start the mic after a
+  // quick Mic tap before the silence is stopped as unused. Counted on the
+  // decode task; zeroed at session start on the NimBLE task, before any frame
+  // of the new session exists (single word, so the cross-task write is safe).
+  static constexpr uint32_t SILENCE_UNHEARD_LIMIT = 50;
+  uint32_t silence_unheard_frames_{0};
   uint16_t prev_buttons_{0};
 
   binary_sensor::BinarySensor *voice_active_sensor_{nullptr};

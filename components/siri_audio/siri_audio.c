@@ -31,6 +31,10 @@ static const char *TAG = "siri_audio";
 // If the decode task is ever this many periods behind on silence, resync to
 // now instead of bursting the backlog out.
 #define SILENCE_MAX_LAG_PERIODS 5
+// Hard cap per siri_audio_silence_start(): 10 s. HA's VAD needs well under 2 s
+// of silence to end a turn; this only bounds a consumer that never stops the
+// stream, so no path can leave CPU1 waking at 50 Hz indefinitely.
+#define SILENCE_MAX_FRAMES (10000 / SILENCE_PERIOD_MS)
 
 // Decode task pinned to CPU1 (Wi-Fi + BLE controller default to CPU0).
 // Priority 5: above idle (0) and the IDF event loop (~3), well below
@@ -124,6 +128,7 @@ static void decode_task(void *arg)
     const TickType_t silence_ticks = pdMS_TO_TICKS(SILENCE_PERIOD_MS);
     bool silence_running = false;
     TickType_t silence_next = 0;
+    uint32_t silence_frames = 0;
 
     while (1) {
         // Block indefinitely unless silence is being generated, in which case
@@ -133,6 +138,9 @@ static void decode_task(void *arg)
         if (s_silence) {
             TickType_t now = xTaskGetTickCount();
             // Signed: now is normally *before* silence_next.
+            if (!silence_running) {
+                silence_frames = 0;
+            }
             if (!silence_running || (int32_t)(now - silence_next) >
                                         (int32_t)(silence_ticks * SILENCE_MAX_LAG_PERIODS)) {
                 silence_running = true;
@@ -147,6 +155,11 @@ static void decode_task(void *arg)
             if (s_silence && s_cfg.on_pcm != NULL) {
                 silence_next += silence_ticks;
                 s_cfg.on_pcm(SILENCE_FRAME, SIRI_AUDIO_FRAME_SAMPLES, s_cfg.user);
+                if (++silence_frames >= SILENCE_MAX_FRAMES) {
+                    ESP_LOGW(TAG, "post-release silence hit its %d s cap; stopping",
+                             SILENCE_MAX_FRAMES * SILENCE_PERIOD_MS / 1000);
+                    s_silence = false;
+                }
             }
             continue;
         }
@@ -262,13 +275,12 @@ void siri_audio_session_end(void)
         return;
     s_session_active = false;
 
-    // Drain any queued packets — past the end of the session, decoded
-    // PCM would arrive late and confuse downstream consumers.
-    if (s_queue != NULL) {
-        audio_packet_t throwaway;
-        while (xQueueReceive(s_queue, &throwaway, 0) == pdTRUE) { /* drop */
-        }
-    }
+    // Packets still queued are not stale: they arrived before the release
+    // report, so they are the end of the utterance. They used to be drained
+    // here, clipping the last word whenever the decoder was behind. The decode
+    // task is the single producer of everything that follows — the remaining
+    // frames, then any post-release silence (queued behind them by its wake
+    // packet) — so nothing reorders.
     ESP_LOGI(TAG, "session end");
     if (s_cfg.on_session_end != NULL) {
         s_cfg.on_session_end(s_cfg.user);

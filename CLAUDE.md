@@ -100,7 +100,10 @@ Three contexts touch shared state; get this wrong and you get rare crashes, not 
   event queue and `siri_ble_repair()` posts an event there, so all BLE state machine
   transitions happen on this one task. Don't add an `esp_timer` or a direct cross-task call
   into `siri_ble` state; add a callout or event. `ble_npl_callout_stop()` does not dequeue
-  an already-fired event, so callbacks must re-check their state.
+  an already-fired event, so callbacks must re-check their state. Never issue a GAP
+  procedure while `!ble_hs_synced()` (mid host reset): it is lost when sync resets the
+  controller but stays "pending" in NimBLE, wedging every later scan/connect.
+  `start_discovery()` / `start_bonded_reconnect()` enforce this; `on_sync` re-dispatches.
 - **ESPHome loop task** (or MQTT handler in standalone) — entity writes, HA event sends.
 - **siri_audio decode task** (CPU1) — `on_pcm` callbacks, for decoded audio and for the
   post-release silence (`siri_audio_silence_start()`), so the ESPHome microphone has a

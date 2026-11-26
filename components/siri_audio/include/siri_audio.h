@@ -66,7 +66,8 @@ typedef struct {
 esp_err_t siri_audio_start(const siri_audio_config_t *cfg);
 
 // Mark the start / end of a Mic-button-driven audio session. Resets
-// decoder state on start; drains the queue on end. Idempotent — calling
+// decoder state on start; packets already queued at end still decode (they
+// are the end of the utterance). Idempotent — calling
 // session_start when one is already active is a no-op.
 void siri_audio_session_start(void);
 void siri_audio_session_end(void);

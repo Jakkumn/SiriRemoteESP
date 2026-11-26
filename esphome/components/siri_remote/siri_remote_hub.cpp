@@ -7,7 +7,12 @@
 #include "esphome/components/api/custom_api_device.h"
 #include "esphome/components/api/api_pb2.h"
 #include "esphome/components/api/api_server.h"
+// voice_assistant is optional: README's no-voice setup drops it from the
+// YAML, and then ESPHome neither generates its sources nor defines
+// USE_VOICE_ASSISTANT. Every use below is guarded the same way.
+#ifdef USE_VOICE_ASSISTANT
 #include "esphome/components/voice_assistant/voice_assistant.h"
+#endif
 #include "esphome/core/application.h"
 #include "esphome/core/automation.h"
 #include "esphome/core/helpers.h"
@@ -59,6 +64,7 @@ static void audio_pcm_thunk(const int16_t *samples, size_t count, void *user) {
   static_cast<SiriRemoteHub *>(user)->on_pcm(samples, count);
 }
 
+#ifdef USE_VOICE_ASSISTANT
 // Action attached to voice_assistant's tts_end_trigger so we can react
 // at TTS_END time without owning a media_player. Forwards to the hub's
 // signal_response_finished(); allocated once at setup and never freed.
@@ -74,6 +80,7 @@ class FinishResponseAction : public Action<std::string> {
  private:
   SiriRemoteHub *hub_;
 };
+#endif  // USE_VOICE_ASSISTANT
 
 void SiriRemoteHub::setup() {
   ESP_LOGI(TAG, "siri_remote setup: voice=%d idle_disconnect_ms=%" PRIu32,
@@ -112,6 +119,7 @@ void SiriRemoteHub::setup() {
   start_tick_timer_();
   start_nimble_();
 
+#ifdef USE_VOICE_ASSISTANT
   if (voice_assistant_ != nullptr && auto_finish_response_) {
     // Bind a one-shot Action onto voice_assistant's tts_end_trigger so we
     // can fan out an AnnounceFinished message ourselves. Without this,
@@ -122,6 +130,7 @@ void SiriRemoteHub::setup() {
         voice_assistant_->get_tts_end_trigger());
     automation->add_actions({new FinishResponseAction(this)});
   }
+#endif
 
   ESP_LOGI(TAG, "siri_remote setup complete");
 }
@@ -151,13 +160,15 @@ void SiriRemoteHub::start_audio_() {
   audio_cfg.user = this;
   esp_err_t rc = siri_audio_start(&audio_cfg);
   if (rc != ESP_OK) {
-    // No decoder + no decode task = no PCM ever, but BLE notify on the
-    // audio CCCD would still happily drive siri_audio_dispatch_packet,
-    // and a Mic press would still kick voice_assistant.start. Disable
-    // voice and mark the component failed so the user sees it.
-    ESP_LOGE(TAG, "siri_audio_start failed: %s", esp_err_to_name(rc));
+    // No decoder + no decode task = no PCM ever. Disable voice (which also
+    // stops a Mic press from starting voice_assistant) and keep the rest of
+    // the bridge running in a deliberate degraded mode. Not mark_failed():
+    // setup() goes on to disable_loop(), which would silently overwrite the
+    // FAILED state anyway, and a genuinely FAILED component is never
+    // re-enabled by enable_loop_soon_any_context, stranding every pulse.
+    ESP_LOGE(TAG, "siri_audio_start failed: %s — voice disabled", esp_err_to_name(rc));
     voice_enabled_ = false;
-    this->mark_failed();
+    this->status_set_error(LOG_STR("Opus decoder unavailable; voice disabled"));
   }
 }
 
@@ -199,16 +210,16 @@ void SiriRemoteHub::start_nimble_() {
 }
 
 void SiriRemoteHub::tick() {
-  const uint32_t now = now_ms();
   LockGuard guard(pulse_lock_);
+  // Read under the lock, so a feed can never land between the timestamp and
+  // the tick and leave last_pulse_ms ahead of `now`.
+  const uint32_t now = now_ms();
   button_pulse_tick(pulse_, now);
   rearm_tick_locked_(now);
 }
 
 void SiriRemoteHub::on_ble_notify(uint16_t attr_handle, const uint8_t *data,
                                   size_t len) {
-  const uint32_t now = now_ms();
-
   switch (attr_handle) {
     case SIRI_HANDLE_BUTTON: {
       uint16_t btns = siri_decode_button_bytes(data, len);
@@ -224,19 +235,22 @@ void SiriRemoteHub::on_ble_notify(uint16_t attr_handle, const uint8_t *data,
           }
         }
         this->defer_publish_(voice_active_sensor_, mic_now);
+#ifdef USE_VOICE_ASSISTANT
         // Direct trigger when the user opted in via voice_assistant_id:
         // skips the binary_sensor → on_press automation hop (~5–15 ms).
         // Still defers because voice_assistant entity APIs are loop-task only.
-        if (mic_now && voice_assistant_ != nullptr) {
+        if (mic_now && voice_enabled_ && voice_assistant_ != nullptr) {
           this->defer([this] {
             voice_assistant_->request_start(/*continuous=*/false,
                                             /*silence_detection=*/true);
           });
         }
+#endif
       }
       prev_buttons_ = btns;
 
       LockGuard guard(pulse_lock_);
+      const uint32_t now = now_ms();  // under the lock; see tick()
       button_pulse_feed_buttons(pulse_, btns, now);
       rearm_tick_locked_(now);
       return;
@@ -297,12 +311,27 @@ void SiriRemoteHub::on_ble_connected(uint32_t idle_ms) {
 
 void SiriRemoteHub::on_ble_disconnected() {
   ESP_LOGI(TAG, "remote disconnected");
+  // No release report will ever arrive for whatever was held when the link
+  // dropped. If that was Mic, close the voice session the release would have
+  // closed (which also starts the post-release silence, so voice_assistant
+  // finishes cleanly) and clear voice_active. Forgetting the bitmap matters
+  // for every button: otherwise a Mic held at reconnect matches the stale
+  // "held" bit, produces no edge, and that voice command is silently lost.
+  // All of this is on the NimBLE host task, like the notify path.
+  if ((prev_buttons_ & SIRI_BTN_MIC) != 0) {
+    if (voice_enabled_) {
+      siri_audio_session_end();
+    }
+    this->defer_publish_(voice_active_sensor_, false);
+  }
+  prev_buttons_ = 0;
   LockGuard guard(pulse_lock_);
   button_pulse_reset(pulse_);
   rearm_tick_locked_(now_ms());  // nothing held any more: stops the tick
 }
 
 void SiriRemoteHub::signal_response_finished() {
+#ifdef USE_VOICE_ASSISTANT
   if (this->voice_assistant_ == nullptr) return;
   api::APIConnection *client = this->voice_assistant_->get_api_connection();
   if (client == nullptr) return;
@@ -311,14 +340,12 @@ void SiriRemoteHub::signal_response_finished() {
   if (!client->send_message(msg)) {
     ESP_LOGW(TAG, "failed to send VoiceAssistantAnnounceFinished");
   }
+#endif
 }
 
 void SiriRemoteHub::on_audio_session_start() {
-  // Real audio is about to flow — stop any post-release silence injection
-  // so we don't mix silence with decoded frames.
-  if (microphone_ != nullptr) {
-    microphone_->stop_silence();
-  }
+  // siri_audio_session_start() has already stopped any post-release silence.
+  silence_unheard_frames_ = 0;
 #ifdef SIRI_REMOTE_DEBUG_PCM_TCP
   siri_audio_pcm_tcp_open(pcm_tcp_host_.c_str(), pcm_tcp_port_);
 #endif
@@ -328,8 +355,9 @@ void SiriRemoteHub::on_audio_session_end() {
   // Apple stops sending audio packets at Mic-release. Without a continuous
   // signal HA's VAD stalls in "Listening" until its 9 s stt-stream-failed
   // timeout. Inject 20 ms-paced silence so VAD detects end-of-speech and
-  // finalizes STT; the mic's own stop() (called by voice_assistant when it
-  // transitions out of STREAMING_MICROPHONE) cancels the timer.
+  // finalizes STT. It ends when the mic stops (voice_assistant leaving
+  // STREAMING_MICROPHONE), when on_pcm sees nobody consuming it, or at
+  // siri_audio's hard cap — whichever comes first.
   if (microphone_ != nullptr) {
     microphone_->start_silence();
   }
@@ -340,7 +368,17 @@ void SiriRemoteHub::on_audio_session_end() {
 
 void SiriRemoteHub::on_pcm(const int16_t *samples, size_t count) {
   if (microphone_ != nullptr) {
-    microphone_->fire_data(samples, count);
+    const bool heard = microphone_->fire_data(samples, count);
+    // Post-release silence that nobody is consuming is pure waste: the mic was
+    // already stopped at release (HA disconnected, voice_assistant busy, or
+    // VAD ended the turn before the user let go), so no later stop() will
+    // come. Give voice_assistant a second to start the mic after a short tap,
+    // then shut it off. Decode task only, like every on_pcm.
+    if (heard || siri_audio_session_active()) {
+      silence_unheard_frames_ = 0;
+    } else if (++silence_unheard_frames_ >= SILENCE_UNHEARD_LIMIT) {
+      siri_audio_silence_stop();  // idempotent flag write
+    }
   }
 #ifdef SIRI_REMOTE_DEBUG_PCM_TCP
   siri_audio_pcm_tcp_send(samples, count);

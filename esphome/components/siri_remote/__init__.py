@@ -12,13 +12,17 @@ from esphome.const import CONF_ID, CONF_PORT
 from esphome.core import CORE
 
 CODEOWNERS = ["@cmehl"]
-DEPENDENCIES = ["esp32"]
+# api: the hub fires the button event through the native API unconditionally.
+DEPENDENCIES = ["esp32", "api"]
 
-# siri_remote_hub.cpp always includes siri_remote_microphone.h (the hub's
-# on_pcm fan-out calls into the mic component). AUTO_LOAD forces the
-# microphone module onto the include path even when the user doesn't add
-# a `microphone:` block. Negligible build cost; no runtime cost.
-AUTO_LOAD = ["microphone"]
+# The hub's headers always include these modules: siri_remote_microphone.h
+# (the on_pcm fan-out) and the binary_sensor / sensor / text_sensor entity
+# types it holds pointers to. AUTO_LOAD puts them on the include path even when
+# the YAML has no `microphone:` or entity platform blocks — without it a
+# minimal `siri_remote:` config fails to compile. Negligible build cost, no
+# runtime cost. voice_assistant is deliberately *not* here: it requires a
+# configured microphone, so the hub guards its uses with USE_VOICE_ASSISTANT.
+AUTO_LOAD = ["microphone", "binary_sensor", "sensor", "text_sensor"]
 
 siri_remote_ns = cg.esphome_ns.namespace("siri_remote")
 SiriRemoteHub = siri_remote_ns.class_("SiriRemoteHub", cg.Component)

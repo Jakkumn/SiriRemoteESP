@@ -36,8 +36,9 @@ class SiriRemoteMicrophone : public microphone::Microphone, public Component {
 
   // Called from the siri_audio decode task (CPU1 prio 5) via
   // SiriRemoteHub::on_pcm, for decoded audio and post-release silence alike.
-  // Skips delivery while stopped or when nothing is listening.
-  void fire_data(const int16_t *samples, size_t count);
+  // Skips delivery while stopped or when nothing is listening; returns whether
+  // the frame was delivered.
+  bool fire_data(const int16_t *samples, size_t count);
 
   // Called by SiriRemoteHub on Apple's audio session boundaries. start
   // begins 20 ms-paced silence injection (generated on the decode task);
