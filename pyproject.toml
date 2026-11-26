@@ -5,10 +5,14 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12,<3.15"
 dependencies = [
-    # Verified against 2026.7.1 and 2026.9.1. 2026.9 began excluding built-in
-    # IDF components by default (`bt`, `esp_coex`), which this component now
-    # requests explicitly — see _pin_sdkconfig()'s neighbours in
-    # esphome/components/siri_remote/__init__.py. Bump the floor only after
-    # compiling against the new version.
+    # Verified against 2026.7.1 and 2026.9.1; the 2026.11 fix below was
+    # compiled against 2026.10.2 and 2026.11.1 only. 2026.9
+    # began excluding built-in IDF components by default (`bt`, `esp_coex`),
+    # which this component now requests explicitly — see _pin_sdkconfig()'s
+    # neighbours in esphome/components/siri_remote/__init__.py. 2026.11 changed
+    # the HA-action message string fields to ProgmemStringRef, which is why the
+    # hub fires events through CustomAPIDevice::fire_homeassistant_event rather
+    # than building the message itself. Bump the floor only after compiling
+    # against the new version.
     "esphome>=2026.7.1",
 ]

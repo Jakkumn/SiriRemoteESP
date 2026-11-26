@@ -4,6 +4,7 @@
 #include <string>
 
 #include "esphome/components/api/api_connection.h"
+#include "esphome/components/api/custom_api_device.h"
 #include "esphome/components/api/api_pb2.h"
 #include "esphome/components/api/api_server.h"
 #include "esphome/components/voice_assistant/voice_assistant.h"
@@ -325,7 +326,9 @@ void SiriRemoteHub::signal_response_finished() {
   if (client == nullptr) return;
   api::VoiceAssistantAnnounceFinished msg;
   msg.success = true;
-  client->send_message(msg);
+  if (!client->send_message(msg)) {
+    ESP_LOGW(TAG, "failed to send VoiceAssistantAnnounceFinished");
+  }
 }
 
 void SiriRemoteHub::on_audio_session_start() {
@@ -374,20 +377,24 @@ void SiriRemoteHub::emit_event(const button_pulse_event_t *evt) {
   const char *btn = siri_button_name(evt->button);
   if (btn == nullptr) return;
 
-  const std::string button(btn);
   const uint32_t repeat = evt->repeat;
   const uint32_t held_ms = evt->held_ms;
 
   // The press is worth seeing at INFO; repeats arrive ~10x/sec and would
   // drown the log, so they sit at DEBUG.
   if (repeat == 0) {
-    ESP_LOGI(TAG, "pulse button=%s press", button.c_str());
+    ESP_LOGI(TAG, "pulse button=%s press", btn);
   } else {
     ESP_LOGD(TAG, "pulse button=%s repeat=%" PRIu32 " held=%" PRIu32 "ms",
-             button.c_str(), repeat, held_ms);
+             btn, repeat, held_ms);
   }
 
-  this->defer([this, button, repeat, held_ms] {
+  // siri_button_name() returns string literals (or NULL, filtered above), so
+  // capturing the pointer is safe even though the deferred item outlives this
+  // call. It also keeps string construction off this task: we run under the
+  // pulse lock on the NimBLE / esp_timer task, and the loop task builds the
+  // payload strings instead.
+  this->defer([this, btn, repeat, held_ms] {
     // Gate on an actually-connected client. Without this, holding a button
     // across an HA restart makes APIServer log a dropped-event warning for
     // every pulse. Note is_connected() means "a client is attached", not
@@ -406,51 +413,29 @@ void SiriRemoteHub::emit_event(const button_pulse_event_t *evt) {
       ESP_LOGI(TAG, "Home Assistant reconnected — resuming button pulses");
     }
 
-    // String storage must outlive the send call: every StringRef inside
-    // resp points back into these locals (the FixedVector entries don't
-    // copy). Captures-by-value in this lambda live until the lambda
-    // returns, after which send_homeassistant_action has already
-    // serialized the message.
-    static const std::string SERVICE = "esphome.siri_remote_button";
-    static const std::string K_DEVICE = "device";
-    static const std::string K_BUTTON = "button";
-    static const std::string K_REPEAT = "repeat";
-    static const std::string K_HELD_MS = "held_ms";
-
     // Must match what HA shows as the device name so a blueprint can filter
     // on device_attr(<device>, 'name'). get_friendly_name() is empty when
     // the user sets only `name:`, and HA falls back to `name` in exactly
     // that case — so mirror the fallback rather than emitting "".
-    const std::string device = App.get_friendly_name().empty()
-                                 ? App.get_name().str()
-                                 : App.get_friendly_name().str();
-    const std::string repeat_str = std::to_string(repeat);
-    const std::string held_str = std::to_string(held_ms);
+    const StringRef &device = App.get_friendly_name().empty()
+                                  ? App.get_name()
+                                  : App.get_friendly_name();
 
-    api::HomeassistantActionRequest resp;
-    resp.service = StringRef(SERVICE);
-    resp.is_event = true;
-    resp.data.init(4);
-
-    auto &kv0 = resp.data.emplace_back();
-    kv0.key = StringRef(K_DEVICE);
-    kv0.value = StringRef(device);
-
-    auto &kv1 = resp.data.emplace_back();
-    kv1.key = StringRef(K_BUTTON);
-    kv1.value = StringRef(button);
-
+    // ESPHome's own helper rather than a hand-built HomeassistantActionRequest:
+    // the message's string field types changed in 2026.11 (StringRef ->
+    // ProgmemStringRef), and upstream migrates this helper with them.
+    // CustomAPIDevice is stateless, so a temporary is fine.
+    //
     // Every value crosses the API as a string — HA compares event_data with
     // == and will not coerce, so automations must use `| int`.
-    auto &kv2 = resp.data.emplace_back();
-    kv2.key = StringRef(K_REPEAT);
-    kv2.value = StringRef(repeat_str);
-
-    auto &kv3 = resp.data.emplace_back();
-    kv3.key = StringRef(K_HELD_MS);
-    kv3.value = StringRef(held_str);
-
-    api::global_api_server->send_homeassistant_action(resp);
+    api::CustomAPIDevice().fire_homeassistant_event(
+        "esphome.siri_remote_button",
+        {
+            {"device", device.str()},
+            {"button", btn},
+            {"repeat", std::to_string(repeat)},
+            {"held_ms", std::to_string(held_ms)},
+        });
   });
 }
 
