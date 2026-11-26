@@ -223,6 +223,20 @@ There is no on-device test harness; anything touching `siri_ble.c` or `siri_audi
 - Comments in this codebase record *why* (empirical findings, Apple firmware behaviour,
   rejected alternatives). Keep that density; don't strip them as noise.
 
+## Releasing
+
+1. Bump `COMPONENT_VERSION` in `esphome/components/siri_remote/__init__.py` to the tag
+   about to be cut (without the `v`; `-rc.N` included). The device logs it at boot and in
+   `dump_config` as `Version: <release> (<commit>)` — it is how you confirm Builder
+   actually picked up the new build, so a stale value defeats the point.
+2. Commit, then `git tag -a vX.Y.Z[-rc.N]` on that commit and push the branch and tag.
+3. Final releases only: point `builder.yaml`'s `ref:` and the README install snippet at
+   the new tag.
+
+When testing a branch rather than a tag from the Builder add-on, add `refresh: always` to
+the `external_components` entry: the git cache is keyed by URL + ref, so a branch ref is
+only re-fetched once a day by default. A new tag is a new cache key and always fetches.
+
 ## Attribution
 
 The protocol knowledge is ported, not originated. The README's Acknowledgments section

@@ -83,8 +83,8 @@ class FinishResponseAction : public Action<std::string> {
 #endif  // USE_VOICE_ASSISTANT
 
 void SiriRemoteHub::setup() {
-  ESP_LOGI(TAG, "siri_remote setup: voice=%d idle_disconnect_ms=%" PRIu32,
-           (int) voice_enabled_, idle_disconnect_ms_);
+  ESP_LOGI(TAG, "siri_remote %s setup: voice=%d idle_disconnect_ms=%" PRIu32,
+           version_, (int) voice_enabled_, idle_disconnect_ms_);
 
   // ESPHome may have already initialized NVS via Preferences.
   // nvs_flash_init is idempotent on success; we still handle the rare
@@ -137,6 +137,7 @@ void SiriRemoteHub::setup() {
 
 void SiriRemoteHub::dump_config() {
   ESP_LOGCONFIG(TAG, "Siri Remote Hub:");
+  ESP_LOGCONFIG(TAG, "  Version: %s", version_);
   ESP_LOGCONFIG(TAG, "  Voice enabled: %s", YESNO(voice_enabled_));
   ESP_LOGCONFIG(TAG, "  Idle-disconnect: %" PRIu32 " ms (0 = always-connected)",
                 idle_disconnect_ms_);

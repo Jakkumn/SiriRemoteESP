@@ -5,11 +5,48 @@ Shares the C components (siri_ble, siri_audio, report_decoder, button_pulse)
 with the standalone idf.py build at <repo>/components/ via in-tree
 symlinks; both build paths consume the same source files."""
 
+import logging
+import subprocess
+from pathlib import Path
+
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.components import esp32, voice_assistant
 from esphome.const import CONF_ID, CONF_PORT
 from esphome.core import CORE
+
+_LOGGER = logging.getLogger(__name__)
+
+# Release version, logged at boot and in dump_config so the device itself says
+# which build is running. Bump it in the same commit as every release tag
+# (including -rc tags); CLAUDE.md's release steps list it. The git commit is
+# appended at codegen time because it is always available, whereas the tag
+# usually is not: ESPHome's git source is a shallow fetch of the ref, so
+# `git describe --tags` can't see it.
+COMPONENT_VERSION = "0.1.2-rc.9"
+
+
+def _git_revision() -> str | None:
+    """Short commit of the checkout this component was loaded from, with
+    `-dirty` for uncommitted tracked changes (local development). None when it
+    isn't a git checkout or git is unavailable; the version alone is then
+    logged."""
+    here = Path(__file__).resolve().parent
+    try:
+        rev = subprocess.run(
+            ["git", "-C", str(here), "rev-parse", "--short=7", "HEAD"],
+            capture_output=True, text=True, timeout=5, check=True,
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "-C", str(here), "status", "--porcelain", "--untracked-files=no"],
+            capture_output=True, text=True, timeout=5, check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError) as err:
+        _LOGGER.debug("siri_remote: no git revision (%s)", err)
+        return None
+    if not rev:
+        return None
+    return f"{rev}-dirty" if dirty else rev
 
 CODEOWNERS = ["@cmehl"]
 # api: the hub fires the button event through the native API unconditionally.
@@ -236,6 +273,9 @@ async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
 
+    rev = _git_revision()
+    version = f"{COMPONENT_VERSION} ({rev})" if rev else COMPONENT_VERSION
+    cg.add(var.set_version(version))
     cg.add(var.set_voice_enabled(config[CONF_VOICE_ENABLED]))
     cg.add(var.set_idle_disconnect_ms(config[CONF_IDLE_DISCONNECT_MS]))
     cg.add(var.set_pairing_flush_suppress_ms(

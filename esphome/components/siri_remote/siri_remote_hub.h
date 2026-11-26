@@ -39,6 +39,9 @@ class SiriRemoteHub : public Component {
   // wifi/api/preferences setup.
   float get_setup_priority() const override { return setup_priority::LATE; }
 
+  // Codegen passes a string literal (static storage), so keeping the pointer
+  // is safe. "<release> (<commit>)", e.g. "0.1.2-rc.9 (5161f72)".
+  void set_version(const char *v) { version_ = v; }
   void set_voice_enabled(bool v) { voice_enabled_ = v; }
   void set_idle_disconnect_ms(uint32_t ms) { idle_disconnect_ms_ = ms; }
   void set_pairing_flush_suppress_ms(uint32_t ms) { pairing_flush_suppress_ms_ = ms; }
@@ -113,6 +116,7 @@ class SiriRemoteHub : public Component {
   }
 
   // Config (YAML).
+  const char *version_{"unknown"};
   bool voice_enabled_{true};
   uint32_t idle_disconnect_ms_{0};
   uint32_t pairing_flush_suppress_ms_{1500};
