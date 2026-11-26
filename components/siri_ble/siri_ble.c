@@ -442,17 +442,8 @@ static void reconnect_cb(struct ble_npl_event *ev)
 static void try_connect_candidate(const struct ble_gap_disc_desc *disc,
                                   const struct ble_hs_adv_fields *fields)
 {
-    if (s_pending_candidate_set) {
-        // Already mid-connect to a candidate; ignore concurrent advs.
-        return;
-    }
-    if (disc->rssi < DISCOVERY_RSSI_MIN) {
-        ESP_LOGD(TAG, "rejecting candidate: rssi=%d < %d", disc->rssi, DISCOVERY_RSSI_MIN);
-        return;
-    }
-    if (blacklist_contains(disc->addr.val)) {
-        return;  // already-rejected device, silently ignore
-    }
+    // Pending / RSSI / blacklist gates run in gap_event_cb, before the
+    // advertisement is parsed.
     if (!adv_advertises_hid(fields)) {
         return;  // not an HID advertiser, silently ignore
     }
@@ -1341,6 +1332,18 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
             //     straight to ADV_IND).
             //   ADV_SCAN_IND / ADV_NONCONN_IND / scan responses — skip.
             return 0;
+        }
+        // Cheap gates before parsing: with duplicate filtering off, every
+        // nearby advertiser reports many times a second, and nearly all of
+        // them fail one of these. Parsing walks the whole payload.
+        if (s_pending_candidate_set) {
+            return 0;  // already mid-connect to a candidate
+        }
+        if (event->disc.rssi < DISCOVERY_RSSI_MIN) {
+            return 0;  // too far away to be the remote the user is holding
+        }
+        if (blacklist_contains(event->disc.addr.val)) {
+            return 0;  // already-rejected device
         }
         struct ble_hs_adv_fields fields;
         if (ble_hs_adv_parse_fields(&fields, event->disc.data, event->disc.length_data) != 0) {

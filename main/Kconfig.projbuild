@@ -137,9 +137,11 @@ menu "Siri Bridge Configuration"
             — that judgment belongs in HA, which has the per-automation and
             per-context knowledge firmware does not.
 
-            Bounded below by the 50 ms tick period; values between 1 and 49
-            simply emit once per tick. Set to 0 to disable repeats entirely,
-            leaving only the initial press (repeat 0).
+            Honoured exactly: the tick timer is armed for each due repeat
+            rather than running on a fixed period. Values much below ~50 ms
+            just flood the MQTT broker and HA with events. Set to 0 to
+            disable repeats entirely, leaving only the initial press
+            (repeat 0).
 
     config BLE_SLAVE_LATENCY_DEFAULT
         int "BLE slave-latency default"

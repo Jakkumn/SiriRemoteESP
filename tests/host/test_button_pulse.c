@@ -339,6 +339,73 @@ static void test_null_emit_callback(void)
     button_pulse_destroy(bp);
 }
 
+static void test_next_due_idle_and_disabled(void)
+{
+    button_pulse_t *bp = make_bp(100);
+    assert(button_pulse_next_due_ms(bp, 0) == BUTTON_PULSE_NONE_DUE);
+
+    // Mic alone never repeats, so nothing needs scheduling.
+    button_pulse_feed_buttons(bp, SIRI_BTN_MIC, 0);
+    assert(button_pulse_next_due_ms(bp, 10) == BUTTON_PULSE_NONE_DUE);
+
+    // Released: back to nothing due.
+    button_pulse_feed_buttons(bp, SIRI_BTN_VOL_UP, 20);
+    button_pulse_feed_buttons(bp, 0, 30);
+    assert(button_pulse_next_due_ms(bp, 40) == BUTTON_PULSE_NONE_DUE);
+    button_pulse_destroy(bp);
+
+    bp = make_bp(0);  // repeats disabled
+    button_pulse_feed_buttons(bp, SIRI_BTN_VOL_UP, 0);
+    assert(button_pulse_next_due_ms(bp, 0) == BUTTON_PULSE_NONE_DUE);
+    button_pulse_destroy(bp);
+
+    assert(button_pulse_next_due_ms(NULL, 0) == BUTTON_PULSE_NONE_DUE);
+}
+
+static void test_next_due_counts_down_and_takes_min(void)
+{
+    button_pulse_t *bp = make_bp(100);
+    button_pulse_feed_buttons(bp, SIRI_BTN_VOL_UP, 0);
+    assert(button_pulse_next_due_ms(bp, 0) == 100);
+    assert(button_pulse_next_due_ms(bp, 30) == 70);
+    assert(button_pulse_next_due_ms(bp, 100) == 0);
+    assert(button_pulse_next_due_ms(bp, 250) == 0);  // overdue clamps to 0
+
+    // A second button pressed later: the earlier one is still due first.
+    button_pulse_feed_buttons(bp, SIRI_BTN_VOL_UP | SIRI_BTN_RIGHT, 60);
+    assert(button_pulse_next_due_ms(bp, 60) == 40);
+    button_pulse_tick(bp, 100);  // VOL_UP repeats; RIGHT not yet due
+    assert(button_pulse_next_due_ms(bp, 100) == 60);
+
+    // Wrap-safe across the uint32 millisecond rollover.
+    button_pulse_reset(bp);
+    button_pulse_feed_buttons(bp, SIRI_BTN_LEFT, UINT32_MAX - 20);
+    assert(button_pulse_next_due_ms(bp, 10) == 69);
+    button_pulse_destroy(bp);
+}
+
+// Drive the emitter the way both firmwares now do: arm a one-shot for exactly
+// next_due_ms() and tick when it fires. Repeats must land on the interval
+// exactly, which a fixed 50 ms tick could not do for 75 ms.
+static void test_scheduled_ticks_hit_interval_exactly(void)
+{
+    button_pulse_t *bp = make_bp(75);
+    button_pulse_feed_buttons(bp, SIRI_BTN_VOL_DOWN, 1000);
+    uint32_t now = 1000;
+    for (int i = 0; i < 6; i++) {
+        uint32_t due = button_pulse_next_due_ms(bp, now);
+        assert(due == 75);
+        now += due;
+        button_pulse_tick(bp, now);
+    }
+    assert(captured_count == 7);  // press + 6 repeats
+    for (size_t i = 1; i < captured_count; i++) {
+        assert(captured[i].repeat == i);
+        assert(captured[i].held_ms == 75 * i);
+    }
+    button_pulse_destroy(bp);
+}
+
 int main(void)
 {
     test_press_emits_once();
@@ -357,6 +424,9 @@ int main(void)
     test_unchanged_bitmap_is_noop();
     test_null_safe();
     test_null_emit_callback();
+    test_next_due_idle_and_disabled();
+    test_next_due_counts_down_and_takes_min();
+    test_scheduled_ticks_hit_interval_exactly();
     printf("test_button_pulse: ok\n");
     return 0;
 }

@@ -28,9 +28,10 @@ extern "C" {
 // pair, because feeds arrive on the NimBLE host task and ticks on a timer task.
 
 typedef struct {
-    // How often a held button re-emits. A rate, not a policy. Bounded below by
-    // the caller's tick period (50 ms in both build paths) — a shorter interval
-    // cannot be honoured and simply emits once per tick.
+    // How often a held button re-emits. A rate, not a policy. Both build paths
+    // schedule their tick from button_pulse_next_due_ms(), so any interval is
+    // honoured to within timer latency; a caller ticking on a fixed period
+    // instead is bounded below by that period.
     //
     // 0 disables repeats entirely: the press still emits with repeat == 0, but
     // nothing follows it. Matches the "0 disables this feature" convention the
@@ -57,9 +58,20 @@ void button_pulse_destroy(button_pulse_t *bp);
 // immediately with repeat == 0; newly-released bits go quiet with no event.
 void button_pulse_feed_buttons(button_pulse_t *bp, uint16_t buttons, uint32_t now_ms);
 
-// Drive the repeat stream. Must be called periodically — repeats exist only
-// because of this, since the remote sends HID reports on change, not while held.
+// Drive the repeat stream — repeats exist only because of this, since the
+// remote sends HID reports on change, not while held. Call it when
+// button_pulse_next_due_ms() says a pulse is due (or periodically).
 void button_pulse_tick(button_pulse_t *bp, uint32_t now_ms);
+
+#define BUTTON_PULSE_NONE_DUE UINT32_MAX
+
+// Milliseconds from `now_ms` until the next repeat is due: 0 if one is already
+// due, BUTTON_PULSE_NONE_DUE if nothing will repeat (no button held, only Mic
+// held, or repeats disabled). Lets the caller arm a one-shot timer for exactly
+// that moment after every feed/tick instead of ticking periodically — exact
+// cadence while a button is held, no wakeups at all while none is. Same
+// locking rule as feed/tick.
+uint32_t button_pulse_next_due_ms(const button_pulse_t *bp, uint32_t now_ms);
 
 // Drop all held state without emitting. Called on BLE disconnect: the pulses
 // simply stop, which is already how release is signalled.

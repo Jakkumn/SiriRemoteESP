@@ -40,9 +40,11 @@ locking discipline). When changing one, check whether the other needs the same c
 - `components/button_pulse/` — pure C, no ESP-IDF. IR-style pulse emitter. While a button
   is held it re-emits `{button, repeat, held_ms}` every `repeat_interval_ms`; **there is no
   release event** — release is inferred downstream from the pulses stopping, exactly as an
-  IR receiver infers it from repeat frames ending. Requires a periodic `button_pulse_tick()`
-  (both paths drive it from an `esp_timer`), because the remote sends HID reports on change,
-  not while held.
+  IR receiver infers it from repeat frames ending. Requires `button_pulse_tick()` calls,
+  because the remote sends HID reports on change, not while held. Both paths drive it from
+  a **one-shot** `esp_timer` re-armed after every feed/tick for `button_pulse_next_due_ms()`
+  — exact repeat cadence, and no wakeups at all while nothing is held. Don't go back to a
+  periodic tick: it quantised repeats to the tick period.
 
   **Nothing here classifies input.** `repeat` and `held_ms` are measurements; every judgment
   built from them ("is 220 ms a click or a hold?") lives in Home Assistant, which has the
@@ -100,7 +102,9 @@ Three contexts touch shared state; get this wrong and you get rare crashes, not 
   into `siri_ble` state; add a callout or event. `ble_npl_callout_stop()` does not dequeue
   an already-fired event, so callbacks must re-check their state.
 - **ESPHome loop task** (or MQTT handler in standalone) — entity writes, HA event sends.
-- **siri_audio decode task** (CPU1) — `on_pcm` callbacks.
+- **siri_audio decode task** (CPU1) — `on_pcm` callbacks, for decoded audio and for the
+  post-release silence (`siri_audio_silence_start()`), so the ESPHome microphone has a
+  single producer.
 
 Rules in force: `button_pulse` has no internal lock — callers hold `pulse_lock_` (ESPHome) or
 `s_pulse_lock` (standalone) around every feed/tick. Entity publishes from the BLE task go
@@ -111,13 +115,16 @@ through `defer_publish_()` / `this->defer()`, never direct. Cross-task scalar fl
 100 ms repeat interval it runs ~10x/sec on the high-priority `esp_timer` task. Standalone
 stages into `s_pulse_stage[]` and `flush_pulses()` queues the batch after releasing the
 lock — otherwise `esp_mqtt_client_publish` (which takes the MQTT client mutex and can block
-on the outbox) would be called with our lock held, against the NimBLE notify path.
+on the outbox) would be called with our lock held, against the NimBLE notify path. ESPHome
+writes the pulse into `pulse_ring_` (a lock-free SPSC ring) and calls
+`enable_loop_soon_any_context()`; `loop()` drains and publishes it, then `disable_loop()`s.
+Not `defer()` per pulse: that heap-allocates and takes the scheduler lock under ours.
 
 Standalone never calls `esp_mqtt_client_publish` from the NimBLE host or `esp_timer` tasks
 at all: it sends synchronously and can block for the ~10 s network timeout. Runtime
 publishes go through `mqtt_publish()`, which copies into `s_pub_queue` without blocking, and
 `publisher_task` does the send. Only the MQTT event handler, already on the MQTT task, uses
-`mqtt_publish_now()` directly. ESPHome defers
+`mqtt_publish_now()` directly. ESPHome hands pulses
 to the loop task for the same reason, and additionally gates on
 `api::global_api_server->is_connected()` so a held button across an HA restart doesn't make
 `APIServer` log a dropped-event warning per pulse.

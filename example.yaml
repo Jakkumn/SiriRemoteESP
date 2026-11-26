@@ -46,8 +46,8 @@ ota:
 
 siri_remote:
   # How often a held button re-emits. A rate, not a policy: each pulse carries
-  # `repeat` and `held_ms`, and HA decides what a click or a hold is. Floored
-  # at the 50 ms tick period; 0 disables repeats (press-only).
+  # `repeat` and `held_ms`, and HA decides what a click or a hold is. Min 50 ms
+  # (20 events/s per held button); 0 disables repeats (press-only).
   # repeat_interval_ms: 100
   # Was a runtime slider; now compile-time. Load-bearing for always-connected
   # wake behaviour — read the README before changing it.

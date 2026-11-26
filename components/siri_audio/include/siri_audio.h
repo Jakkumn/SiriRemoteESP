@@ -44,7 +44,8 @@ extern "C" {
 // PCM frame callback. `samples` is a buffer of `count` 16-bit signed PCM
 // samples (mono, 16 kHz). Buffer is reused on the next decoded frame —
 // copy if the consumer needs to retain. Called from the decode task
-// (priority 5 on CPU1), not the BLE host task. Consumer is responsible
+// (priority 5 on CPU1), not the BLE host task — for decoded audio and for
+// post-session silence alike. Consumer is responsible
 // for any synchronization needed to deliver downstream.
 typedef void (*siri_audio_pcm_cb_t)(const int16_t *samples, size_t count, void *user);
 
@@ -78,6 +79,16 @@ void siri_audio_session_end(void);
 //
 // Safe to call from the BLE host task (NimBLE notify dispatch).
 void siri_audio_dispatch_packet(const uint8_t *data, size_t len);
+
+// Post-session silence. While on, the decode task emits an all-zero frame
+// through on_pcm every 20 ms, so a consumer whose voice-activity detection
+// needs a continuous stream (ESPHome voice_assistant -> HA) sees the utterance
+// end instead of stalling when Apple stops sending packets at Mic release.
+// Frames come from the decode task, the same producer as real audio, so the
+// consumer never sees two writers. Starting a session stops it. Safe from any
+// task; standalone never uses it.
+void siri_audio_silence_start(void);
+void siri_audio_silence_stop(void);
 
 // True iff a session is currently active (between start/end).
 bool siri_audio_session_active(void);

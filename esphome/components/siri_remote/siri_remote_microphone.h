@@ -4,10 +4,10 @@
 #include <cstdint>
 #include <vector>
 
-#include "esp_timer.h"
-
 #include "esphome/components/microphone/microphone.h"
 #include "esphome/core/component.h"
+
+#include "siri_audio.h"
 
 namespace esphome {
 namespace siri_remote {
@@ -17,21 +17,13 @@ namespace siri_remote {
 //
 // Apple only streams audio packets while the Mic button is held. After
 // release, voice_assistant's ring buffer would go empty and HA's VAD
-// would stall waiting for input — so we inject silence frames at the
-// same 50 Hz cadence (one per 20 ms) for the post-release window. That
+// would stall waiting for input — so siri_audio's decode task injects
+// silence frames at the same 50 Hz cadence (one per 20 ms) for the
+// post-release window, delivered through fire_data like real audio. That
 // makes us look like a continuous-stream microphone to HA's VAD, which
 // can then finalize STT naturally on detected silence.
 class SiriRemoteMicrophone : public microphone::Microphone, public Component {
  public:
-  // Base classes (microphone::Microphone, Component) lack virtual destructors,
-  // so don't mark this override — but we still need it to free the
-  // periodic-silence timer if the component is ever torn down.
-  ~SiriRemoteMicrophone() {
-    if (this->silence_timer_ != nullptr) {
-      esp_timer_stop(this->silence_timer_);
-      esp_timer_delete(this->silence_timer_);
-    }
-  }
   void setup() override;
   void dump_config() override;
   float get_setup_priority() const override { return setup_priority::DATA; }
@@ -43,26 +35,22 @@ class SiriRemoteMicrophone : public microphone::Microphone, public Component {
   }
 
   // Called from the siri_audio decode task (CPU1 prio 5) via
-  // SiriRemoteHub::on_pcm. Skips delivery while stopped. The data_callback
-  // contract takes a std::vector<uint8_t>; voice_assistant copies out of it
-  // before returning, so one reused member buffer serves every frame.
+  // SiriRemoteHub::on_pcm, for decoded audio and post-release silence alike.
+  // Skips delivery while stopped. The data_callback contract takes a
+  // std::vector<uint8_t>; voice_assistant copies out of it before returning,
+  // so one reused member buffer serves every frame.
   void fire_data(const int16_t *samples, size_t count);
 
   // Called by SiriRemoteHub on Apple's audio session boundaries. start
-  // begins 20 ms-paced silence injection; the next on_pcm path stops
-  // it via stop_silence() to avoid mixing real audio with zeros.
-  void start_silence();
-  void stop_silence();
+  // begins 20 ms-paced silence injection (generated on the decode task);
+  // a new session or stop() ends it.
+  void start_silence() { siri_audio_silence_start(); }
+  void stop_silence() { siri_audio_silence_stop(); }
 
  protected:
-  static void silence_thunk(void *arg);
-
-  esp_timer_handle_t silence_timer_{nullptr};
-  // Decode-task-only frame buffer. Reused so the ~50 frames/s of a voice
-  // session don't each malloc/free 640 B of internal RAM. Silence has its own
-  // (static) buffer because it is delivered from the esp_timer task, and
-  // esp_timer_stop() does not wait for an in-flight callback — the two
-  // producers can overlap around session start/end.
+  // Frame buffer, touched only by the decode task — the single producer of
+  // both real and silent frames. Reused so the ~50 frames/s of a voice
+  // session don't each malloc/free 640 B of internal RAM.
   std::vector<uint8_t> pcm_buf_;
 };
 

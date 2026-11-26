@@ -62,9 +62,10 @@ CONFIG_SCHEMA = cv.All(
         cv.Optional(CONF_IDLE_DISCONNECT_MS, default=0): cv.uint32_t,
         cv.Optional(CONF_PAIRING_FLUSH_SUPPRESS_MS, default=1500): cv.uint32_t,
         # How often a held button re-emits. A rate, not a policy — HA decides
-        # what a hold means from the `held_ms` each pulse carries. Floored at
-        # the 50 ms tick period, since a shorter interval cannot be honoured.
-        # 0 disables repeats entirely (press-only).
+        # what a hold means from the `held_ms` each pulse carries. Honoured
+        # exactly (the tick is armed per due repeat, not periodic); floored at
+        # 50 ms anyway, since 20 events/s per held button is already as much
+        # as the HA API should carry. 0 disables repeats entirely (press-only).
         cv.Optional(CONF_REPEAT_INTERVAL_MS, default=100): cv.Any(
             cv.int_range(min=0, max=0), cv.int_range(min=50, max=60000)
         ),

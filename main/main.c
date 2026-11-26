@@ -32,8 +32,6 @@
 
 static const char *TAG = "main";
 
-#define TICK_PERIOD_MS 50
-
 // MQTT topic constants. Switch / Number / Button entities use the
 // mqtt_entity helper, which generates topics from each entity's
 // unique_id — so they don't appear here.
@@ -94,6 +92,19 @@ static size_t s_pulse_staged;
 static uint32_t now_ms(void)
 {
     return (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+// Arm the one-shot tick for exactly when button_pulse next has a repeat due,
+// or leave it stopped if nothing is held. Caller holds s_pulse_lock. now is
+// truncated to the millisecond, so firing `due` ms after it lands at or after
+// the due instant — never a hair early, which would skip a whole interval.
+static void rearm_tick_locked(uint32_t now)
+{
+    (void)esp_timer_stop(s_tick_timer);  // ESP_ERR_INVALID_STATE if idle: fine
+    uint32_t due = button_pulse_next_due_ms(s_bp, now);
+    if (due != BUTTON_PULSE_NONE_DUE) {
+        (void)esp_timer_start_once(s_tick_timer, (uint64_t)due * 1000);
+    }
 }
 
 // --- MQTT publish helpers ---
@@ -375,8 +386,10 @@ static void on_notify_cb(uint16_t attr_handle, const uint8_t *data, size_t len, 
         s_prev_btns = btns;
 #endif
 
+        uint32_t now = now_ms();
         xSemaphoreTake(s_pulse_lock, portMAX_DELAY);
-        button_pulse_feed_buttons(s_bp, btns, now_ms());
+        button_pulse_feed_buttons(s_bp, btns, now);
+        rearm_tick_locked(now);
         xSemaphoreGive(s_pulse_lock);
         flush_pulses();
 #ifdef CONFIG_VOICE_ENABLED
@@ -429,7 +442,8 @@ static void on_disconnected_cb(void *user)
     publish_remote_status(false);
     xSemaphoreTake(s_pulse_lock, portMAX_DELAY);
     button_pulse_reset(s_bp);
-    s_pulse_staged = 0;  // drop anything staged but not yet published
+    rearm_tick_locked(now_ms());  // nothing held any more: stops the tick
+    s_pulse_staged = 0;           // drop anything staged but not yet published
     xSemaphoreGive(s_pulse_lock);
 }
 
@@ -441,10 +455,14 @@ static void repair_button_pressed(int32_t value, void *user)
     siri_ble_repair();
 }
 
-// --- FreeRTOS tick for button_pulse ---
+// --- Tick for button_pulse ---
 //
 // Repeats exist only because of this timer: the remote sends HID reports on
-// change, not while a button is held.
+// change, not while a button is held. It is a one-shot re-armed for the next
+// due repeat (rearm_tick_locked), so it fires exactly on the repeat interval
+// while a button is held and not at all otherwise. It used to be a 50 ms
+// periodic, which quantised repeats to the tick (75 ms became 100, 100 ms
+// occasionally 150) and woke the CPU 20x/s with nothing held.
 
 static void tick_timer_cb(void *arg)
 {
@@ -452,6 +470,7 @@ static void tick_timer_cb(void *arg)
     uint32_t now = now_ms();
     xSemaphoreTake(s_pulse_lock, portMAX_DELAY);
     button_pulse_tick(s_bp, now);
+    rearm_tick_locked(now);
     xSemaphoreGive(s_pulse_lock);
     flush_pulses();
 }
@@ -638,8 +657,7 @@ void app_main(void)
         .callback = tick_timer_cb,
         .name = "button_pulse_tick",
     };
-    ESP_ERROR_CHECK(esp_timer_create(&ta, &s_tick_timer));
-    ESP_ERROR_CHECK(esp_timer_start_periodic(s_tick_timer, TICK_PERIOD_MS * 1000));
+    ESP_ERROR_CHECK(esp_timer_create(&ta, &s_tick_timer));  // armed on demand
 
     wifi_start();
     mqtt_start();

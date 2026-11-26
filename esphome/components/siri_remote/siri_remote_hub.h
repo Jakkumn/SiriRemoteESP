@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 
@@ -30,7 +31,8 @@ class SiriRemoteMicrophone;
 class SiriRemoteHub : public Component {
  public:
   void setup() override;
-  void loop() override {}
+  // Publishes staged button pulses; disabled whenever the ring is empty.
+  void loop() override;
   void dump_config() override;
   // siri_ble + Wi-Fi + Preferences must be ready before NimBLE host
   // bring-up; setup priority LATE puts us after the framework's
@@ -73,6 +75,8 @@ class SiriRemoteHub : public Component {
   void on_ble_connected(uint32_t idle_ms);
   void on_ble_disconnected();
 
+  // Runs under pulse_lock_ on the NimBLE host or esp_timer task: stages the
+  // pulse into pulse_ring_ and wakes loop(). Never allocates or publishes.
   void emit_event(const button_pulse_event_t *evt);
 
   // Public so the esp_timer C trampoline can invoke it without a friend
@@ -94,6 +98,9 @@ class SiriRemoteHub : public Component {
   void start_nimble_();
   void start_audio_();
   void start_tick_timer_();
+  // Arms the one-shot tick for the next due repeat; caller holds pulse_lock_.
+  void rearm_tick_locked_(uint32_t now);
+  void publish_pulse_(siri_button_bit_t button, uint32_t repeat, uint32_t held_ms);
 
   // Schedule entity->publish_state(value) on the ESPHome loop. Safe to
   // call from the BLE host task (which is where most call sites live).
@@ -119,6 +126,25 @@ class SiriRemoteHub : public Component {
   button_pulse_t *pulse_{nullptr};
   Mutex pulse_lock_;
   esp_timer_handle_t tick_timer_{nullptr};
+
+  // Pulses travel from emit_event to loop() through this single-producer /
+  // single-consumer ring instead of one defer() per pulse: a defer heap-
+  // allocates its std::function (the capture is past the 8-byte inline
+  // buffer) and takes the scheduler lock, both while we hold pulse_lock_, ~10
+  // times a second per held button. Producers are serialised by pulse_lock_;
+  // the loop task is the only consumer. Indices only ever increase and are
+  // masked on access. 32 slots is several seconds of every button held at a
+  // 100 ms repeat — the loop drains it every iteration.
+  struct StagedPulse {
+    siri_button_bit_t button;
+    uint32_t repeat;
+    uint32_t held_ms;
+  };
+  static constexpr uint32_t PULSE_RING_SIZE = 32;  // power of two
+  StagedPulse pulse_ring_[PULSE_RING_SIZE]{};
+  std::atomic<uint32_t> ring_head_{0};  // next write; producer-owned
+  std::atomic<uint32_t> ring_tail_{0};  // next read; loop-owned
+  std::atomic<uint32_t> ring_dropped_{0};
   uint16_t prev_buttons_{0};
 
   binary_sensor::BinarySensor *voice_active_sensor_{nullptr};

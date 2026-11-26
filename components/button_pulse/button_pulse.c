@@ -157,6 +157,29 @@ void button_pulse_tick(button_pulse_t *bp, uint32_t now_ms)
     }
 }
 
+uint32_t button_pulse_next_due_ms(const button_pulse_t *bp, uint32_t now_ms)
+{
+    if (bp == NULL || bp->cfg.repeat_interval_ms == 0) {
+        return BUTTON_PULSE_NONE_DUE;
+    }
+    uint32_t best = BUTTON_PULSE_NONE_DUE;
+    for (int idx = 0; idx < NUM_BUTTONS; idx++) {
+        const per_button_t *b = &bp->buttons[idx];
+        // Mic never repeats (see button_pulse_tick), so it never needs a tick.
+        if (!b->held || INDEX_TO_BIT[idx] == SIRI_BTN_MIC) {
+            continue;
+        }
+        // Wrap-safe for the same reason as the tick's comparison.
+        uint32_t elapsed = (uint32_t)(now_ms - b->last_pulse_ms);
+        uint32_t remaining =
+            elapsed >= bp->cfg.repeat_interval_ms ? 0 : bp->cfg.repeat_interval_ms - elapsed;
+        if (remaining < best) {
+            best = remaining;
+        }
+    }
+    return best;
+}
+
 void button_pulse_reset(button_pulse_t *bp)
 {
     if (bp == NULL) {

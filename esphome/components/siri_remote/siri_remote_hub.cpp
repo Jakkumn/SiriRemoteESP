@@ -28,8 +28,6 @@ namespace siri_remote {
 
 static const char *const TAG = "siri_remote";
 
-static constexpr uint32_t TICK_PERIOD_MS = 50;
-
 static void ble_notify_thunk(uint16_t attr_handle, const uint8_t *data,
                              size_t len, void *user) {
   static_cast<SiriRemoteHub *>(user)->on_ble_notify(attr_handle, data, len);
@@ -107,6 +105,10 @@ void SiriRemoteHub::setup() {
     start_audio_();
   }
 
+  // Nothing staged yet; emit_event re-enables the loop when there is. Before
+  // NimBLE starts, so the first pulse can only ever turn it back on.
+  this->disable_loop();
+
   start_tick_timer_();
   start_nimble_();
 
@@ -159,13 +161,26 @@ void SiriRemoteHub::start_audio_() {
   }
 }
 
+// One-shot, armed for exactly the next due repeat (rearm_tick_locked_) and
+// left stopped while nothing is held. It used to be a 50 ms periodic, which
+// quantised repeats to the tick (75 ms became 100, 100 ms occasionally 150)
+// and woke the CPU 20x/s with nothing held.
 void SiriRemoteHub::start_tick_timer_() {
   esp_timer_create_args_t ta = {};
   ta.callback = tick_thunk;
   ta.arg = this;
   ta.name = "siri_remote_tick";
   ESP_ERROR_CHECK(esp_timer_create(&ta, &tick_timer_));
-  ESP_ERROR_CHECK(esp_timer_start_periodic(tick_timer_, TICK_PERIOD_MS * 1000));
+}
+
+// now is truncated to the millisecond, so firing `due` ms after it lands at or
+// after the due instant — never a hair early, which would skip an interval.
+void SiriRemoteHub::rearm_tick_locked_(uint32_t now) {
+  esp_timer_stop(tick_timer_);  // ESP_ERR_INVALID_STATE when idle: fine
+  const uint32_t due = button_pulse_next_due_ms(pulse_, now);
+  if (due != BUTTON_PULSE_NONE_DUE) {
+    esp_timer_start_once(tick_timer_, static_cast<uint64_t>(due) * 1000);
+  }
 }
 
 void SiriRemoteHub::start_nimble_() {
@@ -184,8 +199,10 @@ void SiriRemoteHub::start_nimble_() {
 }
 
 void SiriRemoteHub::tick() {
+  const uint32_t now = now_ms();
   LockGuard guard(pulse_lock_);
-  button_pulse_tick(pulse_, now_ms());
+  button_pulse_tick(pulse_, now);
+  rearm_tick_locked_(now);
 }
 
 void SiriRemoteHub::on_ble_notify(uint16_t attr_handle, const uint8_t *data,
@@ -221,6 +238,7 @@ void SiriRemoteHub::on_ble_notify(uint16_t attr_handle, const uint8_t *data,
 
       LockGuard guard(pulse_lock_);
       button_pulse_feed_buttons(pulse_, btns, now);
+      rearm_tick_locked_(now);
       return;
     }
 
@@ -281,6 +299,7 @@ void SiriRemoteHub::on_ble_disconnected() {
   ESP_LOGI(TAG, "remote disconnected");
   LockGuard guard(pulse_lock_);
   button_pulse_reset(pulse_);
+  rearm_tick_locked_(now_ms());  // nothing held any more: stops the tick
 }
 
 void SiriRemoteHub::signal_response_finished() {
@@ -328,85 +347,110 @@ void SiriRemoteHub::on_pcm(const int16_t *samples, size_t count) {
 #endif
 }
 
-// emit_event runs on the BLE host (or esp_timer) task — defer the HA event
-// to the main loop. evt is invalid after we return, so we snapshot its
-// fields by value into the lambda.
+// Runs on the BLE host (or esp_timer) task under pulse_lock_. evt is invalid
+// after we return, so its fields are copied into the ring; loop() publishes.
 //
 // Payload shape is the IR-style pulse: `repeat` indexes the pulse within a
 // hold (0 = the press itself) and `held_ms` measures how long it has been
 // down. Neither is a judgment — HA decides what counts as a click, a hold,
 // or a ramp. There is no release event; the pulses simply stop.
 void SiriRemoteHub::emit_event(const button_pulse_event_t *evt) {
-  const char *btn = siri_button_name(evt->button);
-  if (btn == nullptr) return;
+  const uint32_t head = this->ring_head_.load(std::memory_order_relaxed);
+  const uint32_t tail = this->ring_tail_.load(std::memory_order_acquire);
+  if (head - tail >= PULSE_RING_SIZE) {
+    // The loop task has been stalled for seconds; a dropped repeat costs one
+    // increment, and loop() reports the count once it runs again.
+    this->ring_dropped_.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    this->pulse_ring_[head & (PULSE_RING_SIZE - 1)] = {evt->button, evt->repeat, evt->held_ms};
+    this->ring_head_.store(head + 1, std::memory_order_release);
+  }
+  // ISR/any-task safe, allocation-free, and wakes the loop task immediately.
+  this->enable_loop_soon_any_context();
+}
 
-  const uint32_t repeat = evt->repeat;
-  const uint32_t held_ms = evt->held_ms;
+void SiriRemoteHub::loop() {
+  uint32_t tail = this->ring_tail_.load(std::memory_order_relaxed);
+  while (tail != this->ring_head_.load(std::memory_order_acquire)) {
+    const StagedPulse p = this->pulse_ring_[tail & (PULSE_RING_SIZE - 1)];
+    this->ring_tail_.store(++tail, std::memory_order_release);
+    this->publish_pulse_(p.button, p.repeat, p.held_ms);
+  }
+  const uint32_t dropped = this->ring_dropped_.exchange(0, std::memory_order_relaxed);
+  if (dropped != 0) {
+    ESP_LOGW(TAG, "loop stalled: dropped %" PRIu32 " button pulse(s)", dropped);
+  }
+  this->disable_loop();
+  // A pulse staged between the drain and disable_loop() already queued its
+  // own re-enable; this catches the window explicitly rather than relying on
+  // that ordering.
+  if (tail != this->ring_head_.load(std::memory_order_acquire)) {
+    this->enable_loop();
+  }
+}
+
+void SiriRemoteHub::publish_pulse_(siri_button_bit_t button, uint32_t repeat,
+                                   uint32_t held_ms) {
+  const char *btn = siri_button_name(button);
+  if (btn == nullptr) return;
 
   // The press is worth seeing at INFO; repeats arrive ~10x/sec and would
   // drown the log, so they sit at DEBUG.
   if (repeat == 0) {
     ESP_LOGI(TAG, "pulse button=%s press", btn);
   } else {
-    ESP_LOGD(TAG, "pulse button=%s repeat=%" PRIu32 " held=%" PRIu32 "ms",
-             btn, repeat, held_ms);
+    ESP_LOGD(TAG, "pulse button=%s repeat=%" PRIu32 " held=%" PRIu32 "ms", btn,
+             repeat, held_ms);
   }
 
-  // siri_button_name() returns string literals (or NULL, filtered above), so
-  // capturing the pointer is safe even though the deferred item outlives this
-  // call. It also keeps string construction off this task: we run under the
-  // pulse lock on the NimBLE / esp_timer task, and the loop task builds the
-  // payload strings instead.
-  this->defer([this, btn, repeat, held_ms] {
-    // Gate on an actually-connected client. Without this, holding a button
-    // across an HA restart makes APIServer log a dropped-event warning for
-    // every pulse. Note is_connected() means "a client is attached", not
-    // "it has subscribed to actions yet" — upstream warns about that short
-    // window deliberately, and it is bounded, so we let it through.
-    if (api::global_api_server == nullptr ||
-        !api::global_api_server->is_connected()) {
-      if (!this->api_gate_logged_) {
-        this->api_gate_logged_ = true;
-        ESP_LOGW(TAG, "Home Assistant not connected — dropping button pulses");
-      }
-      return;
+  // Gate on an actually-connected client. Without this, holding a button
+  // across an HA restart makes APIServer log a dropped-event warning for
+  // every pulse. Note is_connected() means "a client is attached", not
+  // "it has subscribed to actions yet" — upstream warns about that short
+  // window deliberately, and it is bounded, so we let it through.
+  if (api::global_api_server == nullptr ||
+      !api::global_api_server->is_connected()) {
+    if (!this->api_gate_logged_) {
+      this->api_gate_logged_ = true;
+      ESP_LOGW(TAG, "Home Assistant not connected — dropping button pulses");
     }
-    if (this->api_gate_logged_) {
-      this->api_gate_logged_ = false;
-      ESP_LOGI(TAG, "Home Assistant reconnected — resuming button pulses");
-    }
+    return;
+  }
+  if (this->api_gate_logged_) {
+    this->api_gate_logged_ = false;
+    ESP_LOGI(TAG, "Home Assistant reconnected — resuming button pulses");
+  }
 
-    // Must match what HA shows as the device name so a blueprint can filter
-    // on device_attr(<device>, 'name'). get_friendly_name() is empty when
-    // the user sets only `name:`, and HA falls back to `name` in exactly
-    // that case — so mirror the fallback rather than emitting "".
-    // Both names are fixed at compile time, so build the string once instead
-    // of per pulse. Only this lambda touches it, always on the loop task.
-    if (this->device_name_.empty()) {
-      this->device_name_ = App.get_friendly_name().empty()
-                               ? App.get_name().str()
-                               : App.get_friendly_name().str();
-    }
-    // Static so the 26-char name (past the SSO limit) isn't heap-allocated as
-    // a temporary on every pulse.
-    static const std::string EVENT_NAME = "esphome.siri_remote_button";
+  // Must match what HA shows as the device name so a blueprint can filter
+  // on device_attr(<device>, 'name'). get_friendly_name() is empty when
+  // the user sets only `name:`, and HA falls back to `name` in exactly
+  // that case — so mirror the fallback rather than emitting "".
+  // Both names are fixed at compile time, so build the string once instead
+  // of per pulse. Only the loop task touches it.
+  if (this->device_name_.empty()) {
+    this->device_name_ = App.get_friendly_name().empty()
+                             ? App.get_name().str()
+                             : App.get_friendly_name().str();
+  }
+  // Static so the 26-char name (past the SSO limit) isn't heap-allocated as
+  // a temporary on every pulse.
+  static const std::string EVENT_NAME = "esphome.siri_remote_button";
 
-    // ESPHome's own helper rather than a hand-built HomeassistantActionRequest:
-    // the message's string field types changed in 2026.11 (StringRef ->
-    // ProgmemStringRef), and upstream migrates this helper with them.
-    // CustomAPIDevice is stateless, so a temporary is fine.
-    //
-    // Every value crosses the API as a string — HA compares event_data with
-    // == and will not coerce, so automations must use `| int`.
-    api::CustomAPIDevice().fire_homeassistant_event(
-        EVENT_NAME,
-        {
-            {"device", this->device_name_},
-            {"button", btn},
-            {"repeat", std::to_string(repeat)},
-            {"held_ms", std::to_string(held_ms)},
-        });
-  });
+  // ESPHome's own helper rather than a hand-built HomeassistantActionRequest:
+  // the message's string field types changed in 2026.11 (StringRef ->
+  // ProgmemStringRef), and upstream migrates this helper with them.
+  // CustomAPIDevice is stateless, so a temporary is fine.
+  //
+  // Every value crosses the API as a string — HA compares event_data with
+  // == and will not coerce, so automations must use `| int`.
+  api::CustomAPIDevice().fire_homeassistant_event(
+      EVENT_NAME,
+      {
+          {"device", this->device_name_},
+          {"button", btn},
+          {"repeat", std::to_string(repeat)},
+          {"held_ms", std::to_string(held_ms)},
+      });
 }
 
 }  // namespace siri_remote

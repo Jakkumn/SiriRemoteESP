@@ -18,10 +18,19 @@ static const char *TAG = "siri_audio";
 // siri_audio.h + siri_audio_validate.c so the host test harness can link
 // the validator without pulling in opus / FreeRTOS / esp-log.
 
-// Queue depth: 2 seconds of 50 Hz audio. Long enough to ride out a brief
-// scheduling stall or Wi-Fi storm; short enough that under sustained
-// overrun we drop frames promptly rather than building unbounded latency.
-#define SIRI_AUDIO_QUEUE_DEPTH 100
+// Queue depth: 0.5 s of 50 Hz audio (~2.5 KB of internal RAM; it was 100 /
+// ~10 KB). The only thing that can back it up is the decode task itself
+// falling behind on CPU1 — the PCM consumers copy and return rather than
+// waiting on the network — and Opus decodes a 20 ms frame in a small fraction
+// of 20 ms. Anything queued longer than this is latency HA's VAD/STT would
+// have to wade through anyway, so drop-oldest past it is the better failure.
+#define SIRI_AUDIO_QUEUE_DEPTH 25
+
+// Post-session silence pacing; see siri_audio_silence_start().
+#define SILENCE_PERIOD_MS 20
+// If the decode task is ever this many periods behind on silence, resync to
+// now instead of bursting the backlog out.
+#define SILENCE_MAX_LAG_PERIODS 5
 
 // Decode task pinned to CPU1 (Wi-Fi + BLE controller default to CPU0).
 // Priority 5: above idle (0) and the IDF event loop (~3), well below
@@ -49,6 +58,9 @@ static volatile bool s_session_active;
 // from the caller could land while opus_decode() is mid-frame on the previous
 // session's last packet and corrupt its state.
 static volatile bool s_reset_pending;
+// Set/cleared from any task; read by the decode task, which emits the frames.
+static volatile bool s_silence;
+static const int16_t SILENCE_FRAME[SIRI_AUDIO_FRAME_SAMPLES];
 
 // --- Decoder lifecycle ----------------------------------------------------
 
@@ -109,10 +121,37 @@ static void decode_task(void *arg)
     audio_packet_t pkt;
     uint32_t frame_idx = 0;
     uint32_t err_count = 0;
+    const TickType_t silence_ticks = pdMS_TO_TICKS(SILENCE_PERIOD_MS);
+    bool silence_running = false;
+    TickType_t silence_next = 0;
 
     while (1) {
-        if (xQueueReceive(s_queue, &pkt, portMAX_DELAY) != pdTRUE) {
+        // Block indefinitely unless silence is being generated, in which case
+        // the receive timeout is the 20 ms frame clock — absolute deadlines, so
+        // decode work and scheduling jitter don't stretch the cadence.
+        TickType_t wait = portMAX_DELAY;
+        if (s_silence) {
+            TickType_t now = xTaskGetTickCount();
+            // Signed: now is normally *before* silence_next.
+            if (!silence_running || (int32_t)(now - silence_next) >
+                                        (int32_t)(silence_ticks * SILENCE_MAX_LAG_PERIODS)) {
+                silence_running = true;
+                silence_next = now + silence_ticks;
+            }
+            TickType_t until = silence_next - now;
+            wait = (int32_t)until > 0 ? until : 0;
+        } else {
+            silence_running = false;
+        }
+        if (xQueueReceive(s_queue, &pkt, wait) != pdTRUE) {
+            if (s_silence && s_cfg.on_pcm != NULL) {
+                silence_next += silence_ticks;
+                s_cfg.on_pcm(SILENCE_FRAME, SIRI_AUDIO_FRAME_SAMPLES, s_cfg.user);
+            }
             continue;
+        }
+        if (pkt.len == 0) {
+            continue;  // wake-up from siri_audio_silence_start(); re-evaluate
         }
         if (s_reset_pending) {
             // Fresh utterance: opus_decode caches last-frame state for FEC and
@@ -209,6 +248,7 @@ void siri_audio_session_start(void)
     // Before s_session_active, so no packet of this session can be queued
     // ahead of the reset request.
     s_reset_pending = true;
+    s_silence = false;  // real audio is about to flow
     s_session_active = true;
     ESP_LOGI(TAG, "session start");
     if (s_cfg.on_session_start != NULL) {
@@ -233,6 +273,24 @@ void siri_audio_session_end(void)
     if (s_cfg.on_session_end != NULL) {
         s_cfg.on_session_end(s_cfg.user);
     }
+}
+
+void siri_audio_silence_start(void)
+{
+    if (s_queue == NULL) {
+        return;
+    }
+    s_silence = true;
+    // The decode task may be blocked forever on an empty queue; a zero-length
+    // packet wakes it to pick up the new pacing. If the queue is full the task
+    // is busy and will see the flag on its next pass anyway.
+    audio_packet_t wake = {.len = 0};
+    (void)xQueueSendToBack(s_queue, &wake, 0);
+}
+
+void siri_audio_silence_stop(void)
+{
+    s_silence = false;  // the decode task drops back to an untimed wait
 }
 
 bool siri_audio_session_active(void)
