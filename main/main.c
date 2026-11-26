@@ -224,6 +224,8 @@ static void publish_ha_discovery_battery(void)
         "\"state_topic\":\"" TOPIC_BATTERY "\","
         "\"value_template\":\"{{ value_json.level }}\","
         "\"device_class\":\"battery\","
+        "\"state_class\":\"measurement\","  // HA long-term statistics
+        "\"entity_category\":\"diagnostic\","
         "\"unit_of_measurement\":\"%\","
         "\"device\":{\"identifiers\":[\"siri_remote_bridge\"]}," AVAILABILITY_BRIDGE_AND_REMOTE "}";
     mqtt_publish_now(TOPIC_DISCOVERY_BATTERY, PAYLOAD, sizeof(PAYLOAD) - 1, 1, /*retain*/ true);
@@ -237,6 +239,7 @@ static void publish_ha_discovery_charging(void)
         "\"unique_id\":\"siri_remote_charging\","
         "\"state_topic\":\"" TOPIC_CHARGING "\","
         "\"icon\":\"mdi:battery-charging\","
+        "\"entity_category\":\"diagnostic\","
         "\"device\":{\"identifiers\":[\"siri_remote_bridge\"]}," AVAILABILITY_BRIDGE_AND_REMOTE "}";
     mqtt_publish_now(TOPIC_DISCOVERY_CHARGING, PAYLOAD, sizeof(PAYLOAD) - 1, 1, /*retain*/ true);
 }
@@ -498,6 +501,21 @@ static void tick_timer_cb(void *arg)
 }
 
 // --- Wi-Fi ---
+//
+// Reconnects back off: 1 s doubling to 30 s, reset on getting an IP. Retrying
+// immediately on every STA_DISCONNECTED turns an AP outage or a bad password
+// into back-to-back full-channel scans, and the radio is shared with the
+// always-connected BLE link that this firmware treats as load-bearing.
+#define WIFI_RETRY_MIN_MS 1000
+#define WIFI_RETRY_MAX_MS 30000
+static esp_timer_handle_t s_wifi_retry_timer;
+static uint32_t s_wifi_retry_ms = WIFI_RETRY_MIN_MS;  // event-loop task only
+
+static void wifi_retry_cb(void *arg)
+{
+    (void)arg;
+    esp_wifi_connect();
+}
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -510,8 +528,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
             esp_wifi_connect();
             break;
         case WIFI_EVENT_STA_DISCONNECTED:
-            ESP_LOGW(TAG, "wifi: disconnected, retrying");
-            esp_wifi_connect();
+            ESP_LOGW(TAG, "wifi: disconnected, retrying in %lu ms", (unsigned long)s_wifi_retry_ms);
+            (void)esp_timer_stop(s_wifi_retry_timer);  // INVALID_STATE if idle: fine
+            (void)esp_timer_start_once(s_wifi_retry_timer, (uint64_t)s_wifi_retry_ms * 1000);
+            s_wifi_retry_ms =
+                s_wifi_retry_ms >= WIFI_RETRY_MAX_MS / 2 ? WIFI_RETRY_MAX_MS : s_wifi_retry_ms * 2;
             break;
         default:
             break;
@@ -519,11 +540,18 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *ip_evt = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "wifi: got IP " IPSTR, IP2STR(&ip_evt->ip_info.ip));
+        s_wifi_retry_ms = WIFI_RETRY_MIN_MS;
     }
 }
 
 static void wifi_start(void)
 {
+    const esp_timer_create_args_t retry_args = {
+        .callback = wifi_retry_cb,
+        .name = "wifi_retry",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&retry_args, &s_wifi_retry_timer));
+
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
@@ -590,7 +618,8 @@ static void mqtt_event_handler(void *args, esp_event_base_t base, int32_t id, vo
         ESP_LOGI(TAG, "mqtt: subscribed (msg_id=%d)", evt->msg_id);
         break;
     case MQTT_EVENT_DATA:
-        (void)mqtt_entity_dispatch_data(evt->topic, evt->topic_len, evt->data, evt->data_len);
+        (void)mqtt_entity_dispatch_data(evt->topic, evt->topic_len, evt->data, evt->data_len,
+                                        evt->retain);
         break;
     default:
         break;

@@ -11,7 +11,6 @@
 #include "nvs.h"
 
 #include "freertos/FreeRTOS.h"
-#include "freertos/portmacro.h"
 
 #include "host/ble_att.h"
 #include "host/ble_gap.h"
@@ -131,11 +130,8 @@ typedef struct {
           // Back+VolUp recovers quickly.
 static blacklist_entry_t s_blacklist[BLACKLIST_SIZE];
 static size_t s_blacklist_next;  // ring index for replacement on overflow
-static portMUX_TYPE s_blacklist_mux = portMUX_INITIALIZER_UNLOCKED;
-// protects s_blacklist + s_blacklist_next:
-// writes/reads from BLE host task (DISC
-// event, fingerprint reject, and repair,
-// which is posted to it).
+// No lock: every reader and writer (DISC events, connect failure, fingerprint
+// reject, Repair) runs on the NimBLE host task.
 
 // --- Host-task timers and events --------------------------------------------
 //
@@ -308,7 +304,6 @@ static void log_addr(const char *prefix, const uint8_t val[6])
 static bool blacklist_contains(const uint8_t addr[6])
 {
     bool found = false;
-    portENTER_CRITICAL(&s_blacklist_mux);
     uint32_t now = now_ms();
     for (size_t i = 0; i < BLACKLIST_SIZE; i++) {
         if (s_blacklist[i].expire_ms == 0)
@@ -322,25 +317,20 @@ static bool blacklist_contains(const uint8_t addr[6])
             break;
         }
     }
-    portEXIT_CRITICAL(&s_blacklist_mux);
     return found;
 }
 
 static void blacklist_add(const uint8_t addr[6], uint32_t ttl_ms)
 {
-    portENTER_CRITICAL(&s_blacklist_mux);
     s_blacklist[s_blacklist_next].expire_ms = now_ms() + ttl_ms;
     memcpy(s_blacklist[s_blacklist_next].addr, addr, 6);
     s_blacklist_next = (s_blacklist_next + 1) % BLACKLIST_SIZE;
-    portEXIT_CRITICAL(&s_blacklist_mux);
 }
 
 static void blacklist_clear(void)
 {
-    portENTER_CRITICAL(&s_blacklist_mux);
     memset(s_blacklist, 0, sizeof(s_blacklist));
     s_blacklist_next = 0;
-    portEXIT_CRITICAL(&s_blacklist_mux);
 }
 
 // --- Adv parsing helper ----------------------------------------------------

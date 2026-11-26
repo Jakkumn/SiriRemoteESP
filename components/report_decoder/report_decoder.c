@@ -79,5 +79,10 @@ const char *siri_decode_charging_state(uint8_t state_byte)
         return "charging";
     if (discharging == 3)
         return "discharging";
+    // Both fields 0 ("unknown") carries no information — the remote hasn't
+    // reported, or reports nothing. Calling that "plugged_in" would put a
+    // confident wrong state in HA.
+    if (charging == 0 && discharging == 0)
+        return "unknown";
     return "plugged_in";
 }

@@ -84,9 +84,12 @@ void mqtt_entity_set_value(mqtt_entity_t *e, int32_t value);
 // MQTT lifecycle hooks. Call these from main.c's mqtt_event_handler.
 // `on_mqtt_connected` (re)publishes discovery configs, restores state to
 // the broker, and subscribes to all command topics. `dispatch_data`
-// returns true if an entity claimed the topic.
+// returns true if an entity claimed the topic. `retained` is the message's
+// retain flag (esp_mqtt_event_t.retain): retained commands are ignored for
+// Buttons, which are events and must not re-fire on every reconnect.
 void mqtt_entity_on_mqtt_connected(esp_mqtt_client_handle_t client);
-bool mqtt_entity_dispatch_data(const char *topic, int topic_len, const char *data, int data_len);
+bool mqtt_entity_dispatch_data(const char *topic, int topic_len, const char *data, int data_len,
+                               bool retained);
 
 #ifdef __cplusplus
 }

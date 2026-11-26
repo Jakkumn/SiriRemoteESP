@@ -68,7 +68,7 @@ The wrap registers four entities under one device:
 
 - `binary_sensor.siri_remote_voice_active` — `on` while Mic is held.
 - `sensor.siri_remote_battery` — battery level (%).
-- `text_sensor.siri_remote_charging` — `charging` / `discharging` / `plugged_in`.
+- `text_sensor.siri_remote_charging` — `charging` / `discharging` / `plugged_in` (`unknown` if the remote reports no state).
 - `button.siri_remote_re_pair` — wipes the BLE bond and re-enters discovery.
 
 That is deliberately a short list. These four are genuine *state* — things the
@@ -273,7 +273,7 @@ running the standalone firmware.
 | `siri_remote/connection` | yes (LWT) | `online` / `offline` |
 | `siri_remote/remote_status` | yes | `connected` / `disconnected` (BLE link to the remote) |
 | `siri_remote/battery` | yes | `{"level": 87, "low": false}` |
-| `siri_remote/charging` | yes | `charging` / `discharging` / `plugged_in` |
+| `siri_remote/charging` | yes | `charging` / `discharging` / `plugged_in` / `unknown` |
 
 ## Pairing your remote
 
@@ -460,8 +460,10 @@ tvOS scrolls:
 
 **Tap vs. hold on the same button.** Because `repeat: 0` fires at *press*,
 an automation bound to the press also runs at the start of a hold. If you
-need them mutually exclusive, you have to wait out the delay to learn it was
-a tap:
+need them mutually exclusive, listen to *every* pulse and let `mode: restart`
+do the timing: each new pulse cancels the previous run, so a run that
+survives its short delay means the pulses stopped — the button was released
+before it became a hold.
 
 ```yaml
 - alias: "Select: tap plays, hold opens scene"
@@ -470,28 +472,34 @@ a tap:
     event_type: esphome.siri_remote_button
     event_data:
       button: select
-      repeat: "0"
+  variables:
+    hold_ms: 400       # how long counts as a hold
+    interval_ms: 100   # must match the bridge's repeat_interval_ms
+    held: "{{ trigger.event.data.held_ms | int }}"
   action:
-    - wait_for_trigger:
-        - platform: event
-          event_type: esphome.siri_remote_button
-          event_data:
-            button: select
-      timeout: "00:00:00.4"
-      continue_on_timeout: true
     - choose:
-        - conditions: "{{ wait.trigger is none }}"
-          sequence:                      # timed out → it was a tap
-            - service: media_player.media_play_pause
-              target: { entity_id: media_player.living_room }
-      default:                           # more pulses arrived → a hold
-        - service: scene.turn_on
-          target: { entity_id: scene.movie_night }
+        - conditions: "{{ held >= hold_ms }}"
+          sequence:
+            # Only the first pulse past the threshold, not every one after it.
+            - condition: "{{ held < hold_ms + interval_ms }}"
+            - service: scene.turn_on
+              target: { entity_id: scene.movie_night }
+      default:
+        # Still short. If another pulse arrives, this run is cancelled; if
+        # none does, the button was let go — a tap.
+        - delay:
+            milliseconds: "{{ interval_ms * 2 + 50 }}"
+        - service: media_player.media_play_pause
+          target: { entity_id: media_player.living_room }
   mode: restart
 ```
 
-The tap action is necessarily delayed by the timeout — you cannot know a tap
-was a tap until it has failed to become a hold.
+The tap action is necessarily delayed — by about two repeat intervals after
+release — because a tap is only known once the pulses stop. The hold action
+fires while the button is still down, the moment it crosses `hold_ms`.
+Don't wait for "any" further `select` event to decide: the first repeat
+arrives after `repeat_interval_ms` (100 ms by default), so a normal click
+held a little longer than that would be misread as a hold.
 
 ### Standalone path (MQTT)
 

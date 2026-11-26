@@ -32,8 +32,10 @@ static button_pulse_t *make_bp(uint32_t interval_ms)
     return bp;
 }
 
-// Drive ticks at the 50 ms cadence both build paths use, so the tests exercise
-// the same granularity the firmware actually has.
+// Drive ticks on a fixed 50 ms cadence. The firmware no longer ticks this way —
+// it arms a one-shot for button_pulse_next_due_ms() (see
+// test_scheduled_ticks_hit_interval_exactly) — but a fixed cadence is still a
+// valid caller of the API, and it keeps these tests' expected counts simple.
 #define TICK_MS 50
 static void run_ticks(button_pulse_t *bp, uint32_t from_ms, uint32_t to_ms)
 {
@@ -406,6 +408,61 @@ static void test_scheduled_ticks_hit_interval_exactly(void)
     button_pulse_destroy(bp);
 }
 
+// One report can release one button and press another (rolling across the
+// clickpad). The release is silent; the new press emits immediately; the
+// released button stops repeating while the held one carries on.
+static void test_release_and_press_in_one_report(void)
+{
+    button_pulse_t *bp = make_bp(100);
+    button_pulse_feed_buttons(bp, SIRI_BTN_UP, 0);
+    button_pulse_feed_buttons(bp, SIRI_BTN_UP | SIRI_BTN_RIGHT, 30);
+    button_pulse_feed_buttons(bp, SIRI_BTN_RIGHT, 60);
+    assert(captured_count == 2);
+    assert(captured[0].button == SIRI_BTN_UP && captured[0].repeat == 0);
+    assert(captured[1].button == SIRI_BTN_RIGHT && captured[1].repeat == 0);
+
+    reset_capture();
+    run_ticks(bp, 60, 400);
+    assert(captured_count > 0);
+    for (size_t i = 0; i < captured_count; i++) {
+        assert(captured[i].button == SIRI_BTN_RIGHT);
+    }
+    button_pulse_destroy(bp);
+}
+
+// Bits above the 13 real buttons (0xE000) must neither emit nor disturb the
+// diff for the real ones on later reports.
+static void test_stray_high_bits_ignored(void)
+{
+    button_pulse_t *bp = make_bp(100);
+    button_pulse_feed_buttons(bp, 0xE000, 0);
+    assert(captured_count == 0);
+    button_pulse_feed_buttons(bp, (uint16_t)(0xE000 | SIRI_BTN_VOL_UP), 10);
+    assert(captured_count == 1 && captured[0].button == SIRI_BTN_VOL_UP);
+    button_pulse_feed_buttons(bp, 0xE000, 20);           // VOL_UP released; high bits linger
+    button_pulse_feed_buttons(bp, SIRI_BTN_VOL_UP, 30);  // high bits clear, VOL_UP again
+    assert(captured_count == 2 && captured[1].button == SIRI_BTN_VOL_UP);
+    assert(captured[1].repeat == 0);
+    assert(button_pulse_next_due_ms(bp, 30) == 100);
+    button_pulse_destroy(bp);
+}
+
+// Mic held alongside another button: Mic is skipped, the other still drives
+// the schedule, and Mic alone again means nothing is due.
+static void test_next_due_with_mic_and_another(void)
+{
+    button_pulse_t *bp = make_bp(100);
+    button_pulse_feed_buttons(bp, SIRI_BTN_MIC, 0);
+    button_pulse_feed_buttons(bp, SIRI_BTN_MIC | SIRI_BTN_VOL_DOWN, 50);
+    assert(button_pulse_next_due_ms(bp, 50) == 100);
+    button_pulse_tick(bp, 150);
+    assert(captured_count == 3);  // two presses + one VOL_DOWN repeat
+    assert(captured[2].button == SIRI_BTN_VOL_DOWN && captured[2].repeat == 1);
+    button_pulse_feed_buttons(bp, SIRI_BTN_MIC, 160);
+    assert(button_pulse_next_due_ms(bp, 160) == BUTTON_PULSE_NONE_DUE);
+    button_pulse_destroy(bp);
+}
+
 int main(void)
 {
     test_press_emits_once();
@@ -427,6 +484,9 @@ int main(void)
     test_next_due_idle_and_disabled();
     test_next_due_counts_down_and_takes_min();
     test_scheduled_ticks_hit_interval_exactly();
+    test_release_and_press_in_one_report();
+    test_stray_high_bits_ignored();
+    test_next_due_with_mic_and_another();
     printf("test_button_pulse: ok\n");
     return 0;
 }

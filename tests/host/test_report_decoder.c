@@ -137,6 +137,19 @@ static void test_button_name_returns_null_for_unknown(void)
     assert(siri_button_name(0x2000) == NULL);
 }
 
+static void test_charging_state(void)
+{
+    // 0x2A1A: bits 4..5 charging, 2..3 discharging (3 = active, 2 = not, 0 = unknown).
+    assert(strcmp(siri_decode_charging_state(0x33), "charging") == 0);     // chg=3
+    assert(strcmp(siri_decode_charging_state(0x2F), "discharging") == 0);  // chg=2, dis=3
+    assert(strcmp(siri_decode_charging_state(0x0F), "discharging") == 0);  // chg=0, dis=3
+    assert(strcmp(siri_decode_charging_state(0x3F), "charging") == 0);     // both: charging wins
+    assert(strcmp(siri_decode_charging_state(0x2B), "plugged_in") == 0);   // chg=2, dis=2
+    assert(strcmp(siri_decode_charging_state(0x00), "unknown") == 0);      // all unknown
+    assert(strcmp(siri_decode_charging_state(0xC3), "unknown") == 0);      // level/presence only
+    assert(strcmp(siri_decode_charging_state(0x23), "plugged_in") == 0);   // chg=2, dis=0
+}
+
 int main(void)
 {
     test_single_button_pressed();
@@ -156,6 +169,7 @@ int main(void)
     test_button_name_returns_strings();
     test_button_name_returns_null_for_unknown();
 
+    test_charging_state();
     printf("test_report_decoder: ok\n");
     return 0;
 }

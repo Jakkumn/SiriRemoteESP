@@ -25,6 +25,9 @@ blueprint:
     the held slot for as long as you keep holding. If you want them to be
     mutually exclusive, see the tap-vs-hold recipe in the project README.
 
+    **Mic (Siri) is press-only.** Holding Mic streams voice audio, so the
+    bridge never repeats it, and it has no "while held" slot.
+
     For a single button with finer control (rate division, extra conditions),
     use the companion "single button" blueprint instead.
 
@@ -157,10 +160,9 @@ blueprint:
       selector: { action: {} }
     mic_press:
       name: "Mic (Siri) — press"
-      default: []
-      selector: { action: {} }
-    mic_held:
-      name: "Mic (Siri) — while held"
+      description: >-
+        Press only: the bridge never repeats Mic, because holding it streams
+        voice audio.
       default: []
       selector: { action: {} }
 
@@ -328,9 +330,3 @@ actions:
           {{ trigger.event.data.button == 'mic'
              and trigger.event.data.repeat | int == 0 }}
         sequence: !input mic_press
-      - conditions: >-
-          {{ trigger.event.data.button == 'mic'
-             and trigger.event.data.repeat | int > 0
-             and trigger.event.data.held_ms | int
-                 >= (typematic_delay_ms | int) }}
-        sequence: !input mic_held

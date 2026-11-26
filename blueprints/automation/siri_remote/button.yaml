@@ -23,6 +23,10 @@ blueprint:
       once the typematic delay has elapsed. Right for volume, channel,
       scrolling, and anything incremental.
 
+    **Mic (Siri) is press-only.** Holding Mic streams voice audio, so the
+    bridge never repeats it; "Repeat while held" behaves like "Once per press"
+    for Mic.
+
     Install: drop this file into <HA config>/blueprints/automation/
     siri_remote/button.yaml, then Settings → Automations → Blueprints.
 
@@ -57,7 +61,7 @@ blueprint:
             - { label: "Back",                     value: "back" }
             - { label: "TV",                       value: "tv" }
             - { label: "Power",                    value: "power" }
-            - { label: "Mic (Siri)",               value: "mic" }
+            - { label: "Mic (Siri) — press only",  value: "mic" }
 
     repeat_mode:
       name: Repeat behaviour

@@ -107,9 +107,6 @@ button:
     type: repair
     name: "Siri Remote Re-pair"
 
-# Runtime-tunable thresholds. All NVS-persisted via ESPHome Preferences.
-# Defaults match the standalone Kconfig defaults; override min/max/step in
-# YAML if you want a different slider range.
 # -----------------------------------------------------------------------------
 # Home Assistant automation example (paste into HA's automations.yaml).
 #
