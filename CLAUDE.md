@@ -35,8 +35,8 @@ locking discipline). When changing one, check whether the other needs the same c
 
 ## Component responsibilities
 
-- `components/report_decoder/` — pure C, no ESP-IDF. Button bitmap (handle `0x0039`),
-  11-byte touch frame (`0x003D`), BLE `0x2A1A` charging byte, enum→string names.
+- `components/report_decoder/` — pure C, no ESP-IDF. Button bitmap (`SIRI_HANDLE_BUTTON`),
+  11-byte touch frame (`SIRI_HANDLE_TOUCH`), BLE `0x2A1A` charging byte, enum→string names.
 - `components/button_pulse/` — pure C, no ESP-IDF. IR-style pulse emitter. While a button
   is held it re-emits `{button, repeat, held_ms}` every `repeat_interval_ms`; **there is no
   release event** — release is inferred downstream from the pulses stopping, exactly as an
@@ -64,15 +64,21 @@ locking discipline). When changing one, check whether the other needs the same c
 
 ### siri_ble specifics
 
-- A 4-state machine: `MODE_DISCOVERING` (active scan, HID-UUID filter, RSSI ≥ −55 dBm,
+- A 4-state machine: `MODE_DISCOVERING` (passive scan, HID-UUID filter, RSSI ≥ −55 dBm,
   post-connect fingerprint) → `MODE_BONDED_RECONNECT` (direct connect to the stored bond)
   → `MODE_CONNECTED`, with `MODE_IDLE` when the 5-minute discovery window lapses.
-- **GATT handles are hardcoded constants**, not discovered, on the live path (~3.7 s saved
-  per connect). The authoritative map is the `SIRI_HANDLE_*` block in `include/siri_ble.h`
-  (value handles, public) plus the `*_CCCD_HANDLE` defines at the top of `siri_ble.c`
-  (private). `peer_disc_all` runs only for the first-bond fingerprint check.
+- **GATT handles are discovered once per bond and cached in NVS**, never hardcoded: two
+  gen-3 units with different firmware carry the same attribute structure shifted by one
+  handle, and a hardcoded CCCD write onto the neighbour "succeeds" and silently never
+  notifies. `derive_handle_map()` builds a `siri_handle_map_t` structurally (by UUID and
+  notify property, in handle order) at the first-bond fingerprint; it is saved under NVS
+  namespace `siri_ble`, key `hmapv1`, and reloaded on bonded reconnect so the ~3.7 s
+  `peer_disc_all` is paid once. A bonded connect with no cached map rediscovers; Repair
+  erases it. `SIRI_HANDLE_*` in `include/siri_ble.h` are now *logical* IDs — siri_ble
+  translates every real handle to one before `on_notify`, so callers never see the layout.
 - Post-connect work is a sequential `SETUP_STEPS[]` table (CCCD writes, the vendor "magic
-  unlock" write `0xF0 0x00` to `0x004D`, initial reads). Steps are chained one-at-a-time
+  unlock" write `0xF0 0x00` to the first non-notify HID Report — `0x004D` on the
+  reference unit — and initial reads). Steps are chained one-at-a-time
   through `on_setup_step_done` — add new steps to the table rather than issuing ad-hoc GATT ops.
 - Default is **always-connected** with slave latency 400; the link is never dropped
   deliberately. This is load-bearing: Apple's firmware discards the wake-press if the
@@ -94,18 +100,25 @@ through `defer_publish_()` / `this->defer()`, never direct. Cross-task scalar fl
 
 **Never publish from inside the emit callback.** It runs under the pulse lock, and at a
 100 ms repeat interval it runs ~10x/sec on the high-priority `esp_timer` task. Standalone
-stages into `s_pulse_stage[]` and `flush_pulses()` publishes after releasing the lock —
-otherwise `esp_mqtt_client_publish` (which takes the MQTT client mutex and can block on the
-outbox) would be called with our lock held, against the NimBLE notify path. ESPHome defers
+stages into `s_pulse_stage[]` and `flush_pulses()` queues the batch after releasing the
+lock — otherwise `esp_mqtt_client_publish` (which takes the MQTT client mutex and can block
+on the outbox) would be called with our lock held, against the NimBLE notify path.
+
+Standalone never calls `esp_mqtt_client_publish` from the NimBLE host or `esp_timer` tasks
+at all: it sends synchronously and can block for the ~10 s network timeout. Runtime
+publishes go through `mqtt_publish()`, which copies into `s_pub_queue` without blocking, and
+`publisher_task` does the send. Only the MQTT event handler, already on the MQTT task, uses
+`mqtt_publish_now()` directly. ESPHome defers
 to the loop task for the same reason, and additionally gates on
 `api::global_api_server->is_connected()` so a held button across an HA restart doesn't make
 `APIServer` log a dropped-event warning per pulse.
 
-Pairing-combo suppression stays in the glue (`suppress_buttons_until_ms_` / 
-`s_suppress_buttons_until_ms`) and gates the *feed*, not the emit — so `button_pulse` never
-learns the combo was held and cannot start pulsing when the window closes. Both its write
-(`on_ble_connected`) and read (`on_ble_notify`) are on the NimBLE host task, so it needs no
-lock; don't "fix" that by moving it into the component.
+Pairing-combo suppression lives in `siri_ble.c` (`s_suppress_until_ms`); the glue only
+supplies `pairing_flush_suppress_ms`. It is armed when a fresh bond's (`idle_ms == 0`)
+setup chain finishes and drops notifies in `NOTIFY_RX` before they reach `on_notify` — so
+`button_pulse` never learns the combo was held and cannot start pulsing when the window
+closes. Both its write and read are on the NimBLE host task, so it needs no lock. Keep it
+out of `button_pulse`, which must stay free of judgment logic.
 
 ## Commands
 

@@ -417,9 +417,16 @@ void SiriRemoteHub::emit_event(const button_pulse_event_t *evt) {
     // on device_attr(<device>, 'name'). get_friendly_name() is empty when
     // the user sets only `name:`, and HA falls back to `name` in exactly
     // that case — so mirror the fallback rather than emitting "".
-    const StringRef &device = App.get_friendly_name().empty()
-                                  ? App.get_name()
-                                  : App.get_friendly_name();
+    // Both names are fixed at compile time, so build the string once instead
+    // of per pulse. Only this lambda touches it, always on the loop task.
+    if (this->device_name_.empty()) {
+      this->device_name_ = App.get_friendly_name().empty()
+                               ? App.get_name().str()
+                               : App.get_friendly_name().str();
+    }
+    // Static so the 26-char name (past the SSO limit) isn't heap-allocated as
+    // a temporary on every pulse.
+    static const std::string EVENT_NAME = "esphome.siri_remote_button";
 
     // ESPHome's own helper rather than a hand-built HomeassistantActionRequest:
     // the message's string field types changed in 2026.11 (StringRef ->
@@ -429,9 +436,9 @@ void SiriRemoteHub::emit_event(const button_pulse_event_t *evt) {
     // Every value crosses the API as a string — HA compares event_data with
     // == and will not coerce, so automations must use `| int`.
     api::CustomAPIDevice().fire_homeassistant_event(
-        "esphome.siri_remote_button",
+        EVENT_NAME,
         {
-            {"device", device.str()},
+            {"device", this->device_name_},
             {"button", btn},
             {"repeat", std::to_string(repeat)},
             {"held_ms", std::to_string(held_ms)},

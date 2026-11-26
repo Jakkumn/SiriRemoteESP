@@ -64,9 +64,9 @@ typedef void (*siri_ble_notify_cb_t)(uint16_t attr_handle, const uint8_t *data, 
 // setup chain in always-connected mode).
 //
 // `idle_ms_since_disconnect` is overloaded:
-//   - **0** — fresh first-bond from the DISCOVERING flow. Caller may use
-//     this as a discriminator to suppress buffered HID notifies (the
-//     pairing-combo flush) for ~1.5 s.
+//   - **0** — fresh first-bond from the DISCOVERING flow. siri_ble itself
+//     suppresses the buffered pairing-combo flush that follows (see
+//     pairing_flush_suppress_ms); callers need not act on it.
 //   - **>0** — warm reconnect after the link dropped (Wi-Fi outage,
 //     remote out of range, bridge reboot). Value reflects elapsed wall
 //     time since the previous disconnect. Mostly diagnostic — in

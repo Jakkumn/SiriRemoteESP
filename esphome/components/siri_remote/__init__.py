@@ -70,8 +70,11 @@ CONFIG_SCHEMA = cv.All(
         ),
         # Was a runtime Number entity; now compile-time. Load-bearing for
         # always-connected wake behaviour — see README before changing.
+        # 498, not 500: NimBLE rejects latency > 499, and 499 fails its
+        # supervision-timeout check against siri_ble's 15 s ceiling — the
+        # conn-param update would return EINVAL and leave latency at 0.
         cv.Optional(CONF_BLE_SLAVE_LATENCY, default=400): cv.int_range(
-            min=0, max=500
+            min=0, max=498
         ),
         cv.Optional(CONF_DEBUG_TOUCH_FRAMES, default=False): cv.boolean,
         cv.Optional(CONF_DEBUG_WAKE_PROBE, default=False): cv.boolean,

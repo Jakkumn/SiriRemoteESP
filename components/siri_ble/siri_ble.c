@@ -29,13 +29,6 @@
 
 static const char *TAG = "siri_ble";
 
-// Gen-3 GATT handles, empirically verified in Phase 1 and reproducible across
-// reconnects on the same unit. We skip GATT service discovery on the live path
-// (~3.7 seconds saved per connection) and write directly to these handles.
-// First-bond connects in DISCOVERING mode still run peer_disc_all once for
-// the fingerprint check, but bonded reconnects use these constants directly.
-// Phase 3B.7 plans a runtime "discovery mode" Switch for cross-gen units
-// where the layout differs.
 // The remote's discovered GATT layout. Declared here because resolve_handle()
 // (below, with the setup-step table) reads it before the derivation helpers
 // are defined. Invalid until a fingerprint pass or a successful NVS load.
@@ -94,6 +87,23 @@ static bool s_have_bonded_peer;
 static ble_addr_t s_pending_candidate;
 static bool s_pending_candidate_set;
 
+// The same candidate's *identity* address, captured at its first ENC_CHANGE.
+// The remote advertises with a resolvable private address, but NimBLE keys
+// bond records by identity address — so deleting or reconnecting by the
+// advertised address silently misses: the delete leaves the bond behind, and
+// a direct connect stops matching as soon as the remote rotates its RPA.
+// NimBLE persists the keys before raising ENC_CHANGE (ble_sm_process_result),
+// so peer_id_addr is already the identity at that point.
+static ble_addr_t s_pending_candidate_id;
+static bool s_pending_candidate_id_set;
+
+// The address that names the candidate's bond record: its identity address
+// once pairing has distributed it, otherwise the advertised one.
+static const ble_addr_t *candidate_bond_addr(void)
+{
+    return s_pending_candidate_id_set ? &s_pending_candidate_id : &s_pending_candidate;
+}
+
 // In-RAM candidate blacklist. Discovery walks every nearby HID adv; once
 // we've rejected one (fingerprint mismatch, or LL connect-establish failure
 // from a remote that's advertising but won't admit an unknown peer until
@@ -105,6 +115,7 @@ typedef struct {
     uint32_t expire_ms;
 } blacklist_entry_t;
 #define BLACKLIST_SIZE 8
+#define CANDIDATE_CONNECT_TIMEOUT_MS 5000
 #define BLACKLIST_TTL_FINGERPRINT_MS 60000  // wrong device entirely
 #define BLACKLIST_TTL_FAILED_CONNECT_MS                                                            \
     5000  // LL handshake didn't complete —
@@ -177,6 +188,7 @@ static esp_timer_handle_t s_setup_fallback_timer;
 // trading battery-life against disconnect-detection latency now needs a reflash.
 // `siri_ble_set_slave_latency` mutates this struct + auto-recomputes
 // supervision_timeout to satisfy the BLE spec rule with ~25 % margin.
+#define SLAVE_LATENCY_MAX 498
 static struct ble_gap_upd_params s_low_power_conn_params = {
     .itvl_min = 6,   // 6 * 1.25ms = 7.5ms
     .itvl_max = 12,  // 12 * 1.25ms = 15ms
@@ -280,7 +292,10 @@ static void start_discovery(void)
         .window = 0,
         .filter_policy = 0,
         .limited = 0,
-        .passive = 0,            // active scan to capture scan responses
+        .passive = 1,            // passive: the HID-UUID match comes from the
+                                 // ADV_IND payload, and gap_event_cb drops scan
+                                 // responses anyway, so SCAN_REQs to every
+                                 // nearby advertiser would be pure radio noise
         .filter_duplicates = 0,  // OFF — we want every adv from a candidate
                                  // until we connect, since blacklist eviction
                                  // depends on retrying after the TTL expires
@@ -288,7 +303,11 @@ static void start_discovery(void)
 
     int rc = ble_gap_disc(s_own_addr_type, BLE_HS_FOREVER, &params, gap_event_cb, NULL);
     if (rc != 0) {
-        ESP_LOGE(TAG, "ble_gap_disc failed: %d", rc);
+        // Without this the bridge would claim DISCOVERING with no scan
+        // running, no window timer armed, and nothing scheduled to retry.
+        // IDLE is the honest state: it is what Repair recovers from.
+        ESP_LOGE(TAG, "ble_gap_disc failed: %d — idle; press the HA Repair button to retry", rc);
+        s_mode = MODE_IDLE;
         return;
     }
 
@@ -350,9 +369,17 @@ static void try_connect_candidate(const struct ble_gap_disc_desc *disc,
 
     s_pending_candidate = disc->addr;
     s_pending_candidate_set = true;
+    s_pending_candidate_id_set = false;
 
     (void)ble_gap_disc_cancel();
-    int rc = ble_gap_connect(s_own_addr_type, &disc->addr, 30000, NULL, gap_event_cb, NULL);
+    // Scanning is cancelled for the duration of this connect, so its timeout
+    // is how long the discovery window goes blind if the candidate stops
+    // advertising (user let go of the combo, walked away). We just heard an
+    // ADV_IND at >= -55 dBm and pairing-mode advertising runs at tens of ms,
+    // so 5 s is still several advertising events even at a 1.28 s interval.
+    // Timeout lands in the CONNECT-failed branch: short blacklist, rescan.
+    int rc = ble_gap_connect(s_own_addr_type, &disc->addr, CANDIDATE_CONNECT_TIMEOUT_MS, NULL,
+                             gap_event_cb, NULL);
     if (rc != 0) {
         ESP_LOGE(TAG, "ble_gap_connect failed: rc=%d", rc);
         s_pending_candidate_set = false;
@@ -673,9 +700,9 @@ static void issue_setup_step(size_t idx)
 {
     if (idx >= SETUP_STEP_COUNT) {
         // Fresh bond (idle==0) means the user just held the pairing combo, and
-        // Apple has now flushed those buffered presses to us. Blackout from
-        // here rather than from connect: the flush lands once the button CCCD
-        // subscribe completes, which is inside this chain.
+        // Apple flushes those buffered presses once the button CCCD subscribe
+        // lands. apply_remote_setup armed the blackout before step 0; re-arm
+        // here so it also runs pairing_flush_suppress_ms past the chain's end.
         if (s_setup_idle_ms == 0 && s_cfg.pairing_flush_suppress_ms > 0) {
             s_suppress_until_ms = now_ms() + s_cfg.pairing_flush_suppress_ms;
             ESP_LOGI(TAG, "post-pairing notify blackout for %u ms",
@@ -783,6 +810,16 @@ static void apply_remote_setup(uint16_t conn_handle)
     s_setup_done_conn = conn_handle;
     s_setup_step_conn = conn_handle;
     s_setup_step_idx = 0;
+    // Arm the post-pairing blackout before step 0, not just when the chain
+    // ends: the flush follows the button CCCD subscribe, which is the first
+    // step, and the remaining steps are several more ATT round-trips during
+    // which flushed presses would otherwise reach on_notify. The terminator
+    // re-arms it so the window still extends past the end of the chain.
+    // Setup reads complete through on_setup_step_done, not NOTIFY_RX, so the
+    // initial battery / charging values are unaffected.
+    if (s_setup_idle_ms == 0 && s_cfg.pairing_flush_suppress_ms > 0) {
+        s_suppress_until_ms = now_ms() + s_cfg.pairing_flush_suppress_ms;
+    }
     issue_setup_step(0);
 }
 
@@ -801,13 +838,14 @@ static void complete_setup_chain(uint16_t conn_handle, uint32_t idle_ms)
 // Run only on the *first* connect to a candidate (DISCOVERING mode).
 // Walks the discovered GATT tree and confirms the candidate looks like a
 // gen-3 Siri Remote: HID service present, ≥3 Report chars with notify, the
-// button value handle 0x0039 specifically present, and the Apple custom
-// service present. Bonded reconnects skip this — we trust prior bonds.
+// Apple custom service present, and a derivable handle map. Bonded
+// reconnects skip this — we trust prior bonds.
 
 // Diagnostic dump of everything we discovered on a candidate. Only called on
-// fingerprint rejection — the hardcoded handle map means "not a Siri Remote"
-// and "a Siri Remote whose handles moved" produce the identical verdict, and
-// this is the only way to tell them apart from a log.
+// rejection: it is the only way to tell "not a Siri Remote" from "a Siri
+// Remote whose layout our derivation doesn't understand" after the fact. A
+// pass logs the derived handle map instead, and dumping dozens of lines on
+// the NimBLE host task there would only delay the setup chain.
 static void dump_gatt_tree(const struct peer *peer)
 {
     const struct peer_svc *svc;
@@ -867,17 +905,45 @@ static const char *fingerprint_check(const struct peer *peer)
     return NULL;
 }
 
+// The bridge bonds to exactly one remote, and on_sync reconnects to whichever
+// bond the store lists first — so any other record left behind (an earlier
+// remote, a candidate whose rejection predates identity-address deletes)
+// could later win that race. Only called once the kept bond's identity
+// address is known, so it can never delete the bond it was asked to keep.
+static void prune_other_bonds(const ble_addr_t *keep)
+{
+    ble_addr_t addrs[CONFIG_BT_NIMBLE_MAX_BONDS];
+    int n = 0;
+    if (ble_store_util_bonded_peers(addrs, &n, CONFIG_BT_NIMBLE_MAX_BONDS) != 0) {
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        if (ble_addr_cmp(&addrs[i], keep) != 0) {
+            log_addr("pruning stale bond", addrs[i].val);
+            (void)ble_store_util_delete_peer(&addrs[i]);
+        }
+    }
+}
+
 static void on_fingerprint_disc_complete(const struct peer *peer, int status, void *arg)
 {
     (void)arg;
     uint16_t conn = peer->conn_handle;
 
+    // Link loss mid-discovery (NimBLE fails in-flight GATT procedures with
+    // ENOTCONN before it raises DISCONNECT) or an ATT timeout says nothing
+    // about what the device is. Blacklist it like a failed connect, not for
+    // the fingerprint TTL — otherwise a genuine remote that dropped during
+    // the ~3.7 s walk is locked out for a minute.
+    uint32_t reject_ttl_ms = BLACKLIST_TTL_FINGERPRINT_MS;
     if (status != 0) {
+        if (status == BLE_HS_ENOTCONN || status == BLE_HS_ETIMEOUT) {
+            reject_ttl_ms = BLACKLIST_TTL_FAILED_CONNECT_MS;
+        }
         ESP_LOGW(TAG, "fingerprint: peer_disc_all failed status=%d — rejecting candidate", status);
         goto reject;
     }
 
-    dump_gatt_tree(peer);
     const char *reason = fingerprint_check(peer);
     if (reason != NULL) {
         ESP_LOGI(TAG, "fingerprint FAIL: %s — rejecting candidate", reason);
@@ -900,25 +966,34 @@ static void on_fingerprint_disc_complete(const struct peer *peer, int status, vo
     log_handle_map(&s_map);
     map_save(&s_map);
     if (s_pending_candidate_set) {
-        s_bonded_peer = s_pending_candidate;
+        // Identity, not advertised, address: a direct connect to the RPA would
+        // stop matching once the remote rotates it, leaving a same-boot link
+        // drop unable to reconnect until reboot.
+        s_bonded_peer = *candidate_bond_addr();
         s_have_bonded_peer = true;
+        if (s_pending_candidate_id_set) {
+            prune_other_bonds(&s_bonded_peer);
+        }
         s_pending_candidate_set = false;
     }
     if (s_discovery_window_timer != NULL) {
         (void)esp_timer_stop(s_discovery_window_timer);
     }
     // Use idle=0 here: this is a brand-new bond, there's no meaningful
-    // time-since-disconnect to publish. main.c keys on idle_ms == 0 in its
-    // on_connected_cb to enable the buffered-button suppression window
-    // (Apple flushes the pairing combo as buttery-press notifies once the
-    // button CCCD subscribes).
+    // time-since-disconnect to publish. idle == 0 is also what arms the
+    // post-pairing notify blackout at the end of the setup chain (Apple
+    // flushes the buffered pairing-combo presses once the button CCCD
+    // subscribes).
     complete_setup_chain(conn, 0);
     return;
 
 reject:
+    dump_gatt_tree(peer);
     if (s_pending_candidate_set) {
-        blacklist_add(s_pending_candidate.val, BLACKLIST_TTL_FINGERPRINT_MS);
-        (void)ble_store_util_delete_peer(&s_pending_candidate);
+        // The blacklist matches advertisements, so it keys on the advertised
+        // address; the bond record is keyed by identity.
+        blacklist_add(s_pending_candidate.val, reject_ttl_ms);
+        (void)ble_store_util_delete_peer(candidate_bond_addr());
         s_pending_candidate_set = false;
     }
     (void)ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
@@ -1105,7 +1180,12 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status != 0) {
-            ESP_LOGE(TAG, "connect failed: status=%d", event->connect.status);
+            if (event->connect.status == BLE_HS_EAPP) {
+                // Our own ble_gap_conn_cancel (siri_ble_repair), not a failure.
+                ESP_LOGI(TAG, "pending connect cancelled");
+            } else {
+                ESP_LOGE(TAG, "connect failed: status=%d", event->connect.status);
+            }
             if (s_mode == MODE_DISCOVERING && s_pending_candidate_set) {
                 blacklist_add(s_pending_candidate.val, BLACKLIST_TTL_FAILED_CONNECT_MS);
             }
@@ -1251,10 +1331,16 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
             } else {
                 // First connect since bridge boot. Use bridge uptime as a
                 // lower bound on idle duration. The value is mostly
-                // diagnostic now — main.c only branches on idle_ms == 0
-                // (fresh fingerprint pass) vs > 0 (warm reconnect) to
-                // gate the buffered-button suppression window.
+                // diagnostic; only idle_ms == 0 (fresh fingerprint pass,
+                // which arms the post-pairing blackout) carries meaning.
                 idle = now_ms();
+            }
+            if (s_mode == MODE_DISCOVERING && s_pending_candidate_set) {
+                struct ble_gap_conn_desc desc;
+                if (ble_gap_conn_find(conn, &desc) == 0) {
+                    s_pending_candidate_id = desc.peer_id_addr;
+                    s_pending_candidate_id_set = true;
+                }
             }
             s_pending_setup_conn = conn;
             s_pending_setup_idle_ms = idle;
@@ -1380,8 +1466,20 @@ void siri_ble_repair(void)
         }
         return;
     }
-    // No active connection — make sure scan is stopped (in case we're mid-
-    // discovery already), then restart the window from scratch.
+    // No active connection, but a connect may still be pending: the
+    // BLE_HS_FOREVER direct connect of BONDED_RECONNECT, or a discovery
+    // candidate's. NimBLE refuses to scan while one is (ble_gap_disc returns
+    // BLE_HS_EBUSY), which is exactly the dead-or-replaced-remote case Repair
+    // exists for. Cancelling is asynchronous — NimBLE reports it as a CONNECT
+    // event with BLE_HS_EAPP once the controller confirms — so set the mode
+    // first and let that handler's DISCOVERING branch start the scan.
+    s_mode = MODE_DISCOVERING;
+    if (ble_gap_conn_cancel() == 0) {
+        ESP_LOGI(TAG, "repair: cancelling pending connect; discovery starts when it completes");
+        return;
+    }
+    // Nothing pending (BLE_HS_EALREADY). Stop any scan in progress, then
+    // restart the window from scratch.
     (void)ble_gap_disc_cancel();
     start_discovery();
 }
@@ -1397,6 +1495,16 @@ void siri_ble_set_slave_latency(uint16_t latency)
     // ...which we round up via integer math, then clamp to the 16-bit
     // field's safe upper bound (1500 = 15 s; longer means runaway-detection
     // delay > 15 s which is already the high end of acceptable).
+    // NimBLE's ble_gap_validate_conn_params rejects latency > 499 and any
+    // timeout <= (1 + latency) * itvl_max / 4. With itvl_max = 12 and the
+    // 1500 ceiling below, 498 is the largest latency that passes; above it
+    // ble_gap_update_params returns EINVAL and the link silently stays on
+    // latency 0. Kconfig and the ESPHome schema cap at 498 too — this clamp
+    // only guards direct callers.
+    if (latency > SLAVE_LATENCY_MAX) {
+        ESP_LOGW(TAG, "slave_latency %u exceeds %u; clamping", latency, SLAVE_LATENCY_MAX);
+        latency = SLAVE_LATENCY_MAX;
+    }
     uint32_t numerator = (uint32_t)(1 + latency) * s_low_power_conn_params.itvl_max * 25;
     uint32_t timeout = (numerator + 79) / 80;  // ceil(numerator / 80)
     if (timeout < 100)

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 #include "esp_timer.h"
 
@@ -42,10 +43,9 @@ class SiriRemoteMicrophone : public microphone::Microphone, public Component {
   }
 
   // Called from the siri_audio decode task (CPU1 prio 5) via
-  // SiriRemoteHub::on_pcm. Skips delivery while stopped. Allocates a
-  // std::vector<uint8_t> per frame because that's the data_callback
-  // contract — voice_assistant copies into its ring buffer immediately,
-  // so the vector dies at the end of this call.
+  // SiriRemoteHub::on_pcm. Skips delivery while stopped. The data_callback
+  // contract takes a std::vector<uint8_t>; voice_assistant copies out of it
+  // before returning, so one reused member buffer serves every frame.
   void fire_data(const int16_t *samples, size_t count);
 
   // Called by SiriRemoteHub on Apple's audio session boundaries. start
@@ -58,6 +58,12 @@ class SiriRemoteMicrophone : public microphone::Microphone, public Component {
   static void silence_thunk(void *arg);
 
   esp_timer_handle_t silence_timer_{nullptr};
+  // Decode-task-only frame buffer. Reused so the ~50 frames/s of a voice
+  // session don't each malloc/free 640 B of internal RAM. Silence has its own
+  // (static) buffer because it is delivered from the esp_timer task, and
+  // esp_timer_stop() does not wait for an in-flight callback — the two
+  // producers can overlap around session start/end.
+  std::vector<uint8_t> pcm_buf_;
 };
 
 }  // namespace siri_remote

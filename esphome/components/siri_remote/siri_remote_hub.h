@@ -158,6 +158,8 @@ class SiriRemoteHub : public Component {
   // once per pulse. Touched only from the loop task inside emit_event's
   // deferred lambda, so it needs no synchronisation.
   bool api_gate_logged_{false};
+  // HA device name for the event payload; filled on first use, loop task only.
+  std::string device_name_;
 
 #ifdef SIRI_REMOTE_DEBUG_PCM_TCP
   int pcm_socket_{-1};

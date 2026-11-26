@@ -144,7 +144,7 @@ menu "Siri Bridge Configuration"
     config BLE_SLAVE_LATENCY_DEFAULT
         int "BLE slave-latency default"
         default 400
-        range 0 500
+        range 0 498
         help
             Initial BLE slave-latency value applied after the post-bond
             setup chain completes. The remote may deep-sleep between

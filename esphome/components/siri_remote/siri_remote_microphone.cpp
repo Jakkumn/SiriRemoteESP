@@ -18,6 +18,7 @@ void SiriRemoteMicrophone::setup() {
   // gen-3 Opus decode produces 16 kHz S16LE mono — voice_assistant's
   // exact ingestion format, no conversion required.
   this->audio_stream_info_ = audio::AudioStreamInfo(16, 1, 16000);
+  this->pcm_buf_.reserve(SILENCE_FRAME_SAMPLES * sizeof(int16_t));
 
   esp_timer_create_args_t ta = {};
   ta.callback = SiriRemoteMicrophone::silence_thunk;
@@ -33,10 +34,10 @@ void SiriRemoteMicrophone::dump_config() {
 void SiriRemoteMicrophone::fire_data(const int16_t *samples, size_t count) {
   if (this->state_ != microphone::STATE_RUNNING)
     return;
-  const size_t bytes = count * sizeof(int16_t);
-  std::vector<uint8_t> buf(bytes);
-  std::memcpy(buf.data(), samples, bytes);
-  this->data_callbacks_.call(buf);
+  const auto *bytes = reinterpret_cast<const uint8_t *>(samples);
+  // assign() reuses the reserved capacity: no allocation after the first frame.
+  this->pcm_buf_.assign(bytes, bytes + count * sizeof(int16_t));
+  this->data_callbacks_.call(this->pcm_buf_);
 }
 
 void SiriRemoteMicrophone::start_silence() {
@@ -57,8 +58,10 @@ void SiriRemoteMicrophone::silence_thunk(void *arg) {
   auto *self = static_cast<SiriRemoteMicrophone *>(arg);
   if (self->state_ != microphone::STATE_RUNNING)
     return;
-  static const int16_t silence[SILENCE_FRAME_SAMPLES] = {0};
-  self->fire_data(silence, SILENCE_FRAME_SAMPLES);
+  // Built once and handed over as-is: no per-tick allocation or copy, and it
+  // never touches pcm_buf_ (see the header for why the producers are split).
+  static const std::vector<uint8_t> SILENCE(SILENCE_FRAME_SAMPLES * sizeof(int16_t), 0);
+  self->data_callbacks_.call(SILENCE);
 }
 
 }  // namespace siri_remote

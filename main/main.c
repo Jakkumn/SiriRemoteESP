@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
@@ -82,8 +83,9 @@ static mqtt_entity_t *s_repair_entity;
 // which takes the MQTT client mutex and can block on the outbox — while
 // holding our lock, on the high-priority esp_timer task, against the NimBLE
 // notify path. That was tolerable at a few events per interaction; it is not
-// at 10 Hz. So the emit callback only stages here, and flush_pulses()
-// publishes once the lock is released. Sized for every button held at once.
+// at 10 Hz. So the emit callback only stages here, and flush_pulses() hands
+// the batch to the publisher task once the lock is released. Sized for every
+// button held at once.
 #define PULSE_STAGE_MAX 13
 typedef struct {
     siri_button_bit_t button;
@@ -93,12 +95,10 @@ typedef struct {
 static staged_pulse_t s_pulse_stage[PULSE_STAGE_MAX];
 static size_t s_pulse_staged;
 // On first-bond, Apple's HID flushes the press/release notifies that were
-// buffered during the bond window (the TV+VolUp pairing-combo the user
-// just held) right after the button CCCD subscribe lands. Without
-// suppression they surface as phantom click events in HA. We squash button
-// notifies for a short window after a fresh-bond on_connected; the window
-// is keyed on idle_ms==0, which is unique to siri_ble's DISCOVERING→
-// CONNECTED transition (bonded reconnects always pass a non-zero idle).
+// buffered during the bond window (the pairing combo the user just held)
+// right after the button CCCD subscribe lands. Without suppression they
+// surface as phantom presses in HA. siri_ble drops all notifies for this
+// long after a fresh bond's setup chain; we only supply the duration.
 #define PAIRING_FLUSH_SUPPRESS_MS 1500
 // Activity tracking for the optional idle-disconnect path. Compiled out
 // entirely in the default always-connected mode (CONFIG_IDLE_DISCONNECT_MS=0).
@@ -123,13 +123,71 @@ static uint32_t now_ms(void)
 }
 
 // --- MQTT publish helpers ---
+//
+// esp_mqtt_client_publish sends synchronously in the caller's task and can
+// block for the network timeout (~10 s) when Wi-Fi is struggling. Runtime
+// publishes originate on the NimBLE host task (battery, charging, remote
+// status, button-driven pulses) and the esp_timer task (repeat pulses) —
+// a stall on the first stops BLE notify processing, and a stall on the
+// second delays every esp_timer callback in the system, NimBLE's callouts
+// included. So those callers enqueue, and a low-priority publisher task does
+// the blocking send. A full queue drops: a pulse costs one missed increment,
+// and retained state is republished on the next MQTT connect.
+//
+// The MQTT event handler's own discovery / LWT publishes stay direct
+// (mqtt_publish_now): they already run on the MQTT task, and their payloads
+// are larger than a queue slot.
 
-static void mqtt_publish(const char *topic, const char *payload, int len, int qos, bool retain)
+#define PUB_PAYLOAD_MAX 192  // largest runtime payload is a pulse event
+#define PUB_QUEUE_DEPTH 16
+typedef struct {
+    const char *topic;  // always a TOPIC_* literal, so the pointer outlives the item
+    uint16_t len;
+    uint8_t qos;
+    bool retain;
+    char payload[PUB_PAYLOAD_MAX];
+} pub_msg_t;
+static QueueHandle_t s_pub_queue;
+static uint32_t s_pub_dropped;  // log-rate-limit only; a lost increment is harmless
+
+static void mqtt_publish_now(const char *topic, const char *payload, int len, int qos, bool retain)
 {
     if (!s_mqtt_connected) {
         return;
     }
     esp_mqtt_client_publish(s_mqtt, topic, payload, len, qos, retain ? 1 : 0);
+}
+
+// Non-blocking. len == 0 means NUL-terminated, matching esp_mqtt_client_publish.
+static void mqtt_publish(const char *topic, const char *payload, int len, int qos, bool retain)
+{
+    if (!s_mqtt_connected) {
+        return;  // same as before the queue: offline publishes go nowhere
+    }
+    size_t n = len > 0 ? (size_t)len : strlen(payload);
+    if (n > PUB_PAYLOAD_MAX) {
+        ESP_LOGE(TAG, "publish to %s dropped: %u B exceeds queue slot", topic, (unsigned)n);
+        return;
+    }
+    pub_msg_t msg = {.topic = topic, .len = (uint16_t)n, .qos = (uint8_t)qos, .retain = retain};
+    memcpy(msg.payload, payload, n);
+    if (xQueueSend(s_pub_queue, &msg, 0) != pdTRUE) {
+        if ((++s_pub_dropped & 31) == 1) {
+            ESP_LOGW(TAG, "publish queue full — dropped %" PRIu32 " message(s) so far",
+                     s_pub_dropped);
+        }
+    }
+}
+
+static void publisher_task(void *arg)
+{
+    (void)arg;
+    pub_msg_t msg;
+    for (;;) {
+        if (xQueueReceive(s_pub_queue, &msg, portMAX_DELAY) == pdTRUE) {
+            mqtt_publish_now(msg.topic, msg.payload, msg.len, msg.qos, msg.retain);
+        }
+    }
 }
 
 static void publish_ha_discovery_event(void)
@@ -155,7 +213,7 @@ static void publish_ha_discovery_event(void)
                                   "\"payload_available\":\"online\","
                                   "\"payload_not_available\":\"offline\""
                                   "}";
-    mqtt_publish(TOPIC_DISCOVERY_EVENT, PAYLOAD, sizeof(PAYLOAD) - 1, 1, /*retain*/ true);
+    mqtt_publish_now(TOPIC_DISCOVERY_EVENT, PAYLOAD, sizeof(PAYLOAD) - 1, 1, /*retain*/ true);
 }
 
 // Battery + charging are continuous-state sensors. Their availability tracks
@@ -183,7 +241,7 @@ static void publish_ha_discovery_battery(void)
         "\"device_class\":\"battery\","
         "\"unit_of_measurement\":\"%\","
         "\"device\":{\"identifiers\":[\"siri_remote_bridge\"]}," AVAILABILITY_BRIDGE_AND_REMOTE "}";
-    mqtt_publish(TOPIC_DISCOVERY_BATTERY, PAYLOAD, sizeof(PAYLOAD) - 1, 1, /*retain*/ true);
+    mqtt_publish_now(TOPIC_DISCOVERY_BATTERY, PAYLOAD, sizeof(PAYLOAD) - 1, 1, /*retain*/ true);
 }
 
 static void publish_ha_discovery_charging(void)
@@ -195,7 +253,7 @@ static void publish_ha_discovery_charging(void)
         "\"state_topic\":\"" TOPIC_CHARGING "\","
         "\"icon\":\"mdi:battery-charging\","
         "\"device\":{\"identifiers\":[\"siri_remote_bridge\"]}," AVAILABILITY_BRIDGE_AND_REMOTE "}";
-    mqtt_publish(TOPIC_DISCOVERY_CHARGING, PAYLOAD, sizeof(PAYLOAD) - 1, 1, /*retain*/ true);
+    mqtt_publish_now(TOPIC_DISCOVERY_CHARGING, PAYLOAD, sizeof(PAYLOAD) - 1, 1, /*retain*/ true);
 }
 
 static void publish_remote_status(bool connected)
@@ -257,8 +315,8 @@ static void emit_cb(const button_pulse_event_t *evt, void *user)
     };
 }
 
-// Drain whatever the last feed/tick staged and publish it. Must be called
-// with s_pulse_lock NOT held.
+// Drain whatever the last feed/tick staged and queue it for the publisher
+// task. Must be called with s_pulse_lock NOT held.
 static void flush_pulses(void)
 {
     staged_pulse_t batch[PULSE_STAGE_MAX];
@@ -440,10 +498,6 @@ static void on_connected_cb(uint32_t idle_ms, void *user)
     s_remote_connected = true;
     publish_remote_status(true);
     MARK_ACTIVITY();  // start the idle clock (no-op unless CONFIG_IDLE_DISCONNECT_MS>0)
-    if (idle_ms == 0) {
-        // Fresh bond from siri_ble's DISCOVERING→CONNECTED transition.
-        // Suppress buffered HID flushes for the next 1.5 s.
-    }
 }
 
 static void on_disconnected_cb(void *user)
@@ -642,6 +696,13 @@ void app_main(void)
 
     s_pulse_lock = xSemaphoreCreateMutex();
     assert(s_pulse_lock != NULL);
+
+    // Before anything that can publish: BLE callbacks, the tick timer, MQTT.
+    s_pub_queue = xQueueCreate(PUB_QUEUE_DEPTH, sizeof(pub_msg_t));
+    assert(s_pub_queue != NULL);
+    BaseType_t ok = xTaskCreate(publisher_task, "mqtt_pub", 4096, NULL, tskIDLE_PRIORITY + 2, NULL);
+    assert(ok == pdPASS);
+    (void)ok;
 
     button_pulse_config_t pulse_cfg = {
         .repeat_interval_ms = CONFIG_PULSE_REPEAT_INTERVAL_MS,

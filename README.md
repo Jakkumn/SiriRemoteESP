@@ -278,10 +278,10 @@ running the standalone firmware.
 ## Pairing your remote
 
 Both build paths use the same pairing flow. The bridge has no hardcoded MAC.
-On first boot (empty NVS) it enters a 5-minute **discovery window**: an active
+On first boot (empty NVS) it enters a 5-minute **discovery window**: a passive
 BLE scan filtered on the HID service UUID (`0x1812`), with a proximity gate
-(RSSI ≥ −55 dBm) and a post-connect fingerprint check (HID + ≥3 Report chars
-+ Apple custom service + button value handle `0x0039`).
+(RSSI ≥ −55 dBm) and a post-connect fingerprint check (HID + ≥3 notify-capable
+Report chars + Apple custom service + a derivable GATT handle map).
 
 ### First-time pair (or pair to a new bridge)
 
