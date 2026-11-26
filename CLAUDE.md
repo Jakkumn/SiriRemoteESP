@@ -209,10 +209,14 @@ There is no on-device test harness; anything touching `siri_ble.c` or `siri_audi
   component — every `host/ble_hs.h` include then fails with a message that blames
   `INCLUDE_DIRS`. Setting `CONFIG_BT_ENABLED` does **not** help: sdkconfig options cannot
   un-exclude a component.
-- **Build against more than one ESPHome release before tagging.** `uv.lock` pins a single
-  version, and v0.1.0 shipped broken on current ESPHome because every check ran on 2026.7.1
-  while users' Builder add-ons run 2026.9.x. `uvx --from esphome==<ver> esphome compile`
-  gives an isolated check without disturbing the project venv.
+- **Track the current ESPHome release line; older releases are unsupported.** The floor in
+  `pyproject.toml` is 2026.11.0 (the microphone uses `publish_audio_()`, the hub uses
+  `fire_homeassistant_event`). Keep `uv.lock` on the release users' Builder add-ons run —
+  v0.1.0 shipped broken because every check ran on a stale locked 2026.7.1 while users were
+  on 2026.9.x. When a new ESPHome release lands, compile against it before tagging:
+  `uvx --from esphome==<ver> esphome compile` is an isolated check, then bump the lock with
+  `uv lock --upgrade-package esphome`. `[tool.uv] environments` excludes Intel macOS, where
+  ESPHome 2026.11's own dependency pins are unsatisfiable.
 - Comments in this codebase record *why* (empirical findings, Apple firmware behaviour,
   rejected alternatives). Keep that density; don't strip them as noise.
 

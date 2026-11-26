@@ -1,8 +1,8 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
-#include <vector>
 
 #include "esphome/components/microphone/microphone.h"
 #include "esphome/core/component.h"
@@ -36,9 +36,7 @@ class SiriRemoteMicrophone : public microphone::Microphone, public Component {
 
   // Called from the siri_audio decode task (CPU1 prio 5) via
   // SiriRemoteHub::on_pcm, for decoded audio and post-release silence alike.
-  // Skips delivery while stopped. The data_callback contract takes a
-  // std::vector<uint8_t>; voice_assistant copies out of it before returning,
-  // so one reused member buffer serves every frame.
+  // Skips delivery while stopped or when nothing is listening.
   void fire_data(const int16_t *samples, size_t count);
 
   // Called by SiriRemoteHub on Apple's audio session boundaries. start
@@ -49,9 +47,11 @@ class SiriRemoteMicrophone : public microphone::Microphone, public Component {
 
  protected:
   // Frame buffer, touched only by the decode task — the single producer of
-  // both real and silent frames. Reused so the ~50 frames/s of a voice
-  // session don't each malloc/free 640 B of internal RAM.
-  std::vector<uint8_t> pcm_buf_;
+  // both real and silent frames. publish_audio_() needs a buffer the platform
+  // owns and may write, because it zeroes the data in place while muted; the
+  // decoder's PCM (and the silence frame, which is const) are copied in here
+  // rather than handed over. Fixed-size: one 20 ms frame, 640 B.
+  std::array<uint8_t, SIRI_AUDIO_FRAME_SAMPLES * sizeof(int16_t)> pcm_buf_{};
 };
 
 }  // namespace siri_remote

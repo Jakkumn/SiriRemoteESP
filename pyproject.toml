@@ -5,14 +5,24 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12,<3.15"
 dependencies = [
-    # Verified against 2026.7.1 and 2026.9.1; the 2026.11 fix below was
-    # compiled against 2026.10.2 and 2026.11.1 only. 2026.9
-    # began excluding built-in IDF components by default (`bt`, `esp_coex`),
-    # which this component now requests explicitly — see _pin_sdkconfig()'s
-    # neighbours in esphome/components/siri_remote/__init__.py. 2026.11 changed
-    # the HA-action message string fields to ProgmemStringRef, which is why the
-    # hub fires events through CustomAPIDevice::fire_homeassistant_event rather
-    # than building the message itself. Bump the floor only after compiling
-    # against the new version.
-    "esphome>=2026.7.1",
+    # The project tracks the current ESPHome release line; older releases
+    # are not built or supported. 2026.11 is a hard floor: the microphone
+    # publishes through Microphone::publish_audio_() (added in 2026.11,
+    # replacing DataCallbackManager::call, which 2027.5.0 removes), and the
+    # hub fires events through CustomAPIDevice::fire_homeassistant_event
+    # because 2026.11 changed the HA-action message string fields to
+    # ProgmemStringRef. 2026.9's built-in IDF component exclusion (`bt`,
+    # `esp_coex`) is handled in esphome/components/siri_remote/__init__.py.
+    # Bump the floor only after compiling against the new version.
+    "esphome>=2026.11.0",
+]
+
+[tool.uv]
+# ESPHome 2026.11's own metadata is unsatisfiable on Intel macOS: it pins
+# cryptography==50.0.2 there while its aioesphomeapi==46.25.1 requires
+# cryptography<49. uv resolves for every platform at once, so without this
+# the lock fails everywhere. Drop it once upstream reconciles the pins.
+environments = [
+    "sys_platform != 'darwin'",
+    "sys_platform == 'darwin' and platform_machine != 'x86_64'",
 ]
