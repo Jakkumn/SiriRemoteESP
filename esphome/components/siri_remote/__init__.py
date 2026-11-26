@@ -127,14 +127,22 @@ def _pin_sdkconfig():
     so("CONFIG_BT_NIMBLE_MAX_CONNECTIONS", 1)
     so("CONFIG_BT_NIMBLE_NVS_PERSIST", True)
 
-    # PSRAM is NOT used implicitly by malloc — lwIP/MQTT TX paths are
-    # timing-sensitive to heap latency and PSRAM SPI access caused MQTT
-    # keepalive timeouts during Phase 3.M bring-up. siri_audio opts in
-    # via heap_caps_malloc(MALLOC_CAP_SPIRAM) for the decoder only.
+    # Unlike standalone, PSRAM *is* in the malloc pool here. SPIRAM_USE_MALLOC
+    # is the IDF default once SPIRAM is on, and ESPHome builds have always run
+    # with it; it is pinned so that stays true rather than depending on the
+    # default. Standalone turns it off because PSRAM-backed lwIP/MQTT buffers
+    # caused MQTT keepalive timeouts during Phase 3.M bring-up. That hazard
+    # doesn't carry over: TRY_ALLOCATE_WIFI_LWIP stays off, so the network
+    # stack is internal, and allocations under SPIRAM_MALLOC_ALWAYSINTERNAL
+    # (16 KiB) never leave internal RAM. Switching it off here would push
+    # every large ESPHome/voice_assistant buffer into internal SRAM, which
+    # this firmware has not been tested with. siri_audio requests PSRAM
+    # explicitly (MALLOC_CAP_SPIRAM) on both paths either way.
     so("CONFIG_SPIRAM", True)
     so("CONFIG_SPIRAM_MODE_OCT", True)
     so("CONFIG_SPIRAM_TYPE_AUTO", True)
     so("CONFIG_SPIRAM_SPEED_80M", True)
+    so("CONFIG_SPIRAM_USE_MALLOC", True)
 
     so("CONFIG_ESP_COEX_SW_COEXIST_ENABLE", True)
 
@@ -149,24 +157,29 @@ def _pin_sdkconfig():
     # ESPHome defaults that ceiling to ERROR(1), which silently deletes every
     # ESP_LOGI in siri_ble.c — including the whole pairing/discovery
     # narrative ("disconnected, reason=0x…", "candidate failed pre-fingerprint
-    # — hold Back+VolUp…"). The standalone build sets DEBUG(4) and so has full
-    # BLE diagnostics; without this the two paths differ precisely when you
-    # most need the logs. Match standalone's sdkconfig.defaults.
+    # — hold Back+VolUp…").
     #
-    # MAXIMUM is the compile-time ceiling; DEFAULT is the runtime level. Both
-    # choice symbols and their ints must be written, and the ERROR choice
-    # cleared, or kconfiglib keeps the old selection.
+    # INFO(3), not DEBUG(4) as standalone uses: under ESPHome this ceiling is
+    # the *only* filter on ESP-IDF output. ESPHome builds with
+    # CONFIG_LOG_DYNAMIC_LEVEL_CONTROL off and TAG_LEVEL_IMPL_NONE, where
+    # esp_log_is_tag_loggable() returns true unconditionally — so
+    # CONFIG_LOG_DEFAULT_LEVEL and esp_log_level_set() are no-ops, and every
+    # IDF component logs at whatever the ceiling compiles in. The closed-source
+    # Wi-Fi driver also derives its own level from this ceiling
+    # (esp_wifi_set_log_level in wifi_init.c). At DEBUG it emits several lines
+    # per beacon-timing adjustment ("bcnd: 2720 -> 2704", "bssid equal"),
+    # continuously. siri_ble's diagnostics are INFO; the one ESP_LOGD there
+    # (sub-threshold RSSI rejects) is not worth that.
     #
-    # The runtime default is WARN, not INFO: DEFAULT applies to every IDF tag,
-    # and at INFO the Wi-Fi driver, phy, esp_netif etc. flood the log on every
-    # (re)association. SiriRemoteHub::setup() raises only our own tags
-    # (siri_ble, siri_audio) back to INFO with esp_log_level_set().
+    # Both choice symbols and their ints must be written, and the ERROR choice
+    # cleared, or kconfiglib keeps the old selection. DEFAULT is set to match
+    # for the day dynamic control is enabled; today it has no effect.
     so("CONFIG_LOG_MAXIMUM_LEVEL_ERROR", False)
-    so("CONFIG_LOG_MAXIMUM_LEVEL_DEBUG", True)
-    so("CONFIG_LOG_MAXIMUM_LEVEL", 4)
+    so("CONFIG_LOG_MAXIMUM_LEVEL_INFO", True)
+    so("CONFIG_LOG_MAXIMUM_LEVEL", 3)
     so("CONFIG_LOG_DEFAULT_LEVEL_ERROR", False)
-    so("CONFIG_LOG_DEFAULT_LEVEL_WARN", True)
-    so("CONFIG_LOG_DEFAULT_LEVEL", 2)
+    so("CONFIG_LOG_DEFAULT_LEVEL_INFO", True)
+    so("CONFIG_LOG_DEFAULT_LEVEL", 3)
 
 
 async def to_code(config):

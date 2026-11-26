@@ -17,19 +17,11 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 
-#include "nimble/nimble_port.h"
-#include "nimble/nimble_port_freertos.h"
-
 #include "siri_remote_microphone.h"
 
 #ifdef SIRI_REMOTE_DEBUG_PCM_TCP
-#include "lwip/sockets.h"
-#include <netinet/in.h>
-#include <arpa/inet.h>
+#include "siri_audio_pcm_tcp.h"
 #endif
-
-// IDF ships ble_store_config_init in libbt.a but doesn't publish a header.
-extern "C" void ble_store_config_init(void);
 
 namespace esphome {
 namespace siri_remote {
@@ -67,12 +59,6 @@ static void audio_session_end_thunk(void *user) {
 }
 static void audio_pcm_thunk(const int16_t *samples, size_t count, void *user) {
   static_cast<SiriRemoteHub *>(user)->on_pcm(samples, count);
-}
-
-static void nimble_host_task(void *param) {
-  (void) param;
-  nimble_port_run();
-  nimble_port_freertos_deinit();
 }
 
 // Action attached to voice_assistant's tts_end_trigger so we can react
@@ -123,11 +109,6 @@ void SiriRemoteHub::setup() {
 
   start_tick_timer_();
   start_nimble_();
-
-  // siri_ble_set_slave_latency caches the value internally and applies it
-  // on the next CONN_UPDATE (or on the next bonded reconnect if no
-  // connection is up yet). Safe to call after siri_ble_start.
-  siri_ble_set_slave_latency(ble_slave_latency_);
 
   if (voice_assistant_ != nullptr && auto_finish_response_) {
     // Bind a one-shot Action onto voice_assistant's tts_end_trigger so we
@@ -188,15 +169,6 @@ void SiriRemoteHub::start_tick_timer_() {
 }
 
 void SiriRemoteHub::start_nimble_() {
-  esp_log_level_set("NimBLE", ESP_LOG_WARN);
-  // The IDF runtime default is WARN (see _pin_sdkconfig) to keep the Wi-Fi
-  // driver quiet; our pure-C components' pairing/discovery narrative is INFO.
-  esp_log_level_set("siri_ble", ESP_LOG_INFO);
-  esp_log_level_set("siri_audio", ESP_LOG_INFO);
-
-  ESP_ERROR_CHECK(nimble_port_init());
-  ble_store_config_init();
-
   siri_ble_config_t ble_cfg = {};
   ble_cfg.on_notify = ble_notify_thunk;
   ble_cfg.on_connected = ble_connected_thunk;
@@ -205,30 +177,20 @@ void SiriRemoteHub::start_nimble_() {
   // siri_ble owns the post-pairing blackout now — it covers every
   // notification, not just buttons, and keeps both build paths identical.
   ble_cfg.pairing_flush_suppress_ms = pairing_flush_suppress_ms_;
+  ble_cfg.idle_disconnect_ms = idle_disconnect_ms_;
+  ble_cfg.slave_latency = ble_slave_latency_;
+  // Brings up NimBLE and starts its host task.
   ESP_ERROR_CHECK(siri_ble_start(&ble_cfg));
-
-  nimble_port_freertos_init(nimble_host_task);
 }
 
 void SiriRemoteHub::tick() {
-  uint32_t now = now_ms();
-  {
-    LockGuard guard(pulse_lock_);
-    button_pulse_tick(pulse_, now);
-  }
-  if (idle_disconnect_ms_ > 0) {
-    uint32_t last = last_activity_ms_;
-    if (last != 0 && (now - last) > idle_disconnect_ms_) {
-      last_activity_ms_ = 0;  // single-shot per idle window
-      siri_ble_idle_disconnect();
-    }
-  }
+  LockGuard guard(pulse_lock_);
+  button_pulse_tick(pulse_, now_ms());
 }
 
 void SiriRemoteHub::on_ble_notify(uint16_t attr_handle, const uint8_t *data,
                                   size_t len) {
   const uint32_t now = now_ms();
-  last_activity_ms_ = now;
 
   switch (attr_handle) {
     case SIRI_HANDLE_BUTTON: {
@@ -312,14 +274,11 @@ void SiriRemoteHub::on_ble_notify(uint16_t attr_handle, const uint8_t *data,
 }
 
 void SiriRemoteHub::on_ble_connected(uint32_t idle_ms) {
-  const uint32_t now = now_ms();
   ESP_LOGI(TAG, "remote connected (idle %" PRIu32 " ms)", idle_ms);
-  last_activity_ms_ = now;
 }
 
 void SiriRemoteHub::on_ble_disconnected() {
   ESP_LOGI(TAG, "remote disconnected");
-  last_activity_ms_ = 0;
   LockGuard guard(pulse_lock_);
   button_pulse_reset(pulse_);
 }
@@ -342,7 +301,7 @@ void SiriRemoteHub::on_audio_session_start() {
     microphone_->stop_silence();
   }
 #ifdef SIRI_REMOTE_DEBUG_PCM_TCP
-  pcm_tcp_open();
+  siri_audio_pcm_tcp_open(pcm_tcp_host_.c_str(), pcm_tcp_port_);
 #endif
 }
 
@@ -356,7 +315,7 @@ void SiriRemoteHub::on_audio_session_end() {
     microphone_->start_silence();
   }
 #ifdef SIRI_REMOTE_DEBUG_PCM_TCP
-  pcm_tcp_close();
+  siri_audio_pcm_tcp_close();
 #endif
 }
 
@@ -365,7 +324,7 @@ void SiriRemoteHub::on_pcm(const int16_t *samples, size_t count) {
     microphone_->fire_data(samples, count);
   }
 #ifdef SIRI_REMOTE_DEBUG_PCM_TCP
-  pcm_tcp_send(samples, count);
+  siri_audio_pcm_tcp_send(samples, count);
 #endif
 }
 
@@ -449,55 +408,6 @@ void SiriRemoteHub::emit_event(const button_pulse_event_t *evt) {
         });
   });
 }
-
-#ifdef SIRI_REMOTE_DEBUG_PCM_TCP
-void SiriRemoteHub::pcm_tcp_open() {
-  int sock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-  if (sock < 0) {
-    ESP_LOGW(TAG, "pcm_tcp: socket() rc=%d errno=%d", sock, errno);
-    return;
-  }
-  struct sockaddr_in addr = {};
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(pcm_tcp_port_);
-  if (::inet_aton(pcm_tcp_host_.c_str(), &addr.sin_addr) == 0) {
-    ESP_LOGW(TAG, "pcm_tcp: inet_aton('%s') failed", pcm_tcp_host_.c_str());
-    ::close(sock);
-    return;
-  }
-  if (::connect(sock, (struct sockaddr *) &addr, sizeof(addr)) != 0) {
-    ESP_LOGW(TAG, "pcm_tcp: connect %s:%u errno=%d (run `nc -l %u` on host)",
-             pcm_tcp_host_.c_str(), (unsigned) pcm_tcp_port_, errno,
-             (unsigned) pcm_tcp_port_);
-    ::close(sock);
-    return;
-  }
-  ESP_LOGI(TAG, "pcm_tcp: streaming to %s:%u", pcm_tcp_host_.c_str(),
-           (unsigned) pcm_tcp_port_);
-  pcm_socket_ = sock;
-}
-
-void SiriRemoteHub::pcm_tcp_close() {
-  int sock = pcm_socket_;
-  pcm_socket_ = -1;
-  if (sock >= 0) {
-    ::close(sock);
-    ESP_LOGI(TAG, "pcm_tcp: stream closed");
-  }
-}
-
-void SiriRemoteHub::pcm_tcp_send(const int16_t *samples, size_t count) {
-  int sock = pcm_socket_;
-  if (sock < 0)
-    return;
-  ssize_t n = ::send(sock, samples, count * sizeof(int16_t), 0);
-  if (n < 0) {
-    ESP_LOGW(TAG, "pcm_tcp: send errno=%d; closing", errno);
-    pcm_socket_ = -1;
-    ::close(sock);
-  }
-}
-#endif  // SIRI_REMOTE_DEBUG_PCM_TCP
 
 }  // namespace siri_remote
 }  // namespace esphome

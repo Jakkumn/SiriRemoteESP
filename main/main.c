@@ -21,24 +21,14 @@
 #include "nvs_flash.h"
 #include "sdkconfig.h"
 
-#include "nimble/nimble_port.h"
-#include "nimble/nimble_port_freertos.h"
-
-#ifdef CONFIG_DEBUG_AUDIO_PCM_TCP
-#include "lwip/sockets.h"
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#endif
-
 #include "button_pulse.h"
 #include "mqtt_entity.h"
 #include "report_decoder.h"
 #include "siri_audio.h"
+#ifdef CONFIG_DEBUG_AUDIO_PCM_TCP
+#include "siri_audio_pcm_tcp.h"
+#endif
 #include "siri_ble.h"
-
-// Forward-declared — ESP-IDF ships the implementation in libbt.a but doesn't
-// expose the header via include path.
-void ble_store_config_init(void);
 
 static const char *TAG = "main";
 
@@ -100,22 +90,6 @@ static size_t s_pulse_staged;
 // surface as phantom presses in HA. siri_ble drops all notifies for this
 // long after a fresh bond's setup chain; we only supply the duration.
 #define PAIRING_FLUSH_SUPPRESS_MS 1500
-// Activity tracking for the optional idle-disconnect path. Compiled out
-// entirely in the default always-connected mode (CONFIG_IDLE_DISCONNECT_MS=0).
-#if CONFIG_IDLE_DISCONNECT_MS > 0
-static volatile uint32_t s_last_activity_ms;
-#define MARK_ACTIVITY()                                                                            \
-    do {                                                                                           \
-        s_last_activity_ms = now_ms();                                                             \
-    } while (0)
-#define MARK_INACTIVE()                                                                            \
-    do {                                                                                           \
-        s_last_activity_ms = 0;                                                                    \
-    } while (0)
-#else
-#define MARK_ACTIVITY() ((void)0)
-#define MARK_INACTIVE() ((void)0)
-#endif
 
 static uint32_t now_ms(void)
 {
@@ -358,73 +332,23 @@ static void flush_pulses(void)
 }
 
 #ifdef CONFIG_DEBUG_AUDIO_PCM_TCP
-// --- Phase 5.A.3 TCP PCM sink (development validation only) ---
-//
-// On Mic-button-driven audio session start: open a TCP connection to the
-// configured host:port. For each decoded Opus frame: send the raw int16
-// PCM samples. On session end: close. Listener side runs:
-//
-//   nc -l <PORT> | ffplay -f s16le -ar 16000 -ac 1 -
-//
-// All errors (failed connect, send failure, host unreachable) are logged
-// once and the socket is dropped — we don't want to interrupt the BLE
-// path or the decoder over a debug channel. Streaming resumes on the
-// next session.
-
-static volatile int s_pcm_socket = -1;
-
-static void pcm_tcp_open_socket(void *user)
+// Development-only PCM sink; see siri_audio_pcm_tcp.h.
+static void pcm_tcp_open_cb(void *user)
 {
     (void)user;
-    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (sock < 0) {
-        ESP_LOGW(TAG, "pcm_tcp: socket() rc=%d errno=%d", sock, errno);
-        return;
-    }
-    struct sockaddr_in addr = {
-        .sin_family = AF_INET,
-        .sin_port = htons(CONFIG_AUDIO_PCM_TCP_PORT),
-    };
-    if (inet_aton(CONFIG_AUDIO_PCM_TCP_HOST, &addr.sin_addr) == 0) {
-        ESP_LOGW(TAG, "pcm_tcp: inet_aton('%s') failed", CONFIG_AUDIO_PCM_TCP_HOST);
-        close(sock);
-        return;
-    }
-    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        ESP_LOGW(TAG, "pcm_tcp: connect %s:%d errno=%d (run `nc -l %d` on the host)",
-                 CONFIG_AUDIO_PCM_TCP_HOST, CONFIG_AUDIO_PCM_TCP_PORT, errno,
-                 CONFIG_AUDIO_PCM_TCP_PORT);
-        close(sock);
-        return;
-    }
-    ESP_LOGI(TAG, "pcm_tcp: streaming to %s:%d", CONFIG_AUDIO_PCM_TCP_HOST,
-             CONFIG_AUDIO_PCM_TCP_PORT);
-    s_pcm_socket = sock;
+    siri_audio_pcm_tcp_open(CONFIG_AUDIO_PCM_TCP_HOST, CONFIG_AUDIO_PCM_TCP_PORT);
 }
 
-static void pcm_tcp_close_socket(void *user)
+static void pcm_tcp_close_cb(void *user)
 {
     (void)user;
-    int sock = s_pcm_socket;
-    s_pcm_socket = -1;
-    if (sock >= 0) {
-        close(sock);
-        ESP_LOGI(TAG, "pcm_tcp: stream closed");
-    }
+    siri_audio_pcm_tcp_close();
 }
 
-static void pcm_tcp_send_frame(const int16_t *samples, size_t count, void *user)
+static void pcm_tcp_send_cb(const int16_t *samples, size_t count, void *user)
 {
     (void)user;
-    int sock = s_pcm_socket;
-    if (sock < 0)
-        return;
-    ssize_t n = send(sock, samples, count * sizeof(int16_t), 0);
-    if (n < 0) {
-        ESP_LOGW(TAG, "pcm_tcp: send errno=%d; closing", errno);
-        s_pcm_socket = -1;
-        close(sock);
-    }
+    siri_audio_pcm_tcp_send(samples, count);
 }
 #endif  // CONFIG_DEBUG_AUDIO_PCM_TCP
 
@@ -433,7 +357,6 @@ static void pcm_tcp_send_frame(const int16_t *samples, size_t count, void *user)
 static void on_notify_cb(uint16_t attr_handle, const uint8_t *data, size_t len, void *user)
 {
     (void)user;
-    MARK_ACTIVITY();
     if (attr_handle == SIRI_HANDLE_BUTTON) {
         uint16_t btns = siri_decode_button_bytes(data, len);
 
@@ -497,7 +420,6 @@ static void on_connected_cb(uint32_t idle_ms, void *user)
     ESP_LOGI(TAG, "remote connected (idle %" PRIu32 " ms)", idle_ms);
     s_remote_connected = true;
     publish_remote_status(true);
-    MARK_ACTIVITY();  // start the idle clock (no-op unless CONFIG_IDLE_DISCONNECT_MS>0)
 }
 
 static void on_disconnected_cb(void *user)
@@ -505,7 +427,6 @@ static void on_disconnected_cb(void *user)
     (void)user;
     s_remote_connected = false;
     publish_remote_status(false);
-    MARK_INACTIVE();  // halt the idle check until next connection
     xSemaphoreTake(s_pulse_lock, portMAX_DELAY);
     button_pulse_reset(s_bp);
     s_pulse_staged = 0;  // drop anything staged but not yet published
@@ -533,14 +454,6 @@ static void tick_timer_cb(void *arg)
     button_pulse_tick(s_bp, now);
     xSemaphoreGive(s_pulse_lock);
     flush_pulses();
-
-#if CONFIG_IDLE_DISCONNECT_MS > 0
-    uint32_t last = s_last_activity_ms;
-    if (last != 0 && (now - last) > CONFIG_IDLE_DISCONNECT_MS) {
-        s_last_activity_ms = 0;  // prevent repeated terminate calls
-        siri_ble_idle_disconnect();
-    }
-#endif
 }
 
 // --- Wi-Fi ---
@@ -661,21 +574,10 @@ static void mqtt_start(void)
     ESP_ERROR_CHECK(esp_mqtt_client_start(s_mqtt));
 }
 
-// --- NimBLE task glue ---
-
-static void nimble_host_task(void *param)
-{
-    (void)param;
-    nimble_port_run();
-    nimble_port_freertos_deinit();
-}
-
 // --- app_main ---
 
 void app_main(void)
 {
-    esp_log_level_set("NimBLE", ESP_LOG_WARN);
-
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -712,11 +614,6 @@ void app_main(void)
     ESP_LOGI(TAG, "button_pulse: repeat_interval=%d ms (0 = press only)",
              CONFIG_PULSE_REPEAT_INTERVAL_MS);
 
-    // Push the configured BLE slave-latency into siri_ble *before*
-    // siri_ble_start so the first conn-param update (post-setup) uses it.
-    // Compile-time since the pulse refactor removed the Number platform.
-    siri_ble_set_slave_latency((uint16_t)CONFIG_BLE_SLAVE_LATENCY_DEFAULT);
-
 #ifdef CONFIG_VOICE_ENABLED
     // Phase 5.A.2 voice pipeline. Allocates OpusDecoder + decode task on
     // CPU1 + FreeRTOS queue. Must come after PSRAM init (handled implicitly
@@ -724,9 +621,9 @@ void app_main(void)
     // dispatcher is ready when the first audio packet arrives.
     siri_audio_config_t audio_cfg = {
 #ifdef CONFIG_DEBUG_AUDIO_PCM_TCP
-        .on_pcm = pcm_tcp_send_frame,
-        .on_session_start = pcm_tcp_open_socket,
-        .on_session_end = pcm_tcp_close_socket,
+        .on_pcm = pcm_tcp_send_cb,
+        .on_session_start = pcm_tcp_open_cb,
+        .on_session_end = pcm_tcp_close_cb,
 #else
         .on_pcm = NULL,  // Phase 5.B will swap this for ESPHome voice_assistant
         .on_session_start = NULL,
@@ -747,9 +644,6 @@ void app_main(void)
     wifi_start();
     mqtt_start();
 
-    ESP_ERROR_CHECK(nimble_port_init());
-    ble_store_config_init();
-
     siri_ble_config_t ble_cfg = {
         .on_notify = on_notify_cb,
         .on_connected = on_connected_cb,
@@ -758,9 +652,11 @@ void app_main(void)
         // siri_ble owns the post-pairing blackout now — it covers every
         // notification, not just buttons, and keeps both build paths identical.
         .pairing_flush_suppress_ms = PAIRING_FLUSH_SUPPRESS_MS,
+        .idle_disconnect_ms = CONFIG_IDLE_DISCONNECT_MS,
+        .slave_latency = (uint16_t)CONFIG_BLE_SLAVE_LATENCY_DEFAULT,
     };
+    // Brings up NimBLE and starts its host task.
     ESP_ERROR_CHECK(siri_ble_start(&ble_cfg));
-    nimble_port_freertos_init(nimble_host_task);
 
     ESP_LOGI(TAG, "booted");
 }

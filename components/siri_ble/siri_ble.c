@@ -23,6 +23,7 @@
 #include "host/util/util.h"
 #include "nimble/nimble_npl.h"
 #include "nimble/nimble_port.h"
+#include "nimble/nimble_port_freertos.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 
@@ -30,6 +31,9 @@
 #include "esp_central.h"
 
 static const char *TAG = "siri_ble";
+
+// IDF ships ble_store_config_init in libbt.a but doesn't publish a header.
+void ble_store_config_init(void);
 
 // The remote's discovered GATT layout. Declared here because resolve_handle()
 // (below, with the setup-step table) reads it before the derivation helpers
@@ -160,7 +164,6 @@ static struct ble_npl_callout s_discovery_window_co;
 // HID service + Report char UUIDs (16-bit) for adv filter + fingerprint walk.
 #define HID_SVC_UUID16 0x1812
 #define HID_REPORT_UUID16 0x2A4D
-#define APPLE_FINGERPRINT_MIN_REPORTS 3  // gen-3 has 9; require ≥3 for fingerprint pass
 
 // Apple custom service UUID `8341f2b4-c013-4f04-8197-c4cdb42e26dc` (LE byte
 // order). Required member of the gen-3 fingerprint; also used by the optional
@@ -194,6 +197,13 @@ static uint16_t s_enc_watchdog_conn = 0xFFFF;
 // Consecutive pre-setup encryption failures; reset on success. Diagnostic only.
 static uint32_t s_enc_fail_streak;
 
+// Optional idle disconnect (s_cfg.idle_disconnect_ms > 0; the default 0 is
+// always-connected). Activity is stamped on every delivered notification and
+// at setup completion; the callout re-arms for the remainder rather than
+// ticking, so an active link costs one timestamp write per notify.
+static struct ble_npl_callout s_idle_co;
+static uint32_t s_last_activity_ms;
+
 // Worst-case wait between the two ENC_CHANGE events before we run setup
 // anyway. Across captured gen-3 connects the gap is reliably 750-1200 ms;
 // 2500 ms gives generous headroom while still bounding worst-case latency.
@@ -220,8 +230,9 @@ static uint32_t s_enc_fail_streak;
 // standalone, the `ble_slave_latency:` YAML key under ESPHome). It was briefly a
 // runtime Number entity; the pulse refactor removed the whole Number platform, so
 // trading battery-life against disconnect-detection latency now needs a reflash.
-// `siri_ble_set_slave_latency` mutates this struct + auto-recomputes
-// supervision_timeout to satisfy the BLE spec rule with ~25 % margin.
+// It arrives as siri_ble_config_t.slave_latency; set_slave_latency() applies it
+// to this struct at start and recomputes supervision_timeout to satisfy the BLE
+// spec rule with ~25 % margin.
 #define SLAVE_LATENCY_MAX 498
 static struct ble_gap_upd_params s_low_power_conn_params = {
     .itvl_min = 6,   // 6 * 1.25ms = 7.5ms
@@ -514,11 +525,6 @@ static uint16_t resolve_handle(const setup_step_t *step)
 
 #define MAP_NVS_NAMESPACE "siri_ble"
 #define MAP_NVS_KEY "hmapv1"
-
-const siri_handle_map_t *siri_ble_handle_map(void)
-{
-    return s_map_valid ? &s_map : NULL;
-}
 
 // A characteristic's CCCD is its own 0x2902 descriptor. Falls back to val+1,
 // which is the usual layout, but only as a last resort — guessing is exactly
@@ -868,6 +874,11 @@ static void complete_setup_chain(uint16_t conn_handle, uint32_t idle_ms)
 {
     s_mode = MODE_CONNECTED;
     s_setup_idle_ms = idle_ms;
+    if (s_cfg.idle_disconnect_ms > 0) {
+        s_last_activity_ms = now_ms();
+        (void)ble_npl_callout_reset(&s_idle_co,
+                                    ble_npl_time_ms_to_ticks32(s_cfg.idle_disconnect_ms));
+    }
     if (s_cfg.on_connected != NULL) {
         s_cfg.on_connected(idle_ms, s_cfg.user);
     }
@@ -913,33 +924,16 @@ static void dump_gatt_tree(const struct peer *peer)
 static const char *fingerprint_check(const struct peer *peer)
 {
     const ble_uuid16_t hid_svc_uuid = BLE_UUID16_INIT(HID_SVC_UUID16);
-    const ble_uuid16_t hid_report_uuid = BLE_UUID16_INIT(HID_REPORT_UUID16);
-
-    const struct peer_svc *hid = peer_svc_find_uuid(peer, &hid_svc_uuid.u);
-    if (hid == NULL) {
+    if (peer_svc_find_uuid(peer, &hid_svc_uuid.u) == NULL) {
         return "HID service 0x1812 missing";
-    }
-
-    int report_notify_count = 0;
-    const struct peer_chr *chr;
-    SLIST_FOREACH(chr, &hid->chrs, next)
-    {
-        if (ble_uuid_cmp(&chr->chr.uuid.u, &hid_report_uuid.u) != 0) {
-            continue;
-        }
-        if (chr->chr.properties & BLE_GATT_CHR_PROP_NOTIFY) {
-            report_notify_count++;
-        }
-    }
-    if (report_notify_count < APPLE_FINGERPRINT_MIN_REPORTS) {
-        return "fewer than 3 notify-capable HID Report chars";
     }
     // Deliberately no check for a Report at a specific handle. That used to be
     // here (0x0039) and it rejected every gen-3 unit whose attribute table is
     // shifted — which is what sent first-time pairing into an endless reject
     // loop while bonded reconnects, which skip this check, worked fine.
-    // Identity is now structural: HID service, three notify Reports, the Apple
-    // custom service, and a derivable handle map (checked by the caller).
+    // Identity is now structural: HID service, the Apple custom service, and a
+    // derivable handle map (checked by the caller — derive_handle_map is what
+    // requires the three notify-capable Reports, so they aren't counted here).
     if (peer_svc_find_uuid(peer, &APPLE_CUSTOM_SVC_UUID.u) == NULL) {
         return "Apple custom service 8341f2b4-... missing";
     }
@@ -1187,6 +1181,26 @@ static void kick_probe_discovery(uint16_t conn_handle)
 }
 #endif
 
+static void idle_cb(struct ble_npl_event *ev)
+{
+    (void)ev;
+    uint16_t conn = s_setup_done_conn;
+    if (conn == 0xFFFF) {
+        return;  // disconnected after the callout fired
+    }
+    uint32_t elapsed = now_ms() - s_last_activity_ms;
+    if (elapsed < s_cfg.idle_disconnect_ms) {
+        (void)ble_npl_callout_reset(&s_idle_co,
+                                    ble_npl_time_ms_to_ticks32(s_cfg.idle_disconnect_ms - elapsed));
+        return;
+    }
+    ESP_LOGI(TAG, "idle threshold reached, terminating connection so remote can sleep");
+    int rc = ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
+    if (rc != 0 && rc != BLE_HS_ENOTCONN) {
+        ESP_LOGW(TAG, "ble_gap_terminate failed: %d", rc);
+    }
+}
+
 static void enc_watchdog_cb(struct ble_npl_event *ev)
 {
     (void)ev;
@@ -1316,6 +1330,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         }
         ble_npl_callout_stop(&s_enc_watchdog_co);
         s_enc_watchdog_conn = 0xFFFF;
+        ble_npl_callout_stop(&s_idle_co);
         if (failed_pre_fingerprint) {
             // Connect was attempted but the link never reached fingerprint —
             // most often the peer is advertising but won't admit us at LL
@@ -1474,6 +1489,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
             s_suppress_until_ms = 0;
             ESP_LOGI(TAG, "post-pairing notify blackout over");
         }
+        s_last_activity_ms = now_ms();
         uint16_t len = OS_MBUF_PKTLEN(event->notify_rx.om);
         uint8_t buf[128];
         if (len > sizeof(buf)) {
@@ -1516,19 +1532,6 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
 
     default:
         return 0;
-    }
-}
-
-void siri_ble_idle_disconnect(void)
-{
-    uint16_t conn = s_setup_done_conn;
-    if (conn == 0xFFFF) {
-        return;
-    }
-    ESP_LOGI(TAG, "idle threshold reached, terminating connection so remote can sleep");
-    int rc = ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
-    if (rc != 0 && rc != BLE_HS_ENOTCONN) {
-        ESP_LOGW(TAG, "ble_gap_terminate failed: %d", rc);
     }
 }
 
@@ -1584,7 +1587,7 @@ void siri_ble_repair(void)
     ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_repair_ev);
 }
 
-void siri_ble_set_slave_latency(uint16_t latency)
+static void set_slave_latency(uint16_t latency)
 {
     // Spec rule: supervision_timeout > 2 * itvl_max * (1 + latency).
     // Compute with ~25% margin: ceil(2.5 * (1 + latency) * itvl_max),
@@ -1600,7 +1603,7 @@ void siri_ble_set_slave_latency(uint16_t latency)
     // 1500 ceiling below, 498 is the largest latency that passes; above it
     // ble_gap_update_params returns EINVAL and the link silently stays on
     // latency 0. Kconfig and the ESPHome schema cap at 498 too — this clamp
-    // only guards direct callers.
+    // only guards a caller that bypasses them.
     if (latency > SLAVE_LATENCY_MAX) {
         ESP_LOGW(TAG, "slave_latency %u exceeds %u; clamping", latency, SLAVE_LATENCY_MAX);
         latency = SLAVE_LATENCY_MAX;
@@ -1617,13 +1620,6 @@ void siri_ble_set_slave_latency(uint16_t latency)
 
     ESP_LOGI(TAG, "slave_latency=%u sup_timeout=%lu (= %lu ms)", latency, (unsigned long)timeout,
              (unsigned long)timeout * 10);
-
-    if (s_setup_done_conn != 0xFFFF) {
-        int rc = ble_gap_update_params(s_setup_done_conn, &s_low_power_conn_params);
-        if (rc != 0 && rc != BLE_HS_ENOTCONN) {
-            ESP_LOGW(TAG, "live conn-param update rc=%d (cached value kept)", rc);
-        }
-    }
 }
 
 static void on_reset(int reason)
@@ -1640,9 +1636,6 @@ static void on_sync(void)
     if (ble_hs_id_infer_auto(0, &s_own_addr_type) != 0) {
         ESP_LOGE(TAG, "id_infer_auto failed");
         return;
-    }
-    if (ble_att_set_preferred_mtu(247) != 0) {
-        ESP_LOGW(TAG, "set_preferred_mtu(247) failed");
     }
     // Inspect the bond store. If a peer is persisted from a previous boot,
     // skip discovery and go straight to a direct connect — NimBLE's resolving
@@ -1675,8 +1668,33 @@ static void on_sync(void)
     }
 }
 
+static void nimble_host_task(void *param)
+{
+    (void)param;
+    nimble_port_run();
+    nimble_port_freertos_deinit();
+}
+
 esp_err_t siri_ble_start(const siri_ble_config_t *cfg)
 {
+    if (cfg == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    s_cfg = *cfg;
+    set_slave_latency(s_cfg.slave_latency);
+
+    // Takes effect in the standalone build only. ESPHome compiles IDF logging
+    // without dynamic level control, where esp_log_level_set() is a no-op and
+    // CONFIG_LOG_MAXIMUM_LEVEL is the only filter (see _pin_sdkconfig).
+    esp_log_level_set("NimBLE", ESP_LOG_WARN);
+
+    esp_err_t err = nimble_port_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "nimble_port_init failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    ble_store_config_init();
+
     // Restore the remote's discovered GATT layout, if we have one. Absent on
     // first boot and after a repair; the bonded path rediscovers in that case.
     if (map_load(&s_map)) {
@@ -1686,11 +1704,6 @@ esp_err_t siri_ble_start(const siri_ble_config_t *cfg)
     } else {
         ESP_LOGI(TAG, "no cached handle map — will discover on first bond");
     }
-
-    if (cfg == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    s_cfg = *cfg;
 
     ble_hs_cfg.sm_io_cap = BLE_HS_IO_NO_INPUT_OUTPUT;
     ble_hs_cfg.sm_bonding = 1;
@@ -1719,15 +1732,18 @@ esp_err_t siri_ble_start(const siri_ble_config_t *cfg)
         return ESP_FAIL;
     }
 
-    // nimble_port_init() has created the default event queue by now; the
-    // host task that drains it starts with nimble_port_freertos_init().
+    // nimble_port_init() created the default event queue above; the host task
+    // that drains it starts below, so nothing can fire before it is set up.
     struct ble_npl_eventq *evq = nimble_port_get_dflt_eventq();
     if (ble_npl_callout_init(&s_setup_fallback_co, evq, setup_fallback_cb, NULL) != 0 ||
         ble_npl_callout_init(&s_discovery_window_co, evq, discovery_window_expired_cb, NULL) != 0 ||
-        ble_npl_callout_init(&s_enc_watchdog_co, evq, enc_watchdog_cb, NULL) != 0) {
+        ble_npl_callout_init(&s_enc_watchdog_co, evq, enc_watchdog_cb, NULL) != 0 ||
+        ble_npl_callout_init(&s_idle_co, evq, idle_cb, NULL) != 0) {
         ESP_LOGE(TAG, "ble_npl_callout_init failed");
         return ESP_FAIL;
     }
     ble_npl_event_init(&s_repair_ev, repair_ev_cb, NULL);
+
+    nimble_port_freertos_init(nimble_host_task);
     return ESP_OK;
 }

@@ -86,12 +86,6 @@ class SiriRemoteHub : public Component {
   void on_audio_session_end();
   void on_pcm(const int16_t *samples, size_t count);
 
-#ifdef SIRI_REMOTE_DEBUG_PCM_TCP
-  void pcm_tcp_open();
-  void pcm_tcp_close();
-  void pcm_tcp_send(const int16_t *samples, size_t count);
-#endif
-
   static uint32_t now_ms() {
     return static_cast<uint32_t>(esp_timer_get_time() / 1000);
   }
@@ -125,11 +119,6 @@ class SiriRemoteHub : public Component {
   button_pulse_t *pulse_{nullptr};
   Mutex pulse_lock_;
   esp_timer_handle_t tick_timer_{nullptr};
-  // Read by the tick timer task, written by the NimBLE host task — the
-  // tick tolerates one stale read so a torn 32-bit access is fine, but
-  // mark volatile to keep the compiler honest about the cross-task
-  // visibility.
-  volatile uint32_t last_activity_ms_{0};
   uint16_t prev_buttons_{0};
 
   binary_sensor::BinarySensor *voice_active_sensor_{nullptr};
@@ -160,10 +149,6 @@ class SiriRemoteHub : public Component {
   bool api_gate_logged_{false};
   // HA device name for the event payload; filled on first use, loop task only.
   std::string device_name_;
-
-#ifdef SIRI_REMOTE_DEBUG_PCM_TCP
-  int pcm_socket_{-1};
-#endif
 };
 
 }  // namespace siri_remote

@@ -55,8 +55,12 @@ locking discipline). When changing one, check whether the other needs the same c
   unless `debug_touch_frames` is on.
 - `components/siri_audio/` — Opus decode. `siri_audio_validate.c` is the pure-C header
   validator (host-testable); `siri_audio.c` owns the decoder task pinned to CPU1 with
-  decoder state in PSRAM (`MALLOC_CAP_SPIRAM`).
-- `components/siri_ble/` — NimBLE central. The bulk of the protocol work lives here.
+  decoder state in PSRAM (`MALLOC_CAP_SPIRAM`). `siri_audio_pcm_tcp.c` is the shared
+  debug PCM-over-TCP sink both glues call.
+- `components/siri_ble/` — NimBLE central. The bulk of the protocol work lives here,
+  including everything below the glue: `siri_ble_start()` brings up the NimBLE port, bond
+  store and host task itself, and the idle-disconnect timer and slave latency arrive as
+  `siri_ble_config_t` fields. The glue only does NVS init and supplies config + callbacks.
 - `components/mqtt_entity/` — HA MQTT-discovery helper; **standalone only**, unused by ESPHome.
 - `components/siri_ble/peer.c` + `esp_central.h` — vendored from IDF's `blecent` example.
   Kept verbatim so they can be diffed against upstream; excluded from `make lint` and from

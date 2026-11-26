@@ -26,7 +26,6 @@ extern "C" {
 #define SIRI_HANDLE_BUTTON 0x0039
 #define SIRI_HANDLE_TOUCH 0x003D
 #define SIRI_HANDLE_AUDIO 0x0035
-#define SIRI_HANDLE_AUDIO_CCCD 0x0036
 #define SIRI_HANDLE_BATTERY 0x002E
 #define SIRI_HANDLE_CHARGING 0x0031
 
@@ -48,9 +47,6 @@ typedef struct {
     uint16_t charging_val, charging_cccd;
     uint16_t magic;
 } siri_handle_map_t;
-
-// The active map, or NULL if no remote has been bonded yet. Diagnostic.
-const siri_handle_map_t *siri_ble_handle_map(void);
 
 // Raw notification from the remote. `attr_handle` is a *logical* SIRI_HANDLE_*
 // ID, already translated from the remote's physical handle — callers must not
@@ -99,16 +95,24 @@ typedef struct {
     // Setup-chain reads (battery/charging) are issued by us and are delivered
     // regardless — they are not part of the flush.
     uint32_t pairing_flush_suppress_ms;
+
+    // Terminate the link after this many milliseconds without a notification,
+    // so the remote can deep-sleep; it reconnects on the next button press.
+    // 0 (the default) is always-connected mode — see README before changing:
+    // Apple's firmware discards the wake-press after a long disconnect.
+    uint32_t idle_disconnect_ms;
+
+    // Peripheral latency requested once the setup chain completes, 0..498.
+    // Supervision timeout is derived from it (timeout > 2 * itvl_max *
+    // (1 + latency), ~25 % margin, capped at 15 s). Above 498 NimBLE rejects
+    // the update and the link silently stays at latency 0, so it is clamped.
+    uint16_t slave_latency;
 } siri_ble_config_t;
 
-// Install callbacks and configure the BLE host. Call after nimble_port_init
-// but before spawning the host task.
+// Bring up the whole BLE stack: NimBLE port, bond store, host configuration,
+// and the host task. Call once, after nvs_flash_init(), and do not call
+// nimble_port_init() / nimble_port_freertos_init() yourself.
 esp_err_t siri_ble_start(const siri_ble_config_t *cfg);
-
-// Proactively terminate the active BLE connection so the remote can enter
-// deep sleep. No-op if no connection is active. Reconnect happens on the
-// next button press from the remote (re-advertises automatically).
-void siri_ble_idle_disconnect(void);
 
 // Forget the current bond and re-enter the 5-minute discovery window.
 // Called when the user presses `button.siri_remote_repair` in HA, or when
@@ -121,16 +125,6 @@ void siri_ble_idle_disconnect(void);
 // Safe from any task, and asynchronous: it posts the request to the NimBLE
 // host task, where the work runs alongside every other BLE state change.
 void siri_ble_repair(void);
-
-// Update slave-latency on the post-setup low-power conn params. Supervision
-// timeout is auto-recomputed from latency to satisfy the BLE spec rule
-// (timeout > 2 * itvl_max * (1 + latency)) with ~25 % margin, capped at
-// 1500 (15 s). If a connection is currently active and post-setup, applies
-// via ble_gap_update_params immediately; otherwise the new value takes
-// effect on the next bonded reconnect. Apple may reject the requested
-// params (CONN_UPDATE status != 0); the cached value is kept either way
-// and the controller falls back to whatever was previously negotiated.
-void siri_ble_set_slave_latency(uint16_t latency);
 
 #ifdef __cplusplus
 }
