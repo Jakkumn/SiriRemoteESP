@@ -114,9 +114,12 @@ void siri_ble_idle_disconnect(void);
 // Called when the user presses `button.siri_remote_repair` in HA, or when
 // they want to switch to a different physical remote. Wipes the NimBLE bond
 // store, terminates the active connection (if any), clears the in-RAM
-// candidate blacklist, and starts a fresh active scan filtered on the HID
+// candidate blacklist, and starts a fresh passive scan filtered on the HID
 // service UUID. The user is expected to put the remote into Apple-pairing
 // mode (Back + Vol Up held ~5 s) during the window.
+//
+// Safe from any task, and asynchronous: it posts the request to the NimBLE
+// host task, where the work runs alongside every other BLE state change.
 void siri_ble_repair(void);
 
 // Update slave-latency on the post-setup low-power conn params. Supervision

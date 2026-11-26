@@ -21,6 +21,8 @@
 #include "host/ble_store.h"
 #include "host/ble_uuid.h"
 #include "host/util/util.h"
+#include "nimble/nimble_npl.h"
+#include "nimble/nimble_port.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 
@@ -128,15 +130,32 @@ static size_t s_blacklist_next;  // ring index for replacement on overflow
 static portMUX_TYPE s_blacklist_mux = portMUX_INITIALIZER_UNLOCKED;
 // protects s_blacklist + s_blacklist_next:
 // writes/reads from BLE host task (DISC
-// event, fingerprint reject), clears from
-// MQTT task (siri_ble_repair).
+// event, fingerprint reject, and repair,
+// which is posted to it).
+
+// --- Host-task timers and events --------------------------------------------
+//
+// Every timer and the Repair request run on the NimBLE host task: the timers
+// are ble_npl_callouts on NimBLE's default event queue, and siri_ble_repair()
+// only posts an event to that queue. That keeps every s_mode / s_pending_* /
+// peer transition on one task. They were esp_timer callbacks and a direct
+// call from the glue's loop / MQTT task, which could interleave with
+// gap_event_cb — two setup chains on one link, or the discovery window
+// dropping to IDLE mid-connect so a candidate skipped the fingerprint.
+//
+// ble_npl_callout_stop() stops the underlying timer but does not dequeue an
+// event that already fired, so every callback re-checks the state it acts on.
+static struct ble_npl_event s_repair_ev;
 
 // Discovery window — keeps the bridge from sitting in active scan forever
 // after a failed/abandoned pairing attempt. Cancelled on fingerprint pass
 // or repair-button press (both restart it from scratch).
 #define DISCOVERY_WINDOW_MS (5 * 60 * 1000)
 #define DISCOVERY_RSSI_MIN -55
-static esp_timer_handle_t s_discovery_window_timer;
+static struct ble_npl_callout s_discovery_window_co;
+// While a candidate connect or fingerprint is in flight at window expiry,
+// re-check after this long instead of dropping to IDLE under it.
+#define DISCOVERY_WINDOW_GRACE_MS (30 * 1000)
 
 // HID service + Report char UUIDs (16-bit) for adv filter + fingerprint walk.
 #define HID_SVC_UUID16 0x1812
@@ -158,7 +177,22 @@ static const ble_uuid128_t APPLE_CUSTOM_SVC_UUID = BLE_UUID128_INIT(
 // to wake the remote is delivered cleanly once our CCCD subscribes land.
 static uint16_t s_pending_setup_conn = 0xFFFF;
 static uint32_t s_pending_setup_idle_ms;
-static esp_timer_handle_t s_setup_fallback_timer;
+static struct ble_npl_callout s_setup_fallback_co;
+
+// Encryption watchdog. Nothing else bounds the time between CONNECT and the
+// first successful ENC_CHANGE: a remote that was factory-reset or re-paired to
+// an Apple TV no longer has our keys, so a bonded reconnect never encrypts,
+// and a discovery candidate that never finishes pairing holds the link — and
+// with scanning stopped, the whole discovery window — indefinitely. On expiry
+// the link is terminated and the normal disconnect dispatch takes over
+// (blacklist + rescan for a candidate, re-issue direct connect when bonded).
+// Bonded resumption takes well under 1 s and a fresh just-works pairing a few
+// seconds, so 10 s only ever fires on a link that is not going to encrypt.
+#define ENC_WATCHDOG_MS 10000
+static struct ble_npl_callout s_enc_watchdog_co;
+static uint16_t s_enc_watchdog_conn = 0xFFFF;
+// Consecutive pre-setup encryption failures; reset on success. Diagnostic only.
+static uint32_t s_enc_fail_streak;
 
 // Worst-case wait between the two ENC_CHANGE events before we run setup
 // anyway. Across captured gen-3 connects the gap is reliably 750-1200 ms;
@@ -311,10 +345,8 @@ static void start_discovery(void)
         return;
     }
 
-    if (s_discovery_window_timer != NULL) {
-        (void)esp_timer_stop(s_discovery_window_timer);
-        (void)esp_timer_start_once(s_discovery_window_timer, (uint64_t)DISCOVERY_WINDOW_MS * 1000);
-    }
+    (void)ble_npl_callout_reset(&s_discovery_window_co,
+                                ble_npl_time_ms_to_ticks32(DISCOVERY_WINDOW_MS));
     ESP_LOGI(TAG,
              "DISCOVERING — for a NEW bridge, hold Back+VolUp on the remote ~5s to "
              "enter pairing mode; for a previously-paired remote, any button press "
@@ -387,10 +419,19 @@ static void try_connect_candidate(const struct ble_gap_disc_desc *disc,
     }
 }
 
-static void discovery_window_expired_cb(void *arg)
+static void discovery_window_expired_cb(struct ble_npl_event *ev)
 {
-    (void)arg;
+    (void)ev;
     if (s_mode != MODE_DISCOVERING) {
+        return;
+    }
+    if (s_pending_candidate_set) {
+        // A candidate is mid-connect or mid-fingerprint. Going IDLE now would
+        // strand it: its later ENC_CHANGE would see a non-DISCOVERING mode and
+        // take the bonded path, skipping the fingerprint. Let it resolve
+        // (pass stops this callout; fail rescans) and check again after.
+        (void)ble_npl_callout_reset(&s_discovery_window_co,
+                                    ble_npl_time_ms_to_ticks32(DISCOVERY_WINDOW_GRACE_MS));
         return;
     }
     ESP_LOGW(TAG,
@@ -800,7 +841,7 @@ static int on_setup_step_done(uint16_t conn_handle, const struct ble_gatt_error 
 // during that handshake window causes Apple to drop the wake-press it has
 // buffered since the user pressed the button to wake the remote. The
 // ENC_CHANGE handler in gap_event_cb defers this call accordingly; the
-// esp_timer fallback at ENC_CHANGE_FALLBACK_MS ms acts as a safety net if
+// fallback callout at ENC_CHANGE_FALLBACK_MS ms acts as a safety net if
 // the secondary phase ever fails to fire.
 static void apply_remote_setup(uint16_t conn_handle)
 {
@@ -976,9 +1017,7 @@ static void on_fingerprint_disc_complete(const struct peer *peer, int status, vo
         }
         s_pending_candidate_set = false;
     }
-    if (s_discovery_window_timer != NULL) {
-        (void)esp_timer_stop(s_discovery_window_timer);
-    }
+    ble_npl_callout_stop(&s_discovery_window_co);
     // Use idle=0 here: this is a brand-new bond, there's no meaningful
     // time-since-disconnect to publish. idle == 0 is also what arms the
     // post-pairing notify blackout at the end of the setup chain (Apple
@@ -1041,14 +1080,13 @@ static void setup_bonded(uint16_t conn, uint32_t idle)
     }
 }
 
-// Fired from esp_timer task if the second ENC_CHANGE never arrives. Runs
+// Fired on the NimBLE host task if the second ENC_CHANGE never arrives. Runs
 // setup with the stashed idle so we don't end up wedged forever in pending
-// state. ble_gattc_* and the on_connected callback are safe from this
-// context (the former posts to the NimBLE host task, the latter just
-// touches main.c state guarded by the caller's own pulse lock).
-static void setup_fallback_cb(void *arg)
+// state. The s_pending_setup_conn check also covers a fire that was already
+// queued when the secondary ENC_CHANGE or DISCONNECT stopped the callout.
+static void setup_fallback_cb(struct ble_npl_event *ev)
 {
-    (void)arg;
+    (void)ev;
     if (s_pending_setup_conn == 0xFFFF) {
         return;
     }
@@ -1149,6 +1187,26 @@ static void kick_probe_discovery(uint16_t conn_handle)
 }
 #endif
 
+static void enc_watchdog_cb(struct ble_npl_event *ev)
+{
+    (void)ev;
+    uint16_t conn = s_enc_watchdog_conn;
+    if (conn == 0xFFFF || conn != s_active_conn) {
+        return;  // encrypted or disconnected after the callout fired
+    }
+    s_enc_watchdog_conn = 0xFFFF;
+    ESP_LOGW(TAG, "link not encrypted %d ms after connect — terminating (mode=%d)", ENC_WATCHDOG_MS,
+             (int)s_mode);
+    if (s_mode == MODE_BONDED_RECONNECT) {
+        ESP_LOGW(TAG, "if this repeats, the remote has likely lost our bond (factory reset or "
+                      "re-paired elsewhere) — press Repair, then hold Back+VolUp ~5s");
+    }
+    int rc = ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
+    if (rc != 0 && rc != BLE_HS_ENOTCONN) {
+        ESP_LOGW(TAG, "ble_gap_terminate (enc watchdog) rc=%d", rc);
+    }
+}
+
 static int gap_event_cb(struct ble_gap_event *event, void *arg)
 {
     switch (event->type) {
@@ -1200,6 +1258,14 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         }
         s_active_conn = event->connect.conn_handle;
         ESP_LOGI(TAG, "connected, conn_handle=%d", event->connect.conn_handle);
+        // On bonded reconnect ENC_CHANGE can precede CONNECT (see the
+        // ENC_CHANGE handler); arm only if encryption hasn't already landed.
+        if (s_pending_setup_conn != event->connect.conn_handle &&
+            s_setup_done_conn != event->connect.conn_handle) {
+            s_enc_watchdog_conn = event->connect.conn_handle;
+            (void)ble_npl_callout_reset(&s_enc_watchdog_co,
+                                        ble_npl_time_ms_to_ticks32(ENC_WATCHDOG_MS));
+        }
 #ifdef CONFIG_DEBUG_WAKE_PROBE
         s_connect_ms = now_ms();
 #endif
@@ -1245,9 +1311,11 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         s_setup_done_conn = 0xFFFF;
         s_active_conn = 0xFFFF;
         if (s_pending_setup_conn != 0xFFFF) {
-            (void)esp_timer_stop(s_setup_fallback_timer);
+            ble_npl_callout_stop(&s_setup_fallback_co);
             s_pending_setup_conn = 0xFFFF;
         }
+        ble_npl_callout_stop(&s_enc_watchdog_co);
+        s_enc_watchdog_conn = 0xFFFF;
         if (failed_pre_fingerprint) {
             // Connect was attempted but the link never reached fingerprint —
             // most often the peer is advertising but won't admit us at LL
@@ -1310,6 +1378,25 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
                        : s_pending_setup_conn == event->enc_change.conn_handle ? "(secondary)"
                                                                                : "(initial)");
         if (event->enc_change.status != 0) {
+            if (s_setup_done_conn == event->enc_change.conn_handle) {
+                return 0;  // failed mid-session re-key; the controller handles the link
+            }
+            // Pre-setup failure: the link can never carry HID (the remote's
+            // reports need encryption), so don't wait out the watchdog. Most
+            // often the remote no longer holds our keys (PIN/key missing).
+            s_enc_fail_streak++;
+            ESP_LOGW(TAG, "encryption failed (status=%d, %lu in a row) — terminating",
+                     event->enc_change.status, (unsigned long)s_enc_fail_streak);
+            if (s_mode == MODE_BONDED_RECONNECT) {
+                ESP_LOGW(TAG, "the remote has likely lost our bond (factory reset or re-paired "
+                              "elsewhere) — press Repair, then hold Back+VolUp ~5s");
+            }
+            ble_npl_callout_stop(&s_enc_watchdog_co);
+            s_enc_watchdog_conn = 0xFFFF;
+            int trc = ble_gap_terminate(event->enc_change.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+            if (trc != 0 && trc != BLE_HS_ENOTCONN) {
+                ESP_LOGW(TAG, "ble_gap_terminate (enc failure) rc=%d", trc);
+            }
             return 0;
         }
         if (s_setup_done_conn == event->enc_change.conn_handle) {
@@ -1344,8 +1431,11 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
             }
             s_pending_setup_conn = conn;
             s_pending_setup_idle_ms = idle;
-            (void)esp_timer_start_once(s_setup_fallback_timer,
-                                       (uint64_t)ENC_CHANGE_FALLBACK_MS * 1000);
+            s_enc_fail_streak = 0;
+            ble_npl_callout_stop(&s_enc_watchdog_co);
+            s_enc_watchdog_conn = 0xFFFF;
+            (void)ble_npl_callout_reset(&s_setup_fallback_co,
+                                        ble_npl_time_ms_to_ticks32(ENC_CHANGE_FALLBACK_MS));
             return 0;
         }
         // Secondary ENC_CHANGE — Apple's accessory-framework handshake has
@@ -1355,7 +1445,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         // setup or rejects+blacklists. If we already trust the bond, skip
         // straight to setup; Apple flushes the buffered wake-press to us
         // shortly after the button CCCD subscribe lands.
-        (void)esp_timer_stop(s_setup_fallback_timer);
+        ble_npl_callout_stop(&s_setup_fallback_co);
         uint32_t idle = s_pending_setup_idle_ms;
         s_pending_setup_conn = 0xFFFF;
         if (s_mode == MODE_DISCOVERING) {
@@ -1442,8 +1532,10 @@ void siri_ble_idle_disconnect(void)
     }
 }
 
-void siri_ble_repair(void)
+// Runs on the NimBLE host task; siri_ble_repair() posts it.
+static void repair_ev_cb(struct ble_npl_event *ev)
 {
+    (void)ev;
     // The map belongs to the old remote; a different unit will have its own.
     map_erase();
     ESP_LOGI(TAG, "repair: clearing bond store and re-entering discovery");
@@ -1482,6 +1574,14 @@ void siri_ble_repair(void)
     // restart the window from scratch.
     (void)ble_gap_disc_cancel();
     start_discovery();
+}
+
+void siri_ble_repair(void)
+{
+    // Callable from any task. A second press while one is still queued is a
+    // no-op (eventq_put ignores an already-queued event), which is what a
+    // double-tap of the HA button should do anyway.
+    ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_repair_ev);
 }
 
 void siri_ble_set_slave_latency(uint16_t latency)
@@ -1619,21 +1719,15 @@ esp_err_t siri_ble_start(const siri_ble_config_t *cfg)
         return ESP_FAIL;
     }
 
-    const esp_timer_create_args_t setup_timer_args = {
-        .callback = setup_fallback_cb,
-        .name = "siri_setup_fallback",
-    };
-    if (esp_timer_create(&setup_timer_args, &s_setup_fallback_timer) != ESP_OK) {
-        ESP_LOGE(TAG, "esp_timer_create (setup_fallback) failed");
+    // nimble_port_init() has created the default event queue by now; the
+    // host task that drains it starts with nimble_port_freertos_init().
+    struct ble_npl_eventq *evq = nimble_port_get_dflt_eventq();
+    if (ble_npl_callout_init(&s_setup_fallback_co, evq, setup_fallback_cb, NULL) != 0 ||
+        ble_npl_callout_init(&s_discovery_window_co, evq, discovery_window_expired_cb, NULL) != 0 ||
+        ble_npl_callout_init(&s_enc_watchdog_co, evq, enc_watchdog_cb, NULL) != 0) {
+        ESP_LOGE(TAG, "ble_npl_callout_init failed");
         return ESP_FAIL;
     }
-    const esp_timer_create_args_t window_timer_args = {
-        .callback = discovery_window_expired_cb,
-        .name = "siri_disc_window",
-    };
-    if (esp_timer_create(&window_timer_args, &s_discovery_window_timer) != ESP_OK) {
-        ESP_LOGE(TAG, "esp_timer_create (discovery_window) failed");
-        return ESP_FAIL;
-    }
+    ble_npl_event_init(&s_repair_ev, repair_ev_cb, NULL);
     return ESP_OK;
 }

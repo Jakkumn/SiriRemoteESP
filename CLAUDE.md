@@ -89,7 +89,12 @@ locking discipline). When changing one, check whether the other needs the same c
 
 Three contexts touch shared state; get this wrong and you get rare crashes, not test failures.
 
-- **NimBLE host task** — all `on_notify` / connect / disconnect callbacks.
+- **NimBLE host task** — all `on_notify` / connect / disconnect callbacks, and every
+  `siri_ble` timer and request: its timeouts are `ble_npl_callout`s on NimBLE's default
+  event queue and `siri_ble_repair()` posts an event there, so all BLE state machine
+  transitions happen on this one task. Don't add an `esp_timer` or a direct cross-task call
+  into `siri_ble` state; add a callout or event. `ble_npl_callout_stop()` does not dequeue
+  an already-fired event, so callbacks must re-check their state.
 - **ESPHome loop task** (or MQTT handler in standalone) — entity writes, HA event sends.
 - **siri_audio decode task** (CPU1) — `on_pcm` callbacks.
 
