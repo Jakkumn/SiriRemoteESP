@@ -156,12 +156,17 @@ def _pin_sdkconfig():
     # MAXIMUM is the compile-time ceiling; DEFAULT is the runtime level. Both
     # choice symbols and their ints must be written, and the ERROR choice
     # cleared, or kconfiglib keeps the old selection.
+    #
+    # The runtime default is WARN, not INFO: DEFAULT applies to every IDF tag,
+    # and at INFO the Wi-Fi driver, phy, esp_netif etc. flood the log on every
+    # (re)association. SiriRemoteHub::setup() raises only our own tags
+    # (siri_ble, siri_audio) back to INFO with esp_log_level_set().
     so("CONFIG_LOG_MAXIMUM_LEVEL_ERROR", False)
     so("CONFIG_LOG_MAXIMUM_LEVEL_DEBUG", True)
     so("CONFIG_LOG_MAXIMUM_LEVEL", 4)
     so("CONFIG_LOG_DEFAULT_LEVEL_ERROR", False)
-    so("CONFIG_LOG_DEFAULT_LEVEL_INFO", True)
-    so("CONFIG_LOG_DEFAULT_LEVEL", 3)
+    so("CONFIG_LOG_DEFAULT_LEVEL_WARN", True)
+    so("CONFIG_LOG_DEFAULT_LEVEL", 2)
 
 
 async def to_code(config):

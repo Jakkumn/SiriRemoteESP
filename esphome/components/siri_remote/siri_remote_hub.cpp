@@ -189,6 +189,10 @@ void SiriRemoteHub::start_tick_timer_() {
 
 void SiriRemoteHub::start_nimble_() {
   esp_log_level_set("NimBLE", ESP_LOG_WARN);
+  // The IDF runtime default is WARN (see _pin_sdkconfig) to keep the Wi-Fi
+  // driver quiet; our pure-C components' pairing/discovery narrative is INFO.
+  esp_log_level_set("siri_ble", ESP_LOG_INFO);
+  esp_log_level_set("siri_audio", ESP_LOG_INFO);
 
   ESP_ERROR_CHECK(nimble_port_init());
   ble_store_config_init();
